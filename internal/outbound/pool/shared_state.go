@@ -20,6 +20,11 @@ type sharedMemberState struct {
 	monitorRestored  bool
 	entry            atomic.Pointer[monitor.EntryHandle]
 	active           atomic.Int32
+	blacklistedFast  atomic.Bool
+	watchMu          sync.Mutex
+	watchers         map[uint64]func(bool)
+	nextWatcher      uint64
+	blacklistTimer   *time.Timer
 }
 
 var sharedStateStore sync.Map // map[tag]*sharedMemberState
@@ -36,10 +41,15 @@ func acquireSharedState(tag string) *sharedMemberState {
 		if restored.BlacklistedUntil.After(time.Now()) {
 			state.blacklisted = true
 			state.blacklistedUntil = restored.BlacklistedUntil
+			state.blacklistedFast.Store(true)
 		}
 	}
 	actual, _ := sharedStateStore.LoadOrStore(tag, state)
-	return actual.(*sharedMemberState)
+	result := actual.(*sharedMemberState)
+	if result == state && state.blacklisted {
+		state.scheduleBlacklistExpiry(state.blacklistedUntil)
+	}
+	return result
 }
 
 // lookupSharedState returns the shared state if it exists.
@@ -53,7 +63,8 @@ func lookupSharedState(tag string) (*sharedMemberState, bool) {
 
 // ResetSharedStateStore clears all shared state (used during config reload).
 func ResetSharedStateStore() {
-	sharedStateStore.Range(func(key, _ any) bool {
+	sharedStateStore.Range(func(key, value any) bool {
+		value.(*sharedMemberState).close()
 		sharedStateStore.Delete(key)
 		return true
 	})
@@ -98,8 +109,13 @@ func (s *sharedMemberState) recordFailure(cause error, threshold int, duration t
 		s.failures = 0
 		s.blacklisted = true
 		s.blacklistedUntil = until
+		s.blacklistedFast.Store(true)
 	}
 	s.mu.Unlock()
+	if triggered {
+		s.publishBlacklist(true)
+		s.scheduleBlacklistExpiry(until)
+	}
 
 	if entry := s.entry.Load(); entry != nil {
 		entry.RecordFailure(cause)
@@ -127,8 +143,13 @@ func (s *sharedMemberState) isBlacklisted(now time.Time) bool {
 	s.mu.Lock()
 	expired := s.blacklisted && now.After(s.blacklistedUntil)
 	if expired {
+		s.blacklistedFast.Store(false)
 		s.blacklisted = false
 		s.blacklistedUntil = time.Time{}
+		if s.blacklistTimer != nil {
+			s.blacklistTimer.Stop()
+			s.blacklistTimer = nil
+		}
 	}
 	blacklisted := s.blacklisted
 	s.mu.Unlock()
@@ -137,6 +158,7 @@ func (s *sharedMemberState) isBlacklisted(now time.Time) bool {
 		if entry := s.entry.Load(); entry != nil {
 			entry.ClearBlacklist()
 		}
+		s.publishBlacklist(false)
 		s.persist()
 	}
 	return blacklisted
@@ -144,13 +166,22 @@ func (s *sharedMemberState) isBlacklisted(now time.Time) bool {
 
 func (s *sharedMemberState) forceRelease() {
 	s.mu.Lock()
+	wasBlacklisted := s.blacklisted
 	s.failures = 0
 	s.blacklisted = false
 	s.blacklistedUntil = time.Time{}
+	if s.blacklistTimer != nil {
+		s.blacklistTimer.Stop()
+		s.blacklistTimer = nil
+	}
 	s.mu.Unlock()
+	s.blacklistedFast.Store(false)
 
 	if entry := s.entry.Load(); entry != nil {
 		entry.ClearBlacklist()
+	}
+	if wasBlacklisted {
+		s.publishBlacklist(false)
 	}
 	s.persist()
 }
@@ -195,6 +226,93 @@ func (s *sharedMemberState) persist() {
 	storeMemberHealth(s.tag, record)
 }
 
+func (s *sharedMemberState) subscribeBlacklist(callback func(bool)) func() {
+	if callback == nil {
+		return func() {}
+	}
+	s.watchMu.Lock()
+	if s.watchers == nil {
+		s.watchers = make(map[uint64]func(bool))
+	}
+	s.nextWatcher++
+	id := s.nextWatcher
+	s.watchers[id] = callback
+	s.watchMu.Unlock()
+	callback(s.isBlacklisted(time.Now()))
+	return func() {
+		s.watchMu.Lock()
+		delete(s.watchers, id)
+		s.watchMu.Unlock()
+	}
+}
+
+func (s *sharedMemberState) publishBlacklist(blacklisted bool) {
+	s.watchMu.Lock()
+	callbacks := make([]func(bool), 0, len(s.watchers))
+	for _, callback := range s.watchers {
+		callbacks = append(callbacks, callback)
+	}
+	s.watchMu.Unlock()
+	for _, callback := range callbacks {
+		callback(blacklisted)
+	}
+}
+
+func (s *sharedMemberState) scheduleBlacklistExpiry(until time.Time) {
+	if until.IsZero() {
+		return
+	}
+	delay := time.Until(until)
+	if delay < 0 {
+		delay = 0
+	}
+	s.mu.Lock()
+	if s.blacklistTimer != nil {
+		s.blacklistTimer.Stop()
+	}
+	s.blacklistTimer = time.AfterFunc(delay, func() {
+		s.expireBlacklist(until)
+	})
+	s.mu.Unlock()
+}
+
+func (s *sharedMemberState) expireBlacklist(expected time.Time) {
+	s.mu.Lock()
+	if !s.blacklisted || !s.blacklistedUntil.Equal(expected) {
+		s.mu.Unlock()
+		return
+	}
+	if remaining := time.Until(expected); remaining > 0 {
+		s.blacklistTimer = time.AfterFunc(remaining, func() {
+			s.expireBlacklist(expected)
+		})
+		s.mu.Unlock()
+		return
+	}
+	s.blacklisted = false
+	s.blacklistedUntil = time.Time{}
+	s.blacklistTimer = nil
+	s.mu.Unlock()
+	s.blacklistedFast.Store(false)
+	if entry := s.entry.Load(); entry != nil {
+		entry.ClearBlacklist()
+	}
+	s.publishBlacklist(false)
+	s.persist()
+}
+
+func (s *sharedMemberState) close() {
+	s.mu.Lock()
+	if s.blacklistTimer != nil {
+		s.blacklistTimer.Stop()
+		s.blacklistTimer = nil
+	}
+	s.mu.Unlock()
+	s.watchMu.Lock()
+	s.watchers = nil
+	s.watchMu.Unlock()
+}
+
 // blacklistSharedMember manually blacklists a node in pool shared state.
 func blacklistSharedMember(tag string, duration time.Duration) {
 	if state, ok := lookupSharedState(tag); ok {
@@ -203,10 +321,13 @@ func blacklistSharedMember(tag string, duration time.Duration) {
 		state.blacklisted = true
 		state.blacklistedUntil = until
 		state.failures = 0
+		state.blacklistedFast.Store(true)
 		state.mu.Unlock()
 		if entry := state.entry.Load(); entry != nil {
 			entry.Blacklist(until)
 		}
+		state.publishBlacklist(true)
+		state.scheduleBlacklistExpiry(until)
 		state.persist()
 	}
 }

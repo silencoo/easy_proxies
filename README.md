@@ -71,7 +71,7 @@ Pool failure streaks, active blacklist deadlines, and the latest health/latency 
 |-----------|-------------|
 | `sequential` | Round-robin through healthy nodes |
 | `random` | Random node selection |
-| `balance` | Least-connections balancing |
+| `balance` | O(1) power-of-two-choices balancing using active connection counts |
 
 ### Minimal Config Example
 

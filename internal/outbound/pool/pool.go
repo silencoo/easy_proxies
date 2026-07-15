@@ -78,22 +78,61 @@ type memberState struct {
 	tag      string
 	entry    *monitor.EntryHandle
 	shared   *sharedMemberState
+	unwatch  func()
+}
+
+type memberSet struct {
+	items []*memberState
+	index map[*memberState]int
+}
+
+func newMemberSet(capacity int) memberSet {
+	return memberSet{
+		items: make([]*memberState, 0, capacity),
+		index: make(map[*memberState]int, capacity),
+	}
+}
+
+func (s *memberSet) add(member *memberState) {
+	if _, exists := s.index[member]; exists {
+		return
+	}
+	s.index[member] = len(s.items)
+	s.items = append(s.items, member)
+}
+
+func (s *memberSet) remove(member *memberState) {
+	idx, exists := s.index[member]
+	if !exists {
+		return
+	}
+	last := len(s.items) - 1
+	replacement := s.items[last]
+	s.items[idx] = replacement
+	s.index[replacement] = idx
+	s.items = s.items[:last]
+	delete(s.index, member)
 }
 
 type poolOutbound struct {
 	outbound.Adapter
-	ctx            context.Context
-	logger         singlog.ContextLogger
-	manager        adapter.OutboundManager
-	options        Options
-	mode           string
-	members        []*memberState
-	mu             sync.Mutex
-	rrCounter      atomic.Uint32
-	rng            *rand.Rand
-	rngMu          sync.Mutex // protects rng for random mode
-	monitor        *monitor.Manager
-	candidatesPool sync.Pool
+	ctx         context.Context
+	logger      singlog.ContextLogger
+	manager     adapter.OutboundManager
+	options     Options
+	mode        string
+	members     []*memberState
+	memberByTag map[string]*memberState
+	mu          sync.Mutex
+	eligibleMu  sync.RWMutex
+	eligibleTCP memberSet
+	eligibleUDP memberSet
+	rrCounter   atomic.Uint32
+	rng         *rand.Rand
+	rngMu       sync.Mutex // protects rng for random mode
+	monitor     *monitor.Manager
+	closed      atomic.Bool
+	initialized atomic.Bool
 }
 
 func newPool(ctx context.Context, _ adapter.Router, logger singlog.ContextLogger, tag string, options Options) (adapter.Outbound, error) {
@@ -106,25 +145,22 @@ func newPool(ctx context.Context, _ adapter.Router, logger singlog.ContextLogger
 	}
 	monitorMgr := monitor.FromContext(ctx)
 	normalized := normalizeOptions(options)
-	memberCount := len(normalized.Members)
 	p := &poolOutbound{
 		// Members are resolved from the already-populated runtime manager. Do not
 		// expose them as manager dependencies: replacement pools otherwise leave
 		// stale dependency edges that prevent drained node outbounds from being
 		// removed after a node-level reload.
-		Adapter: outbound.NewAdapter(Type, tag, []string{N.NetworkTCP, N.NetworkUDP}, nil),
-		ctx:     ctx,
-		logger:  logger,
-		manager: manager,
-		options: normalized,
-		mode:    normalized.Mode,
-		rng:     rand.New(rand.NewSource(time.Now().UnixNano())),
-		monitor: monitorMgr,
-		candidatesPool: sync.Pool{
-			New: func() any {
-				return make([]*memberState, 0, memberCount)
-			},
-		},
+		Adapter:     outbound.NewAdapter(Type, tag, []string{N.NetworkTCP, N.NetworkUDP}, nil),
+		ctx:         ctx,
+		logger:      logger,
+		manager:     manager,
+		options:     normalized,
+		mode:        normalized.Mode,
+		rng:         rand.New(rand.NewSource(time.Now().UnixNano())),
+		monitor:     monitorMgr,
+		memberByTag: make(map[string]*memberState, len(normalized.Members)),
+		eligibleTCP: newMemberSet(len(normalized.Members)),
+		eligibleUDP: newMemberSet(len(normalized.Members)),
 	}
 
 	return p, nil
@@ -134,6 +170,15 @@ func newPool(ctx context.Context, _ adapter.Router, logger singlog.ContextLogger
 // handed out by this pool keep their member/outbound references and can drain
 // naturally after the runtime manager swaps in a replacement pool.
 func (p *poolOutbound) Close() error {
+	p.closed.Store(true)
+	p.mu.Lock()
+	members := append([]*memberState(nil), p.members...)
+	p.mu.Unlock()
+	for _, member := range members {
+		if member.unwatch != nil {
+			member.unwatch()
+		}
+	}
 	unregisterDialer(p.Tag(), p)
 	return nil
 }
@@ -183,6 +228,7 @@ func (p *poolOutbound) Start(stage adapter.StartStage) error {
 // initializeMembersLocked must be called with p.mu held
 func (p *poolOutbound) initializeMembersLocked() error {
 	if len(p.members) > 0 {
+		p.initialized.Store(true)
 		return nil // Already initialized
 	}
 
@@ -202,6 +248,10 @@ func (p *poolOutbound) initializeMembersLocked() error {
 			shared:   state,
 			entry:    state.entryHandle(),
 		}
+		p.memberByTag[tag] = member
+		member.unwatch = state.subscribeBlacklist(func(blacklisted bool) {
+			p.setMemberEligible(member, p.options.Dedicated || !blacklisted)
+		})
 
 		// Connect to existing monitor entry if available
 		if p.monitor != nil {
@@ -230,6 +280,7 @@ func (p *poolOutbound) initializeMembersLocked() error {
 		members = append(members, member)
 	}
 	p.members = members
+	p.initialized.Store(true)
 	p.logger.Info("pool initialized with ", len(members), " members")
 
 	return nil
@@ -365,72 +416,81 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 }
 
 func (p *poolOutbound) pickMember(ctx context.Context, network string) (*memberState, error) {
-	now := time.Now()
-	candidates := p.getCandidateBuffer()
-
-	p.mu.Lock()
-	if len(p.members) == 0 {
+	if !p.initialized.Load() {
+		p.mu.Lock()
 		if err := p.initializeMembersLocked(); err != nil {
 			p.mu.Unlock()
-			p.putCandidateBuffer(candidates)
 			return nil, err
-		}
-	}
-	if inbound := adapter.ContextFrom(ctx); inbound != nil {
-		if dedicatedTag := p.options.DedicatedMembers[inbound.Inbound]; dedicatedTag != "" {
-			for _, member := range p.members {
-				if member.tag == dedicatedTag && (network == "" || common.Contains(member.outbound.Network(), network)) {
-					p.mu.Unlock()
-					p.putCandidateBuffer(candidates)
-					return member, nil
-				}
-			}
-			p.mu.Unlock()
-			p.putCandidateBuffer(candidates)
-			return nil, E.New("dedicated proxy member not found: ", dedicatedTag)
-		}
-	}
-	candidates = p.availableMembersLocked(now, network, candidates)
-	p.mu.Unlock()
-
-	if len(candidates) == 0 {
-		p.mu.Lock()
-		if p.releaseIfAllBlacklistedLocked(now) {
-			candidates = p.availableMembersLocked(now, network, candidates)
 		}
 		p.mu.Unlock()
 	}
-
-	if len(candidates) == 0 {
-		p.putCandidateBuffer(candidates)
-		return nil, E.New("no healthy proxy available")
+	if inbound := adapter.ContextFrom(ctx); inbound != nil {
+		if dedicatedTag := p.options.DedicatedMembers[inbound.Inbound]; dedicatedTag != "" {
+			member := p.memberByTag[dedicatedTag]
+			if member != nil && supportsMemberNetwork(member, network) {
+				return member, nil
+			}
+			return nil, E.New("dedicated proxy member not found: ", dedicatedTag)
+		}
 	}
-
-	member := p.selectMember(candidates)
-	p.putCandidateBuffer(candidates)
-	return member, nil
+	if member := p.selectHealthyMember(network); member != nil {
+		return member, nil
+	}
+	if p.releaseIfAllBlacklisted() {
+		if member := p.selectHealthyMember(network); member != nil {
+			return member, nil
+		}
+	}
+	return nil, E.New("no healthy proxy available")
 }
 
-func (p *poolOutbound) availableMembersLocked(now time.Time, network string, buf []*memberState) []*memberState {
-	result := buf[:0]
-	for _, member := range p.members {
-		// Check blacklist via shared state (auto-clears if expired)
-		if !p.options.Dedicated && member.shared != nil && member.shared.isBlacklisted(now) {
-			continue
+func (p *poolOutbound) selectHealthyMember(network string) *memberState {
+	// The event-maintained index is authoritative in steady state. The atomic
+	// check closes the tiny transition window between setting shared blacklist
+	// state and delivering its removal callback, without scanning the pool.
+	for attempt := 0; attempt < 2; attempt++ {
+		member := p.selectEligibleMember(network)
+		if member == nil {
+			return nil
 		}
-		if network != "" && !common.Contains(member.outbound.Network(), network) {
-			continue
+		if member.shared == nil || !member.shared.blacklistedFast.Load() {
+			return member
 		}
-		result = append(result, member)
+		p.setMemberEligible(member, false)
 	}
-	return result
+	return nil
 }
 
-func (p *poolOutbound) releaseIfAllBlacklistedLocked(now time.Time) bool {
+func supportsMemberNetwork(member *memberState, network string) bool {
+	if member == nil || member.outbound == nil || network == "" {
+		return member != nil
+	}
+	return common.Contains(member.outbound.Network(), network)
+}
+
+func (p *poolOutbound) setMemberEligible(member *memberState, eligible bool) {
+	if member == nil || p.closed.Load() {
+		return
+	}
+	p.eligibleMu.Lock()
+	if eligible && supportsMemberNetwork(member, N.NetworkTCP) {
+		p.eligibleTCP.add(member)
+	} else {
+		p.eligibleTCP.remove(member)
+	}
+	if eligible && supportsMemberNetwork(member, N.NetworkUDP) {
+		p.eligibleUDP.add(member)
+	} else {
+		p.eligibleUDP.remove(member)
+	}
+	p.eligibleMu.Unlock()
+}
+
+func (p *poolOutbound) releaseIfAllBlacklisted() bool {
 	if p.options.Dedicated || !p.options.FailOpen || len(p.members) == 0 {
 		return false
 	}
-	// Check if all members are blacklisted
+	now := time.Now()
 	for _, member := range p.members {
 		if member.shared == nil || !member.shared.isBlacklisted(now) {
 			return false
@@ -448,31 +508,55 @@ func (p *poolOutbound) releaseIfAllBlacklistedLocked(now time.Time) bool {
 	return true
 }
 
-func (p *poolOutbound) selectMember(candidates []*memberState) *memberState {
+func (p *poolOutbound) selectEligibleMember(network string) *memberState {
+	p.eligibleMu.RLock()
+	candidates := p.eligibleTCP.items
+	if network == N.NetworkUDP {
+		candidates = p.eligibleUDP.items
+	}
+	if len(candidates) == 0 {
+		p.eligibleMu.RUnlock()
+		return nil
+	}
+	var selected *memberState
 	switch p.mode {
 	case modeRandom:
 		p.rngMu.Lock()
 		idx := p.rng.Intn(len(candidates))
 		p.rngMu.Unlock()
-		return candidates[idx]
+		selected = candidates[idx]
 	case modeBalance:
-		var selected *memberState
-		var minActive int32
-		for _, member := range candidates {
-			var active int32
-			if member.shared != nil {
-				active = member.shared.activeCount()
-			}
-			if selected == nil || active < minActive {
-				selected = member
-				minActive = active
-			}
+		if len(candidates) == 1 {
+			selected = candidates[0]
+			break
 		}
-		return selected
+		p.rngMu.Lock()
+		firstIndex := p.rng.Intn(len(candidates))
+		secondIndex := p.rng.Intn(len(candidates) - 1)
+		p.rngMu.Unlock()
+		if secondIndex >= firstIndex {
+			secondIndex++
+		}
+		first := candidates[firstIndex]
+		second := candidates[secondIndex]
+		if activeConnections(second) < activeConnections(first) {
+			selected = second
+		} else {
+			selected = first
+		}
 	default:
 		idx := int(p.rrCounter.Add(1)-1) % len(candidates)
-		return candidates[idx]
+		selected = candidates[idx]
 	}
+	p.eligibleMu.RUnlock()
+	return selected
+}
+
+func activeConnections(member *memberState) int32 {
+	if member == nil || member.shared == nil {
+		return 0
+	}
+	return member.shared.activeCount()
 }
 
 func (p *poolOutbound) recordFailure(member *memberState, cause error) {
@@ -645,22 +729,4 @@ func (p *poolOutbound) decActive(member *memberState) {
 	if member.shared != nil {
 		member.shared.decActive()
 	}
-}
-
-func (p *poolOutbound) getCandidateBuffer() []*memberState {
-	if buf := p.candidatesPool.Get(); buf != nil {
-		return buf.([]*memberState)
-	}
-	return make([]*memberState, 0, len(p.options.Members))
-}
-
-func (p *poolOutbound) putCandidateBuffer(buf []*memberState) {
-	if buf == nil {
-		return
-	}
-	const maxCached = 4096
-	if cap(buf) > maxCached {
-		return
-	}
-	p.candidatesPool.Put(buf[:0])
 }
