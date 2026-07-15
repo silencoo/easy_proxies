@@ -101,21 +101,33 @@ func (m *Manager) ensureGeoLookup(cfg *config.Config) (*geoip.Lookup, error) {
 	if path == "" {
 		return nil, fmt.Errorf("GeoIP database_path is empty")
 	}
+	updateInterval := time.Duration(0)
+	if cfg.GeoIP.AutoUpdateEnabled {
+		updateInterval = cfg.GeoIP.AutoUpdateInterval
+		if updateInterval <= 0 {
+			updateInterval = 24 * time.Hour
+		}
+	}
 	m.mu.RLock()
 	current := m.geoLookup
 	currentPath := m.geoLookupPath
+	currentInterval := m.geoAutoInterval
 	m.mu.RUnlock()
-	if current != nil && currentPath == path {
+	if current != nil && currentPath == path && currentInterval == updateInterval {
 		return current, nil
 	}
-	lookup, err := geoip.New(path)
+	lookup, err := geoip.NewWithAutoUpdate(path, updateInterval)
 	if err != nil {
 		return nil, fmt.Errorf("load GeoIP database: %w", err)
 	}
+	lookup.SetUpdateCallback(func() {
+		m.handleGeoDatabaseUpdate(lookup)
+	})
 	m.mu.Lock()
 	previous := m.geoLookup
 	m.geoLookup = lookup
 	m.geoLookupPath = path
+	m.geoAutoInterval = updateInterval
 	if m.exitIPs == nil {
 		m.exitIPs = make(map[string]string)
 	}
@@ -131,10 +143,93 @@ func (m *Manager) stopGeoLookup() {
 	lookup := m.geoLookup
 	m.geoLookup = nil
 	m.geoLookupPath = ""
+	m.geoAutoInterval = 0
 	m.exitIPs = nil
 	m.mu.Unlock()
 	if lookup != nil {
 		_ = lookup.Close()
+	}
+}
+
+// handleGeoDatabaseUpdate reclassifies the last observed exit IPs against the
+// newly loaded MMDB. It deliberately does not probe the network again: the
+// database changed, while the proxy exit observations did not.
+func (m *Manager) handleGeoDatabaseUpdate(source *geoip.Lookup) {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+
+	m.mu.RLock()
+	if m.geoLookup != source || m.currentBox == nil || m.runtimeCtx == nil || m.cfg == nil {
+		m.mu.RUnlock()
+		return
+	}
+	instance := m.currentBox
+	runtimeCtx := m.runtimeCtx
+	runtimeOptions := m.runtimeOptions
+	cfg := m.copyConfigLocked()
+	exitIPs := make(map[string]string, len(m.exitIPs))
+	for tag, ip := range m.exitIPs {
+		exitIPs[tag] = ip
+	}
+	m.mu.RUnlock()
+
+	results := classifyKnownExitIPs(exitIPs, source)
+	if len(results) == 0 {
+		m.logger.Infof("GeoIP database updated; no observed proxy exit IPs need reclassification")
+		return
+	}
+	updatedOptions, err := m.installGeoPools(runtimeCtx, instance, runtimeOptions, cfg, results)
+	if err != nil {
+		m.logger.Warnf("failed to reclassify proxy pools after GeoIP update: %v", err)
+		return
+	}
+
+	m.mu.Lock()
+	if m.geoLookup != source || m.currentBox != instance {
+		m.mu.Unlock()
+		return
+	}
+	m.runtimeOptions = updatedOptions
+	m.mu.Unlock()
+	m.syncGeoRouterDialers()
+
+	regionCounts := make(map[string]int)
+	for _, result := range results {
+		regionCounts[result.Region.Code]++
+	}
+	m.logger.Infof("reclassified %d proxy exit IPs after GeoIP database update; regions=%v", len(results), regionCounts)
+}
+
+func classifyKnownExitIPs(exitIPs map[string]string, lookup ipRegionLookup) map[string]exitRegionResult {
+	results := make(map[string]exitRegionResult, len(exitIPs))
+	for tag, exitIP := range exitIPs {
+		if exitIP == "" {
+			continue
+		}
+		results[tag] = exitRegionResult{
+			ExitIP: exitIP,
+			Region: lookup.LookupIP(exitIP),
+		}
+	}
+	return results
+}
+
+func (m *Manager) syncGeoRouterDialers() {
+	m.mu.RLock()
+	router := m.geoRouter
+	m.mu.RUnlock()
+	if router == nil {
+		return
+	}
+	for _, region := range geoip.AllRegions() {
+		if dialer, ok := pool.GetDialer("pool-" + region); ok {
+			router.SetPool(region, dialer)
+		} else {
+			router.RemovePool(region)
+		}
+	}
+	if dialer, ok := pool.GetDialer(pool.Tag); ok {
+		router.SetGlobalPool(dialer)
 	}
 }
 

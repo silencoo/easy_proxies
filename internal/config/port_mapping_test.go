@@ -150,6 +150,39 @@ func TestWriteFileAtomicConcurrentWriters(t *testing.T) {
 	}
 }
 
+func TestReplaceFileAtomicReplacesExistingFile(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "source.mmdb")
+	destination := filepath.Join(dir, "active.mmdb")
+	if err := os.WriteFile(source, []byte("new database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(destination, []byte("old database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReplaceFileAtomic(source, destination); err != nil {
+		t.Fatalf("replace existing file: %v", err)
+	}
+	data, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatalf("read replacement: %v", err)
+	}
+	if string(data) != "new database" {
+		t.Fatalf("destination contains %q", data)
+	}
+	if _, err := os.Stat(source); !os.IsNotExist(err) {
+		t.Fatalf("source still exists after replacement: %v", err)
+	}
+}
+
+func TestNormalizeGeoIPAutoUpdateInterval(t *testing.T) {
+	cfg := &Config{GeoIP: GeoIPConfig{AutoUpdateEnabled: true}}
+	cfg.normalizeGeoIPConfig()
+	if cfg.GeoIP.AutoUpdateInterval != 24*time.Hour {
+		t.Fatalf("auto-update interval = %v, want 24h", cfg.GeoIP.AutoUpdateInterval)
+	}
+}
+
 func findAvailablePortRange(t *testing.T, count int) uint16 {
 	t.Helper()
 	for base := 30000; base+count < 60000; base++ {

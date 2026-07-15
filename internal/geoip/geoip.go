@@ -2,9 +2,9 @@ package geoip
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
-	"context"
 	"fmt"
 	"io"
 	"log"
@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"easy_proxies/internal/config"
 
 	"github.com/oschwald/geoip2-golang"
 )
@@ -53,6 +55,8 @@ type Lookup struct {
 	updateOnce     sync.Once
 	dnsCache       map[string]RegionInfo
 	cacheMu        sync.RWMutex
+	callbackMu     sync.RWMutex
+	onUpdate       func()
 }
 
 // EnsureDatabase checks if the GeoIP database exists, and downloads it if not
@@ -142,6 +146,16 @@ func EnsureDatabase(dbPath string) error {
 	// Validate MMDB format
 	if err := validateMMDB(tempPath); err != nil {
 		return fmt.Errorf("validation failed: %w", err)
+	}
+	// Parse the complete database before disturbing the active mapping. The
+	// lightweight metadata check above catches truncated downloads; this catches
+	// structurally invalid MMDB files.
+	candidate, err := geoip2.Open(tempPath)
+	if err != nil {
+		return fmt.Errorf("open downloaded database: %w", err)
+	}
+	if err := candidate.Close(); err != nil {
+		return fmt.Errorf("close downloaded database: %w", err)
 	}
 
 	// Atomic rename
@@ -288,31 +302,73 @@ func (l *Lookup) Update() error {
 	if err := validateMMDB(tempPath); err != nil {
 		return fmt.Errorf("validation failed: %w", err)
 	}
-
-	// Open new database
-	newDB, err := geoip2.Open(tempPath)
+	candidate, err := geoip2.Open(tempPath)
 	if err != nil {
-		return fmt.Errorf("open new database: %w", err)
+		return fmt.Errorf("open downloaded database: %w", err)
+	}
+	if err := candidate.Close(); err != nil {
+		return fmt.Errorf("close downloaded database: %w", err)
 	}
 
-	// Hot-swap the database
+	// On Windows the active MMDB is memory-mapped and cannot be replaced while
+	// open. Hold the write lock so lookups pause briefly, close the old mapping,
+	// atomically replace the file, then reopen the configured path.
 	l.mu.Lock()
 	oldDB := l.db
+	if oldDB != nil {
+		if err := oldDB.Close(); err != nil {
+			l.mu.Unlock()
+			return fmt.Errorf("close old database: %w", err)
+		}
+	}
+	l.db = nil
+	if err := config.ReplaceFileAtomic(tempPath, l.path); err != nil {
+		reopened, reopenErr := geoip2.Open(l.path)
+		l.db = reopened
+		l.mu.Unlock()
+		if reopenErr != nil {
+			return fmt.Errorf("replace database: %w; reopen previous database: %v", err, reopenErr)
+		}
+		return fmt.Errorf("replace database: %w", err)
+	}
+	newDB, err := geoip2.Open(l.path)
+	if err != nil {
+		l.mu.Unlock()
+		return fmt.Errorf("open replaced database: %w", err)
+	}
 	l.db = newDB
 	l.mu.Unlock()
-
-	// Close old database
-	if oldDB != nil {
-		oldDB.Close()
-	}
-
-	// Replace the old file with new one
-	if err := os.Rename(tempPath, l.path); err != nil {
-		log.Printf("⚠️  Failed to replace database file: %v (using in-memory version)", err)
-	}
+	l.cacheMu.Lock()
+	l.dnsCache = make(map[string]RegionInfo)
+	l.cacheMu.Unlock()
 
 	log.Printf("✅ GeoIP database updated successfully")
+	l.notifyUpdate()
 	return nil
+}
+
+// SetUpdateCallback installs a callback invoked after a successful database
+// swap. The latest callback replaces the previous one.
+func (l *Lookup) SetUpdateCallback(callback func()) {
+	l.callbackMu.Lock()
+	l.onUpdate = callback
+	l.callbackMu.Unlock()
+}
+
+func (l *Lookup) notifyUpdate() {
+	l.callbackMu.RLock()
+	callback := l.onUpdate
+	l.callbackMu.RUnlock()
+	if callback != nil {
+		func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					log.Printf("⚠️  GeoIP update callback panicked: %v", recovered)
+				}
+			}()
+			callback()
+		}()
+	}
 }
 
 // downloadDatabase downloads the GeoIP database to the specified path
@@ -381,7 +437,7 @@ func downloadDatabase(dbPath string) error {
 	tempFile = nil
 
 	// Rename to target path
-	if err := os.Rename(tempPath, dbPath); err != nil {
+	if err := config.ReplaceFileAtomic(tempPath, dbPath); err != nil {
 		return err
 	}
 	cleanup = false
@@ -401,7 +457,9 @@ func (l *Lookup) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.db != nil {
-		return l.db.Close()
+		err := l.db.Close()
+		l.db = nil
+		return err
 	}
 	return nil
 }

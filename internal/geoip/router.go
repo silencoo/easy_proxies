@@ -55,8 +55,19 @@ func (r *Router) SetPool(region string, dialer PoolDialer) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.pools[region] = dialer
-	// Clear transport cache since pools changed
-	r.transports = make(map[PoolDialer]*http.Transport)
+	r.resetTransportsLocked()
+}
+
+// RemovePool unregisters a region whose refreshed classification has no
+// members. Requests to that region fall back to the global pool.
+func (r *Router) RemovePool(region string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.pools[region]; !exists {
+		return
+	}
+	delete(r.pools, region)
+	r.resetTransportsLocked()
 }
 
 // SetGlobalPool sets the default pool for requests without region path
@@ -64,7 +75,13 @@ func (r *Router) SetGlobalPool(dialer PoolDialer) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.global = dialer
-	// Clear transport cache since pools changed
+	r.resetTransportsLocked()
+}
+
+func (r *Router) resetTransportsLocked() {
+	for _, transport := range r.transports {
+		transport.CloseIdleConnections()
+	}
 	r.transports = make(map[PoolDialer]*http.Transport)
 }
 

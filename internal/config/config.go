@@ -920,6 +920,9 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 }
 
 func (c *Config) normalizeGeoIPConfig() {
+	if c.GeoIP.AutoUpdateEnabled && c.GeoIP.AutoUpdateInterval <= 0 {
+		c.GeoIP.AutoUpdateInterval = 24 * time.Hour
+	}
 	if c.GeoIP.ExitIPURL == "" {
 		c.GeoIP.ExitIPURL = "https://api.ipify.org"
 	}
@@ -1518,6 +1521,12 @@ func WriteNodesToFile(path string, nodes []NodeConfig) error {
 // it into place only after the complete contents have been synced.
 func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 	return writeFileWithLock(path, data, perm)
+}
+
+// ReplaceFileAtomic swaps a fully-written source file over destination using
+// the platform-specific atomic replacement primitive.
+func ReplaceFileAtomic(source, destination string) error {
+	return atomicReplaceFile(source, destination)
 }
 
 // SaveNodes persists nodes to their appropriate locations based on source.

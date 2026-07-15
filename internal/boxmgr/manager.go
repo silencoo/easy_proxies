@@ -63,17 +63,18 @@ type Manager struct {
 	mu       sync.RWMutex
 	reloadMu sync.Mutex
 
-	currentBox     *box.Box
-	runtimeCtx     context.Context
-	runtimeOptions option.Options
-	monitorMgr     *monitor.Manager
-	monitorServer  *monitor.Server
-	geoRouter      *geoip.Router
-	geoLookup      *geoip.Lookup
-	geoLookupPath  string
-	exitIPs        map[string]string
-	cfg            *config.Config
-	monitorCfg     monitor.Config
+	currentBox      *box.Box
+	runtimeCtx      context.Context
+	runtimeOptions  option.Options
+	monitorMgr      *monitor.Manager
+	monitorServer   *monitor.Server
+	geoRouter       *geoip.Router
+	geoLookup       *geoip.Lookup
+	geoLookupPath   string
+	geoAutoInterval time.Duration
+	exitIPs         map[string]string
+	cfg             *config.Config
+	monitorCfg      monitor.Config
 
 	drainTimeout      time.Duration
 	minAvailableNodes int
@@ -757,6 +758,9 @@ func nodeURISet(nodes []config.NodeConfig) map[string]struct{} {
 
 // Close terminates the active instance and auxiliary components.
 func (m *Manager) Close() error {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -788,6 +792,7 @@ func (m *Manager) Close() error {
 		_ = m.geoLookup.Close()
 		m.geoLookup = nil
 		m.geoLookupPath = ""
+		m.geoAutoInterval = 0
 	}
 	m.exitIPs = nil
 	m.baseCtx = nil

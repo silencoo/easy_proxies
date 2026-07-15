@@ -144,9 +144,10 @@ The GeoIP router reuses the `listener.username` and `listener.password` for prox
 
 Key behaviors:
 - The GeoIP database (MaxMind GeoLite2-Country) is **auto-downloaded** on first startup
-- Auto-update is enabled by default (checks every 24h) with hot-reload -- no restart needed
+- When auto-update is enabled, the MMDB is checked every 24h by default and hot-reloaded without restarting listeners
 - Node region classification uses the public exit IP observed by requesting `exit_ip_url` through that exact outbound; it does not use the subscription server address
 - Classification runs at startup and after node reloads. A transient probe failure keeps the node's last observed exit IP when available; otherwise it is placed in `other`
+- After an MMDB update, saved exit IPs are immediately reclassified and the region pools/router are replaced in place; this does not repeat the external exit-IP probes or interrupt existing proxy connections
 
 ### How to Use
 

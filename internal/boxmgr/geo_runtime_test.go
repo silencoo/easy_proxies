@@ -72,3 +72,32 @@ func TestDiscoverExitRegionsUsesEachOutboundObservedIP(t *testing.T) {
 		t.Fatalf("failed node did not retain its last real exit classification: %#v", got)
 	}
 }
+
+func TestClassifyKnownExitIPsReusesObservations(t *testing.T) {
+	exitIPs := map[string]string{
+		"node-a": "8.8.8.8",
+		"node-b": "1.1.1.1",
+		"empty":  "",
+	}
+	first := classifyKnownExitIPs(exitIPs, fakeIPRegionLookup{
+		"8.8.8.8": {Code: geoip.RegionUS, Country: "United States"},
+		"1.1.1.1": {Code: geoip.RegionJP, Country: "Japan"},
+	})
+	if got := first["node-a"]; got.ExitIP != "8.8.8.8" || got.Region.Code != geoip.RegionUS {
+		t.Fatalf("initial classification mismatch: %#v", got)
+	}
+	if _, exists := first["empty"]; exists {
+		t.Fatal("empty exit IP should not be classified")
+	}
+
+	second := classifyKnownExitIPs(exitIPs, fakeIPRegionLookup{
+		"8.8.8.8": {Code: geoip.RegionSG, Country: "Singapore"},
+		"1.1.1.1": {Code: geoip.RegionUS, Country: "United States"},
+	})
+	if got := second["node-a"]; got.ExitIP != "8.8.8.8" || got.Region.Code != geoip.RegionSG {
+		t.Fatalf("updated database did not reclassify the saved observation: %#v", got)
+	}
+	if got := second["node-b"]; got.ExitIP != "1.1.1.1" || got.Region.Code != geoip.RegionUS {
+		t.Fatalf("updated database did not reclassify second observation: %#v", got)
+	}
+}

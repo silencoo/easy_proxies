@@ -51,3 +51,16 @@ func TestDiscoverExitIPRejectsInvalidResponse(t *testing.T) {
 		t.Fatal("expected invalid response to fail")
 	}
 }
+
+func TestLookupUpdateCallback(t *testing.T) {
+	lookup := &Lookup{}
+	called := 0
+	lookup.SetUpdateCallback(func() { called++ })
+	lookup.notifyUpdate()
+	if called != 1 {
+		t.Fatalf("update callback called %d times, want 1", called)
+	}
+
+	lookup.SetUpdateCallback(func() { panic("callback failure") })
+	lookup.notifyUpdate()
+}
