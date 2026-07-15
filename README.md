@@ -45,6 +45,8 @@ docker compose up -d
 go run ./cmd/easy_proxies --config config.yaml
 ```
 
+The default source build runs the proxy, subscriptions, and WebUI without optional Clash traffic streaming. Add `-tags with_clash_api` for that stream; the Docker build already enables it.
+
 ### 4. Access WebUI
 
 Open `http://localhost:9091` in your browser.
@@ -276,7 +278,7 @@ subscription_refresh:
   interval: 1h
 ```
 
-Supports Base64, plain text, and Clash YAML formats. When subscriptions are configured, fetched nodes are written to `nodes_file`. Subscription changes trigger automatic hot-reload without restart.
+Supports Base64, plain text, and Clash YAML formats. When subscriptions are configured, fetched nodes are written to `nodes_file`. Subscription changes are validated before the active sing-box instance is stopped, failed replacements roll back automatically, and dedicated node ports are restored from `port-map.yaml`. Rebinding the same listen ports still interrupts existing TCP connections briefly.
 
 ## WebUI Dashboard
 

@@ -28,6 +28,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 	baseOutbounds := make([]option.Outbound, 0, len(cfg.Nodes))
 	memberTags := make([]string, 0, len(cfg.Nodes))
 	metadata := make(map[string]poolout.MemberMeta)
+	nodesByTag := make(map[string]config.NodeConfig)
 	var failedNodes []string
 	usedTags := make(map[string]int) // Track tag usage for uniqueness
 
@@ -84,6 +85,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 			continue
 		}
 		memberTags = append(memberTags, tag)
+		nodesByTag[tag] = node
 		baseOutbounds = append(baseOutbounds, outbound)
 		meta := poolout.MemberMeta{
 			Name: node.Name,
@@ -234,6 +236,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 			FailureThreshold:  cfg.Pool.FailureThreshold,
 			BlacklistDuration: cfg.Pool.BlacklistDuration,
 			Metadata:          metadata,
+			FailOpen:          cfg.Pool.FailOpen,
 		}
 		outbounds = append(outbounds, option.Outbound{
 			Type:    poolout.Type,
@@ -259,6 +262,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 				FailureThreshold:  cfg.Pool.FailureThreshold,
 				BlacklistDuration: cfg.Pool.BlacklistDuration,
 				Metadata:          perMeta,
+				Dedicated:         true,
 			}
 			perPool := option.Outbound{
 				Type:    poolout.Type,
@@ -272,8 +276,13 @@ func Build(cfg *config.Config) (option.Options, error) {
 					ListenPort: meta.Port,
 				},
 			}
-			username := cfg.MultiPort.Username
-			password := cfg.MultiPort.Password
+			node := nodesByTag[tag]
+			username := node.Username
+			password := node.Password
+			if username == "" {
+				username = cfg.MultiPort.Username
+				password = cfg.MultiPort.Password
+			}
 			if username != "" {
 				inboundOptions.Users = []auth.User{{Username: username, Password: password}}
 			}
@@ -346,15 +355,11 @@ func Build(cfg *config.Config) (option.Options, error) {
 	}
 
 	opts := option.Options{
-		Log:       &option.LogOptions{Level: strings.ToLower(cfg.LogLevel)},
-		Inbounds:  inbounds,
-		Outbounds: outbounds,
-		Route:     &route,
-		Experimental: &option.ExperimentalOptions{
-			ClashAPI: &option.ClashAPIOptions{
-				ExternalController: "127.0.0.1:9092",
-			},
-		},
+		Log:          &option.LogOptions{Level: strings.ToLower(cfg.LogLevel)},
+		Inbounds:     inbounds,
+		Outbounds:    outbounds,
+		Route:        &route,
+		Experimental: buildExperimentalOptions(),
 	}
 	return opts, nil
 }

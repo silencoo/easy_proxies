@@ -55,6 +55,8 @@ pool:
   failure_threshold: 3
   # 黑名单持续时间
   blacklist_duration: 24h
+  # 所有节点被拉黑时是否强制重新尝试；爬虫场景建议保持 false，快速失败
+  fail_open: false
 
 # ───────────────────────────────────────────────────────────────
 # 多端口模式配置（multi-port / hybrid 模式使用）
@@ -64,6 +66,8 @@ multi_port:
   base_port: 24000      # 起始端口号
   username: mpuser      # 默认认证用户名
   password: mppass      # 默认认证密码
+  port_map_file: port-map.yaml  # 节点哈希 → 端口的持久化映射（相对 config.yaml）
+  port_reuse_delay: 24h         # 节点移除后多久才允许其他节点复用其端口
 
 # ───────────────────────────────────────────────────────────────
 # 管理面板配置
@@ -107,7 +111,7 @@ geoip:
 #   interval: 1h                # 刷新间隔（默认 1 小时）
 #   timeout: 30s                # 获取订阅的超时时间
 #   health_check_timeout: 60s   # 新节点健康检查超时
-#   drain_timeout: 30s          # 旧实例排空超时时间
+#   drain_timeout: 30s          # 兼容保留；同端口切换目前无法排空旧连接
 #   min_available_nodes: 1      # 最少可用节点数，低于此值不切换
 
 # ═══════════════════════════════════════════════════════════════

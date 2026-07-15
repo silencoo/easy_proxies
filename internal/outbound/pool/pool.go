@@ -42,6 +42,14 @@ type Options struct {
 	FailureThreshold  int
 	BlacklistDuration time.Duration
 	Metadata          map[string]MemberMeta
+	// FailOpen retries blacklisted nodes when the entire shared pool is down.
+	// It is opt-in because silently reviving known-bad nodes is unsafe for
+	// crawlers that require predictable failure handling.
+	FailOpen bool
+	// Dedicated marks a single-node pool backing a fixed inbound port. It
+	// always attempts that exact node even when the shared pool has blacklisted
+	// it; it must never clear the shared blacklist merely to make progress.
+	Dedicated bool
 }
 
 // MemberMeta carries optional descriptive information for monitoring UI.
@@ -110,46 +118,6 @@ func newPool(ctx context.Context, _ adapter.Router, logger singlog.ContextLogger
 		},
 	}
 
-	// Register nodes immediately if monitor is available
-	if monitorMgr != nil {
-		logger.Info("registering ", len(normalized.Members), " nodes to monitor")
-		for _, memberTag := range normalized.Members {
-			// Acquire shared state for this tag (creates if not exists)
-			state := acquireSharedState(memberTag)
-
-			meta := normalized.Metadata[memberTag]
-			info := monitor.NodeInfo{
-				Tag:           memberTag,
-				Name:          meta.Name,
-				URI:           meta.URI,
-				Mode:          meta.Mode,
-				ListenAddress: meta.ListenAddress,
-				Port:          meta.Port,
-				Region:        meta.Region,
-				Country:       meta.Country,
-			}
-			entry := monitorMgr.Register(info)
-			if entry != nil {
-				// Attach entry to shared state so all pool instances share it
-				state.attachEntry(entry)
-				logger.Info("registered node: ", memberTag)
-				// Set probe, release, and blacklist functions immediately
-				entry.SetRelease(p.makeReleaseByTagFunc(memberTag))
-				entry.SetBlacklistFn(p.makeBlacklistByTagFunc(memberTag))
-				if probeFn := p.makeProbeByTagFunc(memberTag); probeFn != nil {
-					entry.SetProbe(probeFn)
-				}
-			} else {
-				logger.Warn("failed to register node: ", memberTag)
-			}
-		}
-	} else {
-		logger.Warn("monitor manager is nil, skipping node registration")
-	}
-
-	// Register this pool outbound in the dialer registry for GeoIP router
-	registerDialer(tag, p)
-
 	return p, nil
 }
 
@@ -184,6 +152,10 @@ func (p *poolOutbound) Start(stage adapter.StartStage) error {
 	if err != nil {
 		return err
 	}
+	// Registration is intentionally delayed until Start. box.New is used to
+	// pre-validate reloads while the old instance is still serving traffic; it
+	// must not replace live monitor callbacks or GeoIP dialers.
+	registerDialer(p.Tag(), p)
 	// 在初始化完成后，立即在后台触发健康检查
 	if p.monitor != nil {
 		go p.probeAllMembersOnStartup()
@@ -327,6 +299,9 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 			latencyMs := res.latency.Milliseconds()
 			p.logger.Info("initial probe success for ", res.member.tag, ", latency: ", latencyMs, "ms")
 			availableCount++
+			if res.member.shared != nil {
+				res.member.shared.forceRelease()
+			}
 			if res.member.entry != nil {
 				res.member.entry.RecordSuccessWithLatency(res.latency)
 				res.member.entry.MarkInitialCheckDone(true)
@@ -406,7 +381,7 @@ func (p *poolOutbound) availableMembersLocked(now time.Time, network string, buf
 	result := buf[:0]
 	for _, member := range p.members {
 		// Check blacklist via shared state (auto-clears if expired)
-		if member.shared != nil && member.shared.isBlacklisted(now) {
+		if !p.options.Dedicated && member.shared != nil && member.shared.isBlacklisted(now) {
 			continue
 		}
 		if network != "" && !common.Contains(member.outbound.Network(), network) {
@@ -418,7 +393,7 @@ func (p *poolOutbound) availableMembersLocked(now time.Time, network string, buf
 }
 
 func (p *poolOutbound) releaseIfAllBlacklistedLocked(now time.Time) bool {
-	if len(p.members) == 0 {
+	if p.options.Dedicated || !p.options.FailOpen || len(p.members) == 0 {
 		return false
 	}
 	// Check if all members are blacklisted
@@ -433,7 +408,9 @@ func (p *poolOutbound) releaseIfAllBlacklistedLocked(now time.Time) bool {
 			member.shared.forceRelease()
 		}
 	}
-	p.logger.Warn("all upstream proxies were blacklisted, releasing them for retry")
+	if p.logger != nil {
+		p.logger.Warn("all upstream proxies were blacklisted, releasing them for retry")
+	}
 	return true
 }
 
@@ -476,6 +453,16 @@ func (p *poolOutbound) recordFailure(member *memberState, cause error) {
 	} else {
 		p.logger.Warn("proxy ", member.tag, " failure ", failures, "/", p.options.FailureThreshold, ": ", cause)
 		log.Printf("[pool] %s failure %d/%d: %v", member.tag, failures, p.options.FailureThreshold, cause)
+	}
+}
+
+func (p *poolOutbound) recordProbeFailure(member *memberState, cause error) {
+	if member.shared != nil {
+		// An explicit active probe is authoritative; exclude the node from the
+		// shared pool immediately instead of waiting for traffic failures.
+		member.shared.recordFailure(cause, 1, p.options.BlacklistDuration)
+	} else if member.entry != nil {
+		member.entry.RecordFailure(cause)
 	}
 }
 
@@ -549,9 +536,7 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 		start := time.Now()
 		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
 		if err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err)
-			}
+			p.recordProbeFailure(member, err)
 			return 0, err
 		}
 		defer conn.Close()
@@ -559,9 +544,7 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 		// Perform HTTP probe to measure actual latency (TTFB)
 		_, err = httpProbe(conn, destination.AddrString())
 		if err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err)
-			}
+			p.recordProbeFailure(member, err)
 			return 0, err
 		}
 
@@ -577,78 +560,6 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 			member.shared.forceRelease()
 		}
 		return duration, nil
-	}
-}
-
-// makeProbeByTagFunc creates a probe function that works before member initialization
-func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) (time.Duration, error) {
-	if p.monitor == nil {
-		return nil
-	}
-	destination, ok := p.monitor.DestinationForProbe()
-	if !ok {
-		return nil
-	}
-	return func(ctx context.Context) (time.Duration, error) {
-		// Ensure members are initialized
-		p.mu.Lock()
-		if len(p.members) == 0 {
-			if err := p.initializeMembersLocked(); err != nil {
-				p.mu.Unlock()
-				return 0, err
-			}
-		}
-
-		// Find the member by tag
-		var member *memberState
-		for _, m := range p.members {
-			if m.tag == tag {
-				member = m
-				break
-			}
-		}
-		p.mu.Unlock()
-
-		if member == nil {
-			return 0, E.New("member not found: ", tag)
-		}
-
-		start := time.Now()
-		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
-		if err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err)
-			}
-			return 0, err
-		}
-		defer conn.Close()
-
-		// Perform HTTP probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, destination.AddrString())
-		if err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err)
-			}
-			return 0, err
-		}
-
-		// Total duration = dial time + TTFB
-		duration := time.Since(start)
-		if member.entry != nil {
-			member.entry.RecordSuccessWithLatency(duration)
-		}
-		// Clear pool blacklist on successful probe (fixes #8, #9)
-		if member.shared != nil {
-			member.shared.forceRelease()
-		}
-		return duration, nil
-	}
-}
-
-// makeReleaseByTagFunc creates a release function that works before member initialization
-func (p *poolOutbound) makeReleaseByTagFunc(tag string) func() {
-	return func() {
-		releaseSharedMember(tag)
 	}
 }
 

@@ -145,13 +145,6 @@ func (s *sharedMemberState) activeCount() int32 {
 	return s.active.Load()
 }
 
-// releaseSharedMember clears blacklist state for a tag (called from release functions).
-func releaseSharedMember(tag string) {
-	if state, ok := lookupSharedState(tag); ok {
-		state.forceRelease()
-	}
-}
-
 // blacklistSharedMember manually blacklists a node in pool shared state.
 func blacklistSharedMember(tag string, duration time.Duration) {
 	if state, ok := lookupSharedState(tag); ok {

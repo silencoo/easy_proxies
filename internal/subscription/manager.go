@@ -15,7 +15,6 @@ import (
 	"sync"
 	"time"
 
-	"easy_proxies/internal/boxmgr"
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/monitor"
 )
@@ -25,6 +24,11 @@ type Logger interface {
 	Infof(format string, args ...any)
 	Warnf(format string, args ...any)
 	Errorf(format string, args ...any)
+}
+
+type boxManager interface {
+	CurrentPortMap() map[string]uint16
+	ReloadWithPortMap(newCfg *config.Config, portMap map[string]uint16) error
 }
 
 // Option configures the Manager.
@@ -40,7 +44,7 @@ type Manager struct {
 	mu sync.RWMutex
 
 	baseCfg    *config.Config
-	boxMgr     *boxmgr.Manager
+	boxMgr     boxManager
 	logger     Logger
 	httpClient *http.Client // Custom HTTP client with connection pooling
 
@@ -56,7 +60,7 @@ type Manager struct {
 }
 
 // New creates a SubscriptionManager.
-func New(cfg *config.Config, boxMgr *boxmgr.Manager, opts ...Option) *Manager {
+func New(cfg *config.Config, boxMgr boxManager, opts ...Option) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Create optimized HTTP client with connection pooling
@@ -99,25 +103,33 @@ func New(cfg *config.Config, boxMgr *boxmgr.Manager, opts ...Option) *Manager {
 
 // Start begins the periodic refresh loop.
 func (m *Manager) Start() {
-	if !m.baseCfg.SubscriptionRefresh.Enabled {
+	m.mu.RLock()
+	enabled := m.baseCfg.SubscriptionRefresh.Enabled
+	hasSubscriptions := len(m.baseCfg.Subscriptions) > 0
+	interval := m.baseCfg.SubscriptionRefresh.Interval
+	loopCtx := m.ctx
+	manualRefresh := m.manualRefresh
+	m.mu.RUnlock()
+	if !enabled {
 		m.logger.Infof("subscription refresh disabled")
 		return
 	}
-	if len(m.baseCfg.Subscriptions) == 0 {
+	if !hasSubscriptions {
 		m.logger.Infof("no subscriptions configured, refresh disabled")
 		return
 	}
 
-	interval := m.baseCfg.SubscriptionRefresh.Interval
 	m.logger.Infof("starting subscription refresh, interval: %s", interval)
-
-	go m.refreshLoop(interval)
+	go m.refreshLoop(loopCtx, manualRefresh, interval, enabled)
 }
 
 // Stop stops the periodic refresh.
 func (m *Manager) Stop() {
-	if m.cancel != nil {
-		m.cancel()
+	m.mu.RLock()
+	cancel := m.cancel
+	m.mu.RUnlock()
+	if cancel != nil {
+		cancel()
 	}
 
 	// Close idle connections
@@ -129,28 +141,25 @@ func (m *Manager) Stop() {
 // UpdateConfig hot-reloads subscription URLs and refresh settings without restart.
 func (m *Manager) UpdateConfig(urls []string, enabled bool, interval time.Duration) {
 	m.mu.Lock()
+	oldCancel := m.cancel
 	m.baseCfg.Subscriptions = urls
 	m.baseCfg.SubscriptionRefresh.Enabled = enabled
 	if interval > 0 {
 		m.baseCfg.SubscriptionRefresh.Interval = interval
 	}
-	m.mu.Unlock()
-
-	// Persist to config.yaml
+	effectiveInterval := m.baseCfg.SubscriptionRefresh.Interval
 	if err := m.baseCfg.SaveSettings(); err != nil {
 		m.logger.Errorf("failed to save subscription config: %v", err)
 	}
-
-	// Restart the refresh loop with new settings
-	if m.cancel != nil {
-		m.cancel()
-	}
 	ctx, cancel := context.WithCancel(context.Background())
-	m.mu.Lock()
+	manualRefresh := make(chan struct{}, 1)
 	m.ctx = ctx
 	m.cancel = cancel
-	m.manualRefresh = make(chan struct{}, 1)
+	m.manualRefresh = manualRefresh
 	m.mu.Unlock()
+	if oldCancel != nil {
+		oldCancel()
+	}
 
 	if len(urls) == 0 {
 		m.logger.Infof("no subscription URLs configured, skipping refresh")
@@ -158,13 +167,13 @@ func (m *Manager) UpdateConfig(urls []string, enabled bool, interval time.Durati
 	}
 
 	// Always start the refresh loop to handle the immediate refresh signal
-	m.logger.Infof("subscription config updated: %d URLs, enabled=%v, interval=%s", len(urls), enabled, m.baseCfg.SubscriptionRefresh.Interval)
-	go m.refreshLoop(m.baseCfg.SubscriptionRefresh.Interval)
+	m.logger.Infof("subscription config updated: %d URLs, enabled=%v, interval=%s", len(urls), enabled, effectiveInterval)
+	go m.refreshLoop(ctx, manualRefresh, effectiveInterval, enabled)
 
 	// Always trigger an immediate fetch when URLs are provided,
 	// regardless of the "enabled" flag (which only controls periodic auto-refresh)
 	select {
-	case m.manualRefresh <- struct{}{}:
+	case manualRefresh <- struct{}{}:
 		m.logger.Infof("triggered immediate refresh after config update")
 	default:
 		// A refresh is already pending
@@ -175,6 +184,7 @@ func (m *Manager) UpdateConfig(urls []string, enabled bool, interval time.Durati
 // the first refresh to complete before returning. This ensures the caller (WebUI API)
 // can confirm the update took effect.
 func (m *Manager) UpdateConfigAndRefresh(urls []string, enabled bool, interval time.Duration) error {
+	startCount := m.Status().RefreshCount
 	m.UpdateConfig(urls, enabled, interval)
 
 	if len(urls) == 0 {
@@ -182,19 +192,22 @@ func (m *Manager) UpdateConfigAndRefresh(urls []string, enabled bool, interval t
 	}
 
 	// Wait for the refresh triggered by UpdateConfig to complete
+	m.mu.RLock()
 	timeout := m.baseCfg.SubscriptionRefresh.Timeout
+	healthTimeout := m.baseCfg.SubscriptionRefresh.HealthCheckTimeout
+	waitCtx := m.ctx
+	m.mu.RUnlock()
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	deadline := timeout + m.baseCfg.SubscriptionRefresh.HealthCheckTimeout
+	deadline := timeout + healthTimeout
 
-	ctx, cancel := context.WithTimeout(m.ctx, deadline)
+	ctx, cancel := context.WithTimeout(waitCtx, deadline)
 	defer cancel()
 
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
-	startCount := m.Status().RefreshCount
 	for {
 		select {
 		case <-ctx.Done():
@@ -213,26 +226,31 @@ func (m *Manager) UpdateConfigAndRefresh(urls []string, enabled bool, interval t
 
 // RefreshNow triggers an immediate refresh.
 func (m *Manager) RefreshNow() error {
+	startCount := m.Status().RefreshCount
+	m.mu.RLock()
+	manualRefresh := m.manualRefresh
+	timeout := m.baseCfg.SubscriptionRefresh.Timeout
+	healthTimeout := m.baseCfg.SubscriptionRefresh.HealthCheckTimeout
+	waitCtx := m.ctx
+	m.mu.RUnlock()
 	select {
-	case m.manualRefresh <- struct{}{}:
+	case manualRefresh <- struct{}{}:
 	default:
 		// Already a refresh pending
 	}
 
 	// Wait for refresh to complete or timeout
-	timeout := m.baseCfg.SubscriptionRefresh.Timeout
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
 
-	ctx, cancel := context.WithTimeout(m.ctx, timeout+m.baseCfg.SubscriptionRefresh.HealthCheckTimeout)
+	ctx, cancel := context.WithTimeout(waitCtx, timeout+healthTimeout)
 	defer cancel()
 
 	// Poll status until refresh completes
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
-	startCount := m.Status().RefreshCount
 	for {
 		select {
 		case <-ctx.Done():
@@ -261,11 +279,7 @@ func (m *Manager) Status() monitor.SubscriptionStatus {
 }
 
 // refreshLoop runs the periodic refresh.
-func (m *Manager) refreshLoop(interval time.Duration) {
-	m.mu.RLock()
-	autoEnabled := m.baseCfg.SubscriptionRefresh.Enabled
-	m.mu.RUnlock()
-
+func (m *Manager) refreshLoop(loopCtx context.Context, manualRefresh <-chan struct{}, interval time.Duration, autoEnabled bool) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -278,7 +292,7 @@ func (m *Manager) refreshLoop(interval time.Duration) {
 
 	for {
 		select {
-		case <-m.ctx.Done():
+		case <-loopCtx.Done():
 			return
 		case <-ticker.C:
 			// Only do periodic refresh when auto-refresh is enabled
@@ -289,7 +303,7 @@ func (m *Manager) refreshLoop(interval time.Duration) {
 			m.mu.Lock()
 			m.status.NextRefresh = time.Now().Add(interval)
 			m.mu.Unlock()
-		case <-m.manualRefresh:
+		case <-manualRefresh:
 			// Always honor manual/immediate refresh regardless of enabled flag
 			m.doRefresh()
 			if autoEnabled {
@@ -346,8 +360,19 @@ func (m *Manager) doRefresh() {
 
 	m.logger.Infof("fetched %d nodes from subscriptions", len(nodes))
 
-	// Write subscription nodes to nodes.txt
+	// Persist the candidate nodes before switching runtime, but retain the old
+	// bytes so a failed reload can restore the last bootable configuration.
 	nodesFilePath := m.getNodesFilePath()
+	previousNodes, readErr := os.ReadFile(nodesFilePath)
+	previousFileExisted := readErr == nil
+	if readErr != nil && !os.IsNotExist(readErr) {
+		m.logger.Errorf("failed to snapshot nodes.txt: %v", readErr)
+		m.mu.Lock()
+		m.status.LastError = fmt.Sprintf("snapshot nodes.txt: %v", readErr)
+		m.status.LastRefresh = time.Now()
+		m.mu.Unlock()
+		return
+	}
 	if err := m.writeNodesToFile(nodesFilePath, nodes); err != nil {
 		m.logger.Errorf("failed to write nodes.txt: %v", err)
 		m.mu.Lock()
@@ -358,18 +383,6 @@ func (m *Manager) doRefresh() {
 	}
 	m.logger.Infof("written %d nodes to %s", len(nodes), nodesFilePath)
 
-	// Update hash and mod time after writing
-	newHash := m.computeNodesHash(nodes)
-	m.mu.Lock()
-	m.lastSubHash = newHash
-	if info, err := os.Stat(nodesFilePath); err == nil {
-		m.lastNodesModTime = info.ModTime()
-	} else {
-		m.lastNodesModTime = time.Now()
-	}
-	m.status.NodesModified = false
-	m.mu.Unlock()
-
 	// Get current port mapping to preserve existing node ports
 	portMap := m.boxMgr.CurrentPortMap()
 
@@ -378,15 +391,38 @@ func (m *Manager) doRefresh() {
 
 	// Trigger BoxManager reload with port preservation
 	if err := m.boxMgr.ReloadWithPortMap(newCfg, portMap); err != nil {
+		var restoreErr error
+		if previousFileExisted {
+			restoreErr = config.WriteFileAtomic(nodesFilePath, previousNodes, 0o644)
+		} else {
+			restoreErr = os.Remove(nodesFilePath)
+			if os.IsNotExist(restoreErr) {
+				restoreErr = nil
+			}
+		}
 		m.logger.Errorf("reload failed: %v", err)
 		m.mu.Lock()
-		m.status.LastError = err.Error()
+		if restoreErr != nil {
+			m.status.LastError = fmt.Sprintf("%v; restore nodes.txt: %v", err, restoreErr)
+		} else {
+			m.status.LastError = err.Error()
+		}
 		m.status.LastRefresh = time.Now()
 		m.mu.Unlock()
 		return
 	}
 
+	// Only publish modification metadata after both disk and runtime agree.
+	newHash := m.computeNodesHash(nodes)
 	m.mu.Lock()
+	m.baseCfg = newCfg
+	m.lastSubHash = newHash
+	if info, err := os.Stat(nodesFilePath); err == nil {
+		m.lastNodesModTime = info.ModTime()
+	} else {
+		m.lastNodesModTime = time.Now()
+	}
+	m.status.NodesModified = false
 	m.status.LastRefresh = time.Now()
 	m.status.NodeCount = len(nodes)
 	m.status.LastError = ""
@@ -397,23 +433,19 @@ func (m *Manager) doRefresh() {
 
 // getNodesFilePath returns the path to nodes.txt.
 func (m *Manager) getNodesFilePath() string {
-	if m.baseCfg.NodesFile != "" {
-		return m.baseCfg.NodesFile
+	m.mu.RLock()
+	nodesFile := m.baseCfg.NodesFile
+	configPath := m.baseCfg.FilePath()
+	m.mu.RUnlock()
+	if nodesFile != "" {
+		return nodesFile
 	}
-	return filepath.Join(filepath.Dir(m.baseCfg.FilePath()), "nodes.txt")
+	return filepath.Join(filepath.Dir(configPath), "nodes.txt")
 }
 
 // writeNodesToFile writes nodes to a file (one URI per line).
 func (m *Manager) writeNodesToFile(path string, nodes []config.NodeConfig) error {
-	var lines []string
-	for _, node := range nodes {
-		lines = append(lines, node.URI)
-	}
-	content := strings.Join(lines, "\n")
-	if len(lines) > 0 {
-		content += "\n"
-	}
-	return os.WriteFile(path, []byte(content), 0o644)
+	return config.WriteNodesToFile(path, nodes)
 }
 
 // computeNodesHash computes a hash of node URIs for change detection.
@@ -493,13 +525,17 @@ func (m *Manager) fetchAllSubscriptions() ([]config.NodeConfig, error) {
 	var allNodes []config.NodeConfig
 	var lastErr error
 
+	m.mu.RLock()
 	timeout := m.baseCfg.SubscriptionRefresh.Timeout
+	urls := append([]string(nil), m.baseCfg.Subscriptions...)
+	fetchCtx := m.ctx
+	m.mu.RUnlock()
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
 
-	for _, subURL := range m.baseCfg.Subscriptions {
-		nodes, err := m.fetchSubscription(subURL, timeout)
+	for _, subURL := range urls {
+		nodes, err := m.fetchSubscription(fetchCtx, subURL, timeout)
 		if err != nil {
 			m.logger.Warnf("failed to fetch %s: %v", subURL, err)
 			lastErr = err
@@ -517,8 +553,8 @@ func (m *Manager) fetchAllSubscriptions() ([]config.NodeConfig, error) {
 }
 
 // fetchSubscription fetches and parses a single subscription URL.
-func (m *Manager) fetchSubscription(subURL string, timeout time.Duration) ([]config.NodeConfig, error) {
-	ctx, cancel := context.WithTimeout(m.ctx, timeout)
+func (m *Manager) fetchSubscription(parent context.Context, subURL string, timeout time.Duration) ([]config.NodeConfig, error) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, "GET", subURL, nil)
@@ -555,24 +591,13 @@ func (m *Manager) fetchSubscription(subURL string, timeout time.Duration) ([]con
 // createNewConfig creates a new config with updated nodes while preserving other settings.
 func (m *Manager) createNewConfig(nodes []config.NodeConfig) *config.Config {
 	// Deep copy base config
+	m.mu.RLock()
 	newCfg := *m.baseCfg
-
-	// Assign port numbers to nodes in multi-port mode
-	if newCfg.Mode == "multi-port" {
-		portCursor := newCfg.MultiPort.BasePort
-		for i := range nodes {
-			nodes[i].Port = portCursor
-			portCursor++
-			// Apply default credentials
-			if nodes[i].Username == "" {
-				nodes[i].Username = newCfg.MultiPort.Username
-				nodes[i].Password = newCfg.MultiPort.Password
-			}
-		}
-	}
+	m.mu.RUnlock()
 
 	// Process node names
 	for i := range nodes {
+		nodes[i].Source = config.NodeSourceSubscription
 		nodes[i].Name = strings.TrimSpace(nodes[i].Name)
 		nodes[i].URI = strings.TrimSpace(nodes[i].URI)
 

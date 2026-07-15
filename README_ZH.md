@@ -53,6 +53,8 @@ docker compose up -d
 go run ./cmd/easy_proxies -config config.yaml
 ```
 
+默认源码构建可直接运行代理、订阅和 WebUI；实时 Clash 流量流需要使用 `-tags with_clash_api`（Docker 镜像已包含该标签）。
+
 ## 最小配置示例（Pool）
 
 ```yaml
@@ -113,6 +115,8 @@ dns:
 - `multi-port`：每个节点一个独立本地 HTTP/SOCKS5 端口。
 - `hybrid`：同时启用 pool + multi-port。
 
+多端口模式会把节点规范化 URI 的哈希与端口持久化到配置目录下的 `port-map.yaml`。订阅改名、重排或进程重启不会改变已有节点端口；节点删除后，端口默认保留 24 小时再允许其他节点复用。可通过 `multi_port.port_map_file` 和 `multi_port.port_reuse_delay` 调整。
+
 ## 节点来源行为
 
 - 配置了 `subscriptions` 时：
@@ -156,7 +160,7 @@ dns:
 
 ## 重要运行说明
 
-- 重载（`/api/reload` 或订阅刷新）会中断现有连接。
+- 新配置会在旧实例停止前完成构建验证，失败时恢复旧的 `nodes_file` 和运行配置；由于相同监听端口仍需重新绑定，重载会短暂中断现有连接。
 - Settings API 会把配置写回 `config.yaml`；部分设置需要重载后才能完全生效。
 - 省略项默认值可在 `internal/config/config.go` 中查看。
 - 日志轮转通过 `log` 配置段设置；当 `output: file` 时，日志同时写入控制台和文件，并自动轮转。

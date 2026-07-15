@@ -1,7 +1,9 @@
 package config
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -72,14 +74,17 @@ type PoolConfig struct {
 	Mode              string        `yaml:"mode"`
 	FailureThreshold  int           `yaml:"failure_threshold"`
 	BlacklistDuration time.Duration `yaml:"blacklist_duration"`
+	FailOpen          bool          `yaml:"fail_open,omitempty"`
 }
 
 // MultiPortConfig defines address/credential defaults for multi-port mode.
 type MultiPortConfig struct {
-	Address  string `yaml:"address"`
-	BasePort uint16 `yaml:"base_port"`
-	Username string `yaml:"username"`
-	Password string `yaml:"password"`
+	Address        string        `yaml:"address"`
+	BasePort       uint16        `yaml:"base_port"`
+	Username       string        `yaml:"username"`
+	Password       string        `yaml:"password"`
+	PortMapFile    string        `yaml:"port_map_file,omitempty"`
+	PortReuseDelay time.Duration `yaml:"port_reuse_delay,omitempty"`
 }
 
 // ManagementConfig controls the monitoring HTTP endpoint.
@@ -119,10 +124,62 @@ type NodeConfig struct {
 	Source   NodeSource `yaml:"-" json:"source,omitempty"` // Runtime only, not persisted
 }
 
-// NodeKey returns a unique identifier for the node based on its URI.
-// This is used to preserve port assignments across reloads.
+// NodeKey returns a stable, non-secret identifier for a node. Display names and
+// URL query ordering do not affect the key, so subscription reordering/renaming
+// does not change a node's dedicated port.
 func (n *NodeConfig) NodeKey() string {
-	return n.URI
+	canonical := canonicalNodeURI(n.URI)
+	sum := sha256.Sum256([]byte(canonical))
+	return hex.EncodeToString(sum[:])
+}
+
+func canonicalNodeURI(rawURI string) string {
+	rawURI = strings.TrimSpace(rawURI)
+	if rawURI == "" {
+		return ""
+	}
+
+	if strings.HasPrefix(strings.ToLower(rawURI), "vmess://") {
+		payload := rawURI[len("vmess://"):]
+		if idx := strings.IndexByte(payload, '#'); idx >= 0 {
+			payload = payload[:idx]
+		}
+		payload = strings.TrimSpace(payload)
+		encodings := []*base64.Encoding{
+			base64.StdEncoding,
+			base64.RawStdEncoding,
+			base64.URLEncoding,
+			base64.RawURLEncoding,
+		}
+		for _, encoding := range encodings {
+			decoded, err := encoding.DecodeString(payload)
+			if err != nil {
+				continue
+			}
+			var document map[string]any
+			if json.Unmarshal(decoded, &document) != nil {
+				continue
+			}
+			delete(document, "ps")
+			canonical, err := json.Marshal(document)
+			if err == nil {
+				return "vmess://" + string(canonical)
+			}
+		}
+	}
+
+	parsed, err := url.Parse(rawURI)
+	if err != nil {
+		return rawURI
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	parsed.Host = strings.ToLower(parsed.Host)
+	parsed.Fragment = ""
+	parsed.RawFragment = ""
+	if parsed.RawQuery != "" {
+		parsed.RawQuery = parsed.Query().Encode()
+	}
+	return parsed.String()
 }
 
 // Load reads YAML config from disk and applies defaults/validation.
@@ -230,6 +287,9 @@ func (c *Config) normalize() error {
 	if c.MultiPort.BasePort == 0 {
 		c.MultiPort.BasePort = 24000
 	}
+	if c.MultiPort.PortReuseDelay <= 0 {
+		c.MultiPort.PortReuseDelay = defaultPortReuseTTL
+	}
 	if c.Management.Listen == "" {
 		c.Management.Listen = "127.0.0.1:9091"
 	}
@@ -320,7 +380,6 @@ func (c *Config) normalize() error {
 	if len(c.Nodes) == 0 {
 		return errors.New("config.nodes cannot be empty (configure nodes in config or use nodes_file)")
 	}
-	portCursor := c.MultiPort.BasePort
 	for idx := range c.Nodes {
 		c.Nodes[idx].Name = strings.TrimSpace(c.Nodes[idx].Name)
 		c.Nodes[idx].URI = strings.TrimSpace(c.Nodes[idx].URI)
@@ -338,28 +397,9 @@ func (c *Config) normalize() error {
 			c.Nodes[idx].Name = fmt.Sprintf("node-%d", idx)
 		}
 
-		// Auto-assign port in multi-port/hybrid mode, skip occupied ports
-		if c.Nodes[idx].Port == 0 && (c.Mode == "multi-port" || c.Mode == "hybrid") {
-			for !IsPortAvailable(c.MultiPort.Address, portCursor) {
-				log.Printf("⚠️  Port %d is in use, trying next port", portCursor)
-				portCursor++
-				if portCursor > 65535 {
-					return fmt.Errorf("no available ports found starting from %d", c.MultiPort.BasePort)
-				}
-			}
-			c.Nodes[idx].Port = portCursor
-			portCursor++
-		} else if c.Nodes[idx].Port == 0 {
-			c.Nodes[idx].Port = portCursor
-			portCursor++
-		}
-
-		if c.Mode == "multi-port" || c.Mode == "hybrid" {
-			if c.Nodes[idx].Username == "" {
-				c.Nodes[idx].Username = c.MultiPort.Username
-				c.Nodes[idx].Password = c.MultiPort.Password
-			}
-		}
+	}
+	if err := c.assignNodePorts(nil, true); err != nil {
+		return err
 	}
 	if c.LogLevel == "" {
 		c.LogLevel = "info"
@@ -368,35 +408,10 @@ func (c *Config) normalize() error {
 	// Log config defaults
 	c.normalizeLogConfig()
 
-	// Auto-fix port conflicts in hybrid mode (pool port vs multi-port)
-	if c.Mode == "hybrid" {
-		poolPort := c.Listener.Port
-		usedPorts := make(map[uint16]bool)
-		usedPorts[poolPort] = true
-		for idx := range c.Nodes {
-			usedPorts[c.Nodes[idx].Port] = true
-		}
-		for idx := range c.Nodes {
-			if c.Nodes[idx].Port == poolPort {
-				// Find next available port
-				newPort := c.Nodes[idx].Port + 1
-				for usedPorts[newPort] || !IsPortAvailable(c.MultiPort.Address, newPort) {
-					newPort++
-					if newPort > 65535 {
-						return fmt.Errorf("no available port for node %q after conflict with pool port %d", c.Nodes[idx].Name, poolPort)
-					}
-				}
-				log.Printf("⚠️  Node %q port %d conflicts with pool port, reassigned to %d", c.Nodes[idx].Name, poolPort, newPort)
-				usedPorts[newPort] = true
-				c.Nodes[idx].Port = newPort
-			}
-		}
-	}
-
 	return nil
 }
 
-// BuildPortMap creates a mapping from node URI to port for existing nodes.
+// BuildPortMap creates a mapping from stable node key to port for existing nodes.
 // This is used to preserve port assignments when reloading configuration.
 func (c *Config) BuildPortMap() map[string]uint16 {
 	portMap := make(map[string]uint16)
@@ -406,6 +421,252 @@ func (c *Config) BuildPortMap() map[string]uint16 {
 		}
 	}
 	return portMap
+}
+
+const (
+	portMappingVersion  = 1
+	defaultPortMapFile  = "port-map.yaml"
+	defaultPortReuseTTL = 24 * time.Hour
+)
+
+type portLease struct {
+	Port       uint16     `yaml:"port"`
+	ReleasedAt *time.Time `yaml:"released_at,omitempty"`
+}
+
+type portMappingState struct {
+	Version int                  `yaml:"version"`
+	Leases  map[string]portLease `yaml:"leases"`
+}
+
+func newPortMappingState() *portMappingState {
+	return &portMappingState{
+		Version: portMappingVersion,
+		Leases:  make(map[string]portLease),
+	}
+}
+
+func (c *Config) portMapPath() string {
+	path := strings.TrimSpace(c.MultiPort.PortMapFile)
+	if path == "" {
+		path = defaultPortMapFile
+	}
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path)
+	}
+	if c.filePath == "" {
+		return filepath.Clean(path)
+	}
+	return filepath.Join(filepath.Dir(c.filePath), path)
+}
+
+func (c *Config) loadPortMappingState() (*portMappingState, error) {
+	path := c.portMapPath()
+	if path == "" {
+		return newPortMappingState(), nil
+	}
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return newPortMappingState(), nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read port map %q: %w", path, err)
+	}
+
+	state := newPortMappingState()
+	if err := yaml.Unmarshal(data, state); err != nil {
+		return nil, fmt.Errorf("decode port map %q: %w", path, err)
+	}
+	if state.Version != 0 && state.Version != portMappingVersion {
+		return nil, fmt.Errorf("unsupported port map version %d in %q", state.Version, path)
+	}
+	state.Version = portMappingVersion
+	if state.Leases == nil {
+		state.Leases = make(map[string]portLease)
+	}
+	for key, lease := range state.Leases {
+		if strings.TrimSpace(key) == "" || lease.Port == 0 {
+			delete(state.Leases, key)
+		}
+	}
+	return state, nil
+}
+
+func (c *Config) savePortMappingState(state *portMappingState) error {
+	if c.Mode != "multi-port" && c.Mode != "hybrid" {
+		return nil
+	}
+	if state == nil {
+		return errors.New("port mapping state is nil")
+	}
+	state.Version = portMappingVersion
+	if state.Leases == nil {
+		state.Leases = make(map[string]portLease)
+	}
+	data, err := yaml.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("encode port map: %w", err)
+	}
+	if err := writeFileWithLock(c.portMapPath(), data, 0o600); err != nil {
+		return fmt.Errorf("write port map: %w", err)
+	}
+	return nil
+}
+
+func (c *Config) pruneExpiredPortLeases(state *portMappingState, activeKeys map[string]struct{}, now time.Time) {
+	reuseDelay := c.MultiPort.PortReuseDelay
+	if reuseDelay <= 0 {
+		reuseDelay = defaultPortReuseTTL
+	}
+	for key, lease := range state.Leases {
+		if _, active := activeKeys[key]; active {
+			continue
+		}
+		if lease.ReleasedAt == nil {
+			releasedAt := now
+			lease.ReleasedAt = &releasedAt
+			state.Leases[key] = lease
+			continue
+		}
+		if now.Sub(*lease.ReleasedAt) >= reuseDelay {
+			delete(state.Leases, key)
+		}
+	}
+}
+
+func (c *Config) assignNodePorts(runtimeMap map[string]uint16, persist bool) error {
+	if c.Mode != "multi-port" && c.Mode != "hybrid" {
+		portCursor := c.MultiPort.BasePort
+		for idx := range c.Nodes {
+			if c.Nodes[idx].Port == 0 {
+				c.Nodes[idx].Port = portCursor
+				portCursor++
+			}
+		}
+		return nil
+	}
+
+	state, err := c.loadPortMappingState()
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	activeKeys := make(map[string]struct{}, len(c.Nodes))
+	for idx := range c.Nodes {
+		activeKeys[c.Nodes[idx].NodeKey()] = struct{}{}
+	}
+	c.pruneExpiredPortLeases(state, activeKeys, now)
+
+	reserved := make(map[uint16]string)
+	for key, lease := range state.Leases {
+		if _, active := activeKeys[key]; !active {
+			reserved[lease.Port] = key
+		}
+	}
+	used := make(map[uint16]string, len(c.Nodes)+1)
+	if c.Mode == "hybrid" {
+		used[c.Listener.Port] = "pool-listener"
+	}
+
+	for idx := range c.Nodes {
+		node := &c.Nodes[idx]
+		key := node.NodeKey()
+		explicitPort := node.Port > 0
+		candidate := node.Port
+		if candidate == 0 && runtimeMap != nil {
+			candidate = runtimeMap[key]
+		}
+		if candidate == 0 {
+			candidate = state.Leases[key].Port
+		}
+
+		if candidate > 0 {
+			_, alreadyUsed := used[candidate]
+			_, heldForRemovedNode := reserved[candidate]
+			if !alreadyUsed && (explicitPort || !heldForRemovedNode) {
+				node.Port = candidate
+				used[candidate] = key
+				continue
+			}
+			log.Printf("⚠️  Port %d for node %q is unavailable or reserved; assigning a new stable port", candidate, node.Name)
+		}
+		node.Port = 0
+	}
+
+	portCursor := int(c.MultiPort.BasePort)
+	if portCursor <= 0 {
+		portCursor = 24000
+	}
+	for idx := range c.Nodes {
+		node := &c.Nodes[idx]
+		if node.Port == 0 {
+			for {
+				if portCursor > 65535 {
+					return fmt.Errorf("no available ports found starting from %d", c.MultiPort.BasePort)
+				}
+				candidate := uint16(portCursor)
+				_, alreadyUsed := used[candidate]
+				_, reservedForRemovedNode := reserved[candidate]
+				if !alreadyUsed && !reservedForRemovedNode && IsPortAvailable(c.MultiPort.Address, candidate) {
+					node.Port = candidate
+					used[candidate] = node.NodeKey()
+					portCursor++
+					break
+				}
+				portCursor++
+			}
+			log.Printf("📌 Assigned stable port %d for node %q", node.Port, node.Name)
+		}
+
+		if node.Username == "" {
+			node.Username = c.MultiPort.Username
+			node.Password = c.MultiPort.Password
+		}
+	}
+
+	for idx := range c.Nodes {
+		node := &c.Nodes[idx]
+		key := node.NodeKey()
+		for otherKey, lease := range state.Leases {
+			if otherKey != key && lease.Port == node.Port {
+				delete(state.Leases, otherKey)
+			}
+		}
+		state.Leases[key] = portLease{Port: node.Port}
+	}
+	c.pruneExpiredPortLeases(state, activeKeys, now)
+
+	if persist {
+		return c.savePortMappingState(state)
+	}
+	return nil
+}
+
+// PersistPortMap commits the current node-to-port assignments after a
+// successful start/reload.
+func (c *Config) PersistPortMap() error {
+	if c == nil || (c.Mode != "multi-port" && c.Mode != "hybrid") {
+		return nil
+	}
+	state, err := c.loadPortMappingState()
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	activeKeys := make(map[string]struct{}, len(c.Nodes))
+	for idx := range c.Nodes {
+		node := &c.Nodes[idx]
+		key := node.NodeKey()
+		activeKeys[key] = struct{}{}
+		for otherKey, lease := range state.Leases {
+			if otherKey != key && lease.Port == node.Port {
+				delete(state.Leases, otherKey)
+			}
+		}
+		state.Leases[key] = portLease{Port: node.Port}
+	}
+	c.pruneExpiredPortLeases(state, activeKeys, now)
+	return c.savePortMappingState(state)
 }
 
 // NormalizeWithPortMap applies defaults and validation, preserving port assignments
@@ -443,6 +704,9 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	if c.MultiPort.BasePort == 0 {
 		c.MultiPort.BasePort = 24000
 	}
+	if c.MultiPort.PortReuseDelay <= 0 {
+		c.MultiPort.PortReuseDelay = defaultPortReuseTTL
+	}
 	if c.Management.Listen == "" {
 		c.Management.Listen = "127.0.0.1:9091"
 	}
@@ -473,13 +737,6 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 		return errors.New("config.nodes cannot be empty")
 	}
 
-	// Build set of ports already assigned from portMap
-	usedPorts := make(map[uint16]bool)
-	if c.Mode == "hybrid" {
-		usedPorts[c.Listener.Port] = true
-	}
-
-	// First pass: assign ports from portMap for existing nodes
 	for idx := range c.Nodes {
 		c.Nodes[idx].Name = strings.TrimSpace(c.Nodes[idx].Name)
 		c.Nodes[idx].URI = strings.TrimSpace(c.Nodes[idx].URI)
@@ -494,45 +751,9 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 		if c.Nodes[idx].Name == "" {
 			c.Nodes[idx].Name = fmt.Sprintf("node-%d", idx)
 		}
-
-		// Check if this node has a preserved port from portMap
-		if c.Mode == "multi-port" || c.Mode == "hybrid" {
-			nodeKey := c.Nodes[idx].NodeKey()
-			if existingPort, ok := portMap[nodeKey]; ok && existingPort > 0 {
-				c.Nodes[idx].Port = existingPort
-				usedPorts[existingPort] = true
-				log.Printf("✅ Preserved port %d for node %q", existingPort, c.Nodes[idx].Name)
-			}
-		}
 	}
-
-	// Second pass: assign new ports for nodes without preserved ports
-	portCursor := c.MultiPort.BasePort
-	for idx := range c.Nodes {
-		if c.Nodes[idx].Port == 0 && (c.Mode == "multi-port" || c.Mode == "hybrid") {
-			// Find next available port that's not used
-			for usedPorts[portCursor] || !IsPortAvailable(c.MultiPort.Address, portCursor) {
-				portCursor++
-				if portCursor > 65535 {
-					return fmt.Errorf("no available ports found starting from %d", c.MultiPort.BasePort)
-				}
-			}
-			c.Nodes[idx].Port = portCursor
-			usedPorts[portCursor] = true
-			log.Printf("📌 Assigned new port %d for node %q", portCursor, c.Nodes[idx].Name)
-			portCursor++
-		} else if c.Nodes[idx].Port == 0 {
-			c.Nodes[idx].Port = portCursor
-			portCursor++
-		}
-
-		// Apply default credentials
-		if c.Mode == "multi-port" || c.Mode == "hybrid" {
-			if c.Nodes[idx].Username == "" {
-				c.Nodes[idx].Username = c.MultiPort.Username
-				c.Nodes[idx].Password = c.MultiPort.Password
-			}
-		}
+	if err := c.assignNodePorts(portMap, false); err != nil {
+		return err
 	}
 
 	if c.LogLevel == "" {
@@ -1104,6 +1325,17 @@ func writeNodesToFile(path string, nodes []NodeConfig) error {
 	return writeFileWithLock(path, []byte(content), 0o644)
 }
 
+// WriteNodesToFile atomically persists a URI-per-line node file.
+func WriteNodesToFile(path string, nodes []NodeConfig) error {
+	return writeNodesToFile(path, nodes)
+}
+
+// WriteFileAtomic writes a file under an inter-process sidecar lock and swaps
+// it into place only after the complete contents have been synced.
+func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
+	return writeFileWithLock(path, data, perm)
+}
+
 // SaveNodes persists nodes to their appropriate locations based on source.
 // - subscription/nodes_file nodes → nodes.txt (or configured nodes_file)
 // - inline nodes → config.yaml nodes array
@@ -1241,26 +1473,52 @@ func IsPortAvailable(address string, port uint16) bool {
 
 // writeFileWithLock writes data to a file with exclusive locking.
 func writeFileWithLock(path string, data []byte, perm os.FileMode) error {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, perm)
-	if err != nil {
-		return fmt.Errorf("open file: %w", err)
+	if strings.TrimSpace(path) == "" {
+		return errors.New("file path is empty")
 	}
-	defer f.Close()
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create parent directory: %w", err)
+	}
 
-	// Acquire exclusive lock
-	if err := lockFile(f); err != nil {
+	// Lock a stable sidecar rather than the destination. The destination can
+	// then be atomically replaced without truncating the last good file first.
+	lockPath := path + ".lock"
+	lockHandle, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return fmt.Errorf("open lock file: %w", err)
+	}
+	defer lockHandle.Close()
+
+	if err := lockFile(lockHandle); err != nil {
 		return fmt.Errorf("lock file: %w", err)
 	}
-	defer unlockFile(f)
+	defer unlockFile(lockHandle)
 
-	// Write data
-	if _, err := f.Write(data); err != nil {
+	tempFile, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temporary file: %w", err)
+	}
+	tempPath := tempFile.Name()
+	defer os.Remove(tempPath)
+
+	if err := tempFile.Chmod(perm); err != nil {
+		tempFile.Close()
+		return fmt.Errorf("set temporary file permissions: %w", err)
+	}
+	if _, err := tempFile.Write(data); err != nil {
+		tempFile.Close()
 		return fmt.Errorf("write file: %w", err)
 	}
-
-	// Ensure data is written to disk
-	if err := f.Sync(); err != nil {
+	if err := tempFile.Sync(); err != nil {
+		tempFile.Close()
 		return fmt.Errorf("sync file: %w", err)
+	}
+	if err := tempFile.Close(); err != nil {
+		return fmt.Errorf("close temporary file: %w", err)
+	}
+	if err := atomicReplaceFile(tempPath, path); err != nil {
+		return fmt.Errorf("replace file: %w", err)
 	}
 
 	return nil

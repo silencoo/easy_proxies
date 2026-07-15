@@ -70,12 +70,12 @@ type SubscriptionStatus struct {
 
 // Server exposes HTTP endpoints for monitoring.
 type Server struct {
-	cfg          Config
-	cfgMu        sync.RWMutex   // 保护动态配置字段
-	cfgSrc       *config.Config // 可持久化的配置对象
-	mgr          *Manager
-	srv          *http.Server
-	logger       *log.Logger
+	cfg    Config
+	cfgMu  sync.RWMutex   // 保护动态配置字段
+	cfgSrc *config.Config // 可持久化的配置对象
+	mgr    *Manager
+	srv    *http.Server
+	logger *log.Logger
 
 	// Session management
 	sessionMu  sync.RWMutex
@@ -846,15 +846,18 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				"password": cfg.Listener.Password,
 			}
 			resp["multi_port"] = map[string]any{
-				"address":   cfg.MultiPort.Address,
-				"base_port": cfg.MultiPort.BasePort,
-				"username":  cfg.MultiPort.Username,
-				"password":  cfg.MultiPort.Password,
+				"address":          cfg.MultiPort.Address,
+				"base_port":        cfg.MultiPort.BasePort,
+				"username":         cfg.MultiPort.Username,
+				"password":         cfg.MultiPort.Password,
+				"port_map_file":    cfg.MultiPort.PortMapFile,
+				"port_reuse_delay": cfg.MultiPort.PortReuseDelay.String(),
 			}
 			resp["pool"] = map[string]any{
 				"mode":               cfg.Pool.Mode,
 				"failure_threshold":  cfg.Pool.FailureThreshold,
 				"blacklist_duration": cfg.Pool.BlacklistDuration.String(),
+				"fail_open":          cfg.Pool.FailOpen,
 			}
 			resp["management"] = map[string]any{
 				"listen":   cfg.Management.Listen,
@@ -883,15 +886,18 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				Password string `json:"password"`
 			} `json:"listener,omitempty"`
 			MultiPort *struct {
-				Address  string `json:"address"`
-				BasePort uint16 `json:"base_port"`
-				Username string `json:"username"`
-				Password string `json:"password"`
+				Address        string  `json:"address"`
+				BasePort       uint16  `json:"base_port"`
+				Username       string  `json:"username"`
+				Password       string  `json:"password"`
+				PortMapFile    *string `json:"port_map_file"`
+				PortReuseDelay string  `json:"port_reuse_delay"`
 			} `json:"multi_port,omitempty"`
 			Pool *struct {
 				Mode              string `json:"mode"`
 				FailureThreshold  int    `json:"failure_threshold"`
 				BlacklistDuration string `json:"blacklist_duration"`
+				FailOpen          *bool  `json:"fail_open"`
 			} `json:"pool,omitempty"`
 			Management *struct {
 				Listen   string `json:"listen"`
@@ -939,7 +945,6 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-
 		// Update extended settings
 		s.cfgMu.Lock()
 		if s.cfgSrc != nil {
@@ -957,10 +962,21 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				s.cfgSrc.MultiPort.BasePort = req.MultiPort.BasePort
 				s.cfgSrc.MultiPort.Username = req.MultiPort.Username
 				s.cfgSrc.MultiPort.Password = req.MultiPort.Password
+				if req.MultiPort.PortMapFile != nil {
+					s.cfgSrc.MultiPort.PortMapFile = *req.MultiPort.PortMapFile
+				}
+				if req.MultiPort.PortReuseDelay != "" {
+					if d, err := time.ParseDuration(req.MultiPort.PortReuseDelay); err == nil {
+						s.cfgSrc.MultiPort.PortReuseDelay = d
+					}
+				}
 			}
 			if req.Pool != nil {
 				s.cfgSrc.Pool.Mode = req.Pool.Mode
 				s.cfgSrc.Pool.FailureThreshold = req.Pool.FailureThreshold
+				if req.Pool.FailOpen != nil {
+					s.cfgSrc.Pool.FailOpen = *req.Pool.FailOpen
+				}
 				if req.Pool.BlacklistDuration != "" {
 					if d, err := time.ParseDuration(req.Pool.BlacklistDuration); err == nil {
 						s.cfgSrc.Pool.BlacklistDuration = d

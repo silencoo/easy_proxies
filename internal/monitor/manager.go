@@ -309,6 +309,21 @@ func (m *Manager) ClearNodes() {
 	m.nodes = make(map[string]*entry)
 }
 
+// RetainNodeURIs removes monitor entries that are no longer present after a
+// successful reload while preserving health history for unchanged nodes.
+func (m *Manager) RetainNodeURIs(activeURIs map[string]struct{}) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for tag, entry := range m.nodes {
+		entry.mu.RLock()
+		uri := strings.TrimSpace(entry.info.URI)
+		entry.mu.RUnlock()
+		if _, ok := activeURIs[uri]; !ok {
+			delete(m.nodes, tag)
+		}
+	}
+}
+
 // DestinationForProbe exposes the configured destination for health checks.
 func (m *Manager) DestinationForProbe() (M.Socksaddr, bool) {
 	if !m.probeReady {
