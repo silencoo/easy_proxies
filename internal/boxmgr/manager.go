@@ -127,6 +127,9 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.baseCtx = ctx
 	cfg := m.cfg
 	m.mu.Unlock()
+	if err := pool.ConfigureHealthPersistence(cfg.HealthStatePath()); err != nil {
+		return fmt.Errorf("load pool health state: %w", err)
+	}
 
 	// Try to start, with automatic port conflict resolution
 	var built *builtInstance
@@ -157,6 +160,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.runtimeCtx = built.ctx
 	m.runtimeOptions = built.options
 	m.mu.Unlock()
+	m.updateHealthPersistence(cfg)
 	if err := cfg.PersistPortMap(); err != nil {
 		m.logger.Warnf("failed to persist dedicated port map after start: %v", err)
 	}
@@ -263,6 +267,7 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	m.runtimeOptions = built.options
 	m.cfg = newCfg
 	m.mu.Unlock()
+	m.updateHealthPersistence(newCfg)
 
 	// Sync config to monitor server so future WebUI settings changes target the current config pointer
 	if m.monitorServer != nil {
@@ -498,6 +503,7 @@ func (m *Manager) reloadNodesInPlace(
 	m.runtimeOptions = desiredOptions
 	drainTimeout := m.drainTimeout
 	m.mu.Unlock()
+	m.updateHealthPersistence(newCfg)
 	if m.monitorServer != nil {
 		m.monitorServer.SetConfig(newCfg)
 	}
@@ -709,6 +715,7 @@ func (m *Manager) rollbackToOldConfig(ctx context.Context, oldCfg *config.Config
 	m.runtimeOptions = built.options
 	m.cfg = oldCfg
 	m.mu.Unlock()
+	m.updateHealthPersistence(oldCfg)
 	// Sync config pointer to monitor server after rollback
 	if m.monitorServer != nil {
 		m.monitorServer.SetConfig(m.cfg)
@@ -737,10 +744,14 @@ func (m *Manager) Close() error {
 	defer m.mu.Unlock()
 
 	var err error
+	if persistErr := pool.PersistHealthStateNow(); persistErr != nil {
+		m.logger.Warnf("failed to persist pool health state during shutdown: %v", persistErr)
+	}
 	if m.currentBox != nil {
 		err = m.currentBox.Close()
 		m.currentBox = nil
 	}
+	pool.ResetSharedStateStore()
 	m.runtimeCtx = nil
 	m.runtimeOptions = option.Options{}
 	if m.monitorServer != nil {
@@ -758,6 +769,19 @@ func (m *Manager) Close() error {
 	}
 	m.baseCtx = nil
 	return err
+}
+
+func (m *Manager) updateHealthPersistence(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	if err := pool.ConfigureHealthPersistence(cfg.HealthStatePath()); err != nil {
+		m.logger.Warnf("failed to configure pool health persistence: %v", err)
+		return
+	}
+	if err := pool.PersistHealthStateNow(); err != nil {
+		m.logger.Warnf("failed to flush pool health state: %v", err)
+	}
 }
 
 // MonitorManager returns the shared monitor manager.

@@ -63,6 +63,8 @@ Open `http://localhost:9091` in your browser.
 
 Dedicated ports keep their assignments in `port-map.yaml`. Per-node listener credentials edited through the WebUI are stored separately in `node-auth.yaml` (mode `0600`) and are automatically reapplied to matching `nodes_file` or subscription nodes by stable node identity.
 
+Pool failure streaks, active blacklist deadlines, and the latest health/latency counters are coalesced into `health-state.yaml` (also mode `0600`). They are restored on restart; active connection counts remain process-local.
+
 ### Pool Scheduling
 
 | Algorithm | Description |

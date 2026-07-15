@@ -11,10 +11,13 @@ import (
 // sharedMemberState holds failure/blacklist state shared across all pool instances.
 // This enables hybrid mode where pool and multi-port modes share the same node state.
 type sharedMemberState struct {
+	tag              string
 	mu               sync.Mutex
 	failures         int
 	blacklisted      bool
 	blacklistedUntil time.Time
+	restoredMonitor  monitor.PersistedHealthState
+	monitorRestored  bool
 	entry            atomic.Pointer[monitor.EntryHandle]
 	active           atomic.Int32
 }
@@ -26,7 +29,15 @@ func acquireSharedState(tag string) *sharedMemberState {
 	if v, ok := sharedStateStore.Load(tag); ok {
 		return v.(*sharedMemberState)
 	}
-	state := &sharedMemberState{}
+	state := &sharedMemberState{tag: tag}
+	if restored, ok := restoredMemberHealth(tag); ok {
+		state.failures = restored.Failures
+		state.restoredMonitor = restored.Monitor
+		if restored.BlacklistedUntil.After(time.Now()) {
+			state.blacklisted = true
+			state.blacklistedUntil = restored.BlacklistedUntil
+		}
+	}
 	actual, _ := sharedStateStore.LoadOrStore(tag, state)
 	return actual.(*sharedMemberState)
 }
@@ -54,6 +65,19 @@ func (s *sharedMemberState) attachEntry(entry *monitor.EntryHandle) {
 		return
 	}
 	s.entry.Store(entry)
+	s.mu.Lock()
+	if s.monitorRestored {
+		s.mu.Unlock()
+		return
+	}
+	s.monitorRestored = true
+	restored := s.restoredMonitor
+	if s.blacklisted && s.blacklistedUntil.After(time.Now()) {
+		restored.BlacklistedUntil = s.blacklistedUntil
+		restored.Available = false
+	}
+	s.mu.Unlock()
+	entry.RestoreHealthState(restored)
 }
 
 func (s *sharedMemberState) entryHandle() *monitor.EntryHandle {
@@ -83,6 +107,7 @@ func (s *sharedMemberState) recordFailure(cause error, threshold int, duration t
 			entry.Blacklist(until)
 		}
 	}
+	s.persist()
 	return count, triggered, until
 }
 
@@ -94,6 +119,7 @@ func (s *sharedMemberState) recordSuccess() {
 	if entry := s.entry.Load(); entry != nil {
 		entry.RecordSuccess()
 	}
+	s.persist()
 }
 
 // isBlacklisted checks if the node is currently blacklisted, auto-clearing if expired.
@@ -111,6 +137,7 @@ func (s *sharedMemberState) isBlacklisted(now time.Time) bool {
 		if entry := s.entry.Load(); entry != nil {
 			entry.ClearBlacklist()
 		}
+		s.persist()
 	}
 	return blacklisted
 }
@@ -125,6 +152,7 @@ func (s *sharedMemberState) forceRelease() {
 	if entry := s.entry.Load(); entry != nil {
 		entry.ClearBlacklist()
 	}
+	s.persist()
 }
 
 func (s *sharedMemberState) incActive() {
@@ -145,6 +173,28 @@ func (s *sharedMemberState) activeCount() int32 {
 	return s.active.Load()
 }
 
+func (s *sharedMemberState) persist() {
+	if s == nil || s.tag == "" {
+		return
+	}
+	s.mu.Lock()
+	record := persistedMemberHealth{
+		Failures: s.failures,
+	}
+	if s.blacklisted && s.blacklistedUntil.After(time.Now()) {
+		record.BlacklistedUntil = s.blacklistedUntil
+	}
+	s.mu.Unlock()
+	if entry := s.entry.Load(); entry != nil {
+		record.Monitor = entry.ExportHealthState()
+	}
+	if !record.BlacklistedUntil.IsZero() {
+		record.Monitor.BlacklistedUntil = record.BlacklistedUntil
+		record.Monitor.Available = false
+	}
+	storeMemberHealth(s.tag, record)
+}
+
 // blacklistSharedMember manually blacklists a node in pool shared state.
 func blacklistSharedMember(tag string, duration time.Duration) {
 	if state, ok := lookupSharedState(tag); ok {
@@ -154,5 +204,9 @@ func blacklistSharedMember(tag string, duration time.Duration) {
 		state.blacklistedUntil = until
 		state.failures = 0
 		state.mu.Unlock()
+		if entry := state.entry.Load(); entry != nil {
+			entry.Blacklist(until)
+		}
+		state.persist()
 	}
 }

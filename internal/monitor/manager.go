@@ -68,6 +68,21 @@ type Snapshot struct {
 	Timeline          []TimelineEvent `json:"timeline,omitempty"`
 }
 
+// PersistedHealthState is the restart-safe subset of a node's monitor state.
+// Active connections, callbacks and the short debug timeline are deliberately
+// process-local and are not restored.
+type PersistedHealthState struct {
+	FailureCount     int           `yaml:"failure_count,omitempty"`
+	SuccessCount     int64         `yaml:"success_count,omitempty"`
+	BlacklistedUntil time.Time     `yaml:"blacklisted_until,omitempty"`
+	LastError        string        `yaml:"last_error,omitempty"`
+	LastFailure      time.Time     `yaml:"last_failure,omitempty"`
+	LastSuccess      time.Time     `yaml:"last_success,omitempty"`
+	LastProbeLatency time.Duration `yaml:"last_probe_latency,omitempty"`
+	Available        bool          `yaml:"available,omitempty"`
+	InitialCheckDone bool          `yaml:"initial_check_done,omitempty"`
+}
+
 type probeFunc func(ctx context.Context) (time.Duration, error)
 type releaseFunc func()
 
@@ -600,6 +615,53 @@ func (h *EntryHandle) ClearBlacklist() {
 		return
 	}
 	h.ref.clearBlacklist()
+}
+
+// ExportHealthState returns the restart-safe monitor fields.
+func (h *EntryHandle) ExportHealthState() PersistedHealthState {
+	if h == nil || h.ref == nil {
+		return PersistedHealthState{}
+	}
+	e := h.ref
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return PersistedHealthState{
+		FailureCount:     e.failure,
+		SuccessCount:     e.success,
+		BlacklistedUntil: e.until,
+		LastError:        e.lastError,
+		LastFailure:      e.lastFail,
+		LastSuccess:      e.lastOK,
+		LastProbeLatency: e.lastProbe,
+		Available:        e.available,
+		InitialCheckDone: e.initialCheckDone,
+	}
+}
+
+// RestoreHealthState hydrates monitor fields before probes resume.
+func (h *EntryHandle) RestoreHealthState(state PersistedHealthState) {
+	if h == nil || h.ref == nil {
+		return
+	}
+	e := h.ref
+	e.mu.Lock()
+	e.failure = state.FailureCount
+	e.success = state.SuccessCount
+	e.lastError = state.LastError
+	e.lastFail = state.LastFailure
+	e.lastOK = state.LastSuccess
+	e.lastProbe = state.LastProbeLatency
+	e.available = state.Available
+	e.initialCheckDone = state.InitialCheckDone
+	if state.BlacklistedUntil.After(time.Now()) {
+		e.blacklist = true
+		e.until = state.BlacklistedUntil
+		e.available = false
+	} else {
+		e.blacklist = false
+		e.until = time.Time{}
+	}
+	e.mu.Unlock()
 }
 
 // IncActive increments the active connection counter.

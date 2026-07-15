@@ -246,6 +246,9 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 			if member.entry != nil {
 				member.entry.MarkInitialCheckDone(true)
 			}
+			if member.shared != nil {
+				member.shared.persist()
+			}
 		}
 		p.mu.Unlock()
 		return
@@ -304,24 +307,24 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 		if res.err != nil {
 			p.logger.Warn("initial probe failed for ", res.member.tag, ": ", res.err)
 			failedCount++
+			if res.member.entry != nil {
+				res.member.entry.MarkInitialCheckDone(false)
+			}
 			if res.member.shared != nil {
 				res.member.shared.recordFailure(res.err, 1, p.options.BlacklistDuration)
 			} else if res.member.entry != nil {
 				res.member.entry.RecordFailure(res.err)
 			}
-			if res.member.entry != nil {
-				res.member.entry.MarkInitialCheckDone(false)
-			}
 		} else {
 			latencyMs := res.latency.Milliseconds()
 			p.logger.Info("initial probe success for ", res.member.tag, ", latency: ", latencyMs, "ms")
 			availableCount++
-			if res.member.shared != nil {
-				res.member.shared.forceRelease()
-			}
 			if res.member.entry != nil {
 				res.member.entry.RecordSuccessWithLatency(res.latency)
 				res.member.entry.MarkInitialCheckDone(true)
+			}
+			if res.member.shared != nil {
+				res.member.shared.forceRelease()
 			}
 		}
 	}
@@ -567,6 +570,9 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 		start := time.Now()
 		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
 		if err != nil {
+			if member.entry != nil {
+				member.entry.MarkInitialCheckDone(false)
+			}
 			p.recordProbeFailure(member, err)
 			return 0, err
 		}
@@ -575,6 +581,9 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 		// Perform HTTP probe to measure actual latency (TTFB)
 		_, err = httpProbe(conn, destination.AddrString())
 		if err != nil {
+			if member.entry != nil {
+				member.entry.MarkInitialCheckDone(false)
+			}
 			p.recordProbeFailure(member, err)
 			return 0, err
 		}
@@ -583,6 +592,7 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 		duration := time.Since(start)
 		if member.entry != nil {
 			member.entry.RecordSuccessWithLatency(duration)
+			member.entry.MarkInitialCheckDone(true)
 		}
 		// Clear pool blacklist on successful probe — a node that passes
 		// health check should be available for selection immediately,

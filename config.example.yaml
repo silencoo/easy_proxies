@@ -57,6 +57,8 @@ pool:
   blacklist_duration: 24h
   # 所有节点被拉黑时是否强制重新尝试；爬虫场景建议保持 false，快速失败
   fail_open: false
+  # 失败计数、黑名单和测活结果的重启持久化文件（相对 config.yaml）
+  health_state_file: health-state.yaml
 
 # ───────────────────────────────────────────────────────────────
 # 多端口模式配置（multi-port / hybrid 模式使用）

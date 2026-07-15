@@ -75,6 +75,7 @@ type PoolConfig struct {
 	FailureThreshold  int           `yaml:"failure_threshold"`
 	BlacklistDuration time.Duration `yaml:"blacklist_duration"`
 	FailOpen          bool          `yaml:"fail_open,omitempty"`
+	HealthStateFile   string        `yaml:"health_state_file,omitempty"`
 }
 
 // MultiPortConfig defines address/credential defaults for multi-port mode.
@@ -1457,6 +1458,24 @@ func (c *Config) SetFilePath(path string) {
 	if c != nil {
 		c.filePath = path
 	}
+}
+
+// HealthStatePath resolves the restart-safe pool health sidecar.
+func (c *Config) HealthStatePath() string {
+	if c == nil {
+		return ""
+	}
+	path := strings.TrimSpace(c.Pool.HealthStateFile)
+	if path == "" {
+		path = "health-state.yaml"
+	}
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path)
+	}
+	if c.filePath == "" {
+		return filepath.Clean(path)
+	}
+	return filepath.Join(filepath.Dir(c.filePath), path)
 }
 
 // writeNodesToFile writes nodes to a file (one URI per line) with file locking.
