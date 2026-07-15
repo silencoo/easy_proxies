@@ -61,6 +61,8 @@ Open `http://localhost:9091` in your browser.
 | `multi-port` | One local port per node for direct access |
 | `hybrid` | Both pool + multi-port simultaneously |
 
+Dedicated ports keep their assignments in `port-map.yaml`. Per-node listener credentials edited through the WebUI are stored separately in `node-auth.yaml` (mode `0600`) and are automatically reapplied to matching `nodes_file` or subscription nodes by stable node identity.
+
 ### Pool Scheduling
 
 | Algorithm | Description |

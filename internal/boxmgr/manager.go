@@ -1233,6 +1233,11 @@ func (m *Manager) UpdateNode(ctx context.Context, name string, node config.NodeC
 		m.cfg.Nodes[idx] = prev
 		return config.NodeConfig{}, fmt.Errorf("save config: %w", err)
 	}
+	if prev.NodeKey() != normalized.NodeKey() {
+		if err := m.cfg.RemoveNodeAuthOverride(prev); err != nil {
+			return config.NodeConfig{}, fmt.Errorf("remove previous node auth override: %w", err)
+		}
+	}
 	return normalized, nil
 }
 
@@ -1258,10 +1263,14 @@ func (m *Manager) DeleteNode(ctx context.Context, name string) error {
 	}
 
 	backup := cloneNodes(m.cfg.Nodes)
+	deleted := m.cfg.Nodes[idx]
 	m.cfg.Nodes = append(m.cfg.Nodes[:idx], m.cfg.Nodes[idx+1:]...)
 	if err := m.cfg.Save(); err != nil {
 		m.cfg.Nodes = backup
 		return fmt.Errorf("save config: %w", err)
+	}
+	if err := m.cfg.RemoveNodeAuthOverride(deleted); err != nil {
+		return fmt.Errorf("remove node auth override: %w", err)
 	}
 	return nil
 }

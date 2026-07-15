@@ -79,12 +79,13 @@ type PoolConfig struct {
 
 // MultiPortConfig defines address/credential defaults for multi-port mode.
 type MultiPortConfig struct {
-	Address        string        `yaml:"address"`
-	BasePort       uint16        `yaml:"base_port"`
-	Username       string        `yaml:"username"`
-	Password       string        `yaml:"password"`
-	PortMapFile    string        `yaml:"port_map_file,omitempty"`
-	PortReuseDelay time.Duration `yaml:"port_reuse_delay,omitempty"`
+	Address           string        `yaml:"address"`
+	BasePort          uint16        `yaml:"base_port"`
+	Username          string        `yaml:"username"`
+	Password          string        `yaml:"password"`
+	PortMapFile       string        `yaml:"port_map_file,omitempty"`
+	AuthOverridesFile string        `yaml:"auth_overrides_file,omitempty"`
+	PortReuseDelay    time.Duration `yaml:"port_reuse_delay,omitempty"`
 }
 
 // ManagementConfig controls the monitoring HTTP endpoint.
@@ -398,6 +399,9 @@ func (c *Config) normalize() error {
 		}
 
 	}
+	if err := c.ApplyNodeAuthOverrides(); err != nil {
+		return err
+	}
 	if err := c.assignNodePorts(nil, true); err != nil {
 		return err
 	}
@@ -427,7 +431,148 @@ const (
 	portMappingVersion  = 1
 	defaultPortMapFile  = "port-map.yaml"
 	defaultPortReuseTTL = 24 * time.Hour
+	nodeAuthVersion     = 1
+	defaultNodeAuthFile = "node-auth.yaml"
 )
+
+type nodeAuthOverride struct {
+	Username string `yaml:"username,omitempty"`
+	Password string `yaml:"password,omitempty"`
+}
+
+type nodeAuthState struct {
+	Version   int                         `yaml:"version"`
+	Overrides map[string]nodeAuthOverride `yaml:"overrides"`
+}
+
+func newNodeAuthState() *nodeAuthState {
+	return &nodeAuthState{
+		Version:   nodeAuthVersion,
+		Overrides: make(map[string]nodeAuthOverride),
+	}
+}
+
+func (c *Config) nodeAuthPath() string {
+	path := strings.TrimSpace(c.MultiPort.AuthOverridesFile)
+	if path == "" {
+		path = defaultNodeAuthFile
+	}
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path)
+	}
+	if c.filePath == "" {
+		return filepath.Clean(path)
+	}
+	return filepath.Join(filepath.Dir(c.filePath), path)
+}
+
+func (c *Config) loadNodeAuthState() (*nodeAuthState, error) {
+	path := c.nodeAuthPath()
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return newNodeAuthState(), nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read node auth overrides %q: %w", path, err)
+	}
+	state := newNodeAuthState()
+	if err := yaml.Unmarshal(data, state); err != nil {
+		return nil, fmt.Errorf("decode node auth overrides %q: %w", path, err)
+	}
+	if state.Version != 0 && state.Version != nodeAuthVersion {
+		return nil, fmt.Errorf("unsupported node auth override version %d in %q", state.Version, path)
+	}
+	state.Version = nodeAuthVersion
+	if state.Overrides == nil {
+		state.Overrides = make(map[string]nodeAuthOverride)
+	}
+	for key := range state.Overrides {
+		if strings.TrimSpace(key) == "" {
+			delete(state.Overrides, key)
+		}
+	}
+	return state, nil
+}
+
+func (c *Config) saveNodeAuthState(state *nodeAuthState) error {
+	if state == nil {
+		return errors.New("node auth state is nil")
+	}
+	state.Version = nodeAuthVersion
+	if state.Overrides == nil {
+		state.Overrides = make(map[string]nodeAuthOverride)
+	}
+	data, err := yaml.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("encode node auth overrides: %w", err)
+	}
+	if err := writeFileWithLock(c.nodeAuthPath(), data, 0o600); err != nil {
+		return fmt.Errorf("write node auth overrides: %w", err)
+	}
+	return nil
+}
+
+// ApplyNodeAuthOverrides restores per-node listener credentials for nodes
+// loaded from nodes_file/subscriptions. The stable NodeKey keeps overrides
+// attached when the provider changes display names or URI query ordering.
+func (c *Config) ApplyNodeAuthOverrides() error {
+	if c == nil {
+		return errors.New("config is nil")
+	}
+	state, err := c.loadNodeAuthState()
+	if err != nil {
+		return err
+	}
+	for idx := range c.Nodes {
+		node := &c.Nodes[idx]
+		if node.Source == NodeSourceInline {
+			continue
+		}
+		if override, ok := state.Overrides[node.NodeKey()]; ok {
+			node.Username = override.Username
+			node.Password = override.Password
+		}
+	}
+	return nil
+}
+
+func (c *Config) persistNodeAuthOverrides() error {
+	state, err := c.loadNodeAuthState()
+	if err != nil {
+		return err
+	}
+	for _, node := range c.Nodes {
+		key := node.NodeKey()
+		if node.Source == NodeSourceInline {
+			delete(state.Overrides, key)
+			continue
+		}
+		if node.Username == c.MultiPort.Username && node.Password == c.MultiPort.Password {
+			delete(state.Overrides, key)
+			continue
+		}
+		state.Overrides[key] = nodeAuthOverride{
+			Username: node.Username,
+			Password: node.Password,
+		}
+	}
+	return c.saveNodeAuthState(state)
+}
+
+// RemoveNodeAuthOverride forgets an explicitly deleted external node without
+// pruning overrides for nodes that are merely absent from one subscription
+// refresh and may return later.
+func (c *Config) RemoveNodeAuthOverride(node NodeConfig) error {
+	if c == nil || node.Source == NodeSourceInline {
+		return nil
+	}
+	state, err := c.loadNodeAuthState()
+	if err != nil {
+		return err
+	}
+	delete(state.Overrides, node.NodeKey())
+	return c.saveNodeAuthState(state)
+}
 
 type portLease struct {
 	Port       uint16     `yaml:"port"`
@@ -751,6 +896,9 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 		if c.Nodes[idx].Name == "" {
 			c.Nodes[idx].Name = fmt.Sprintf("node-%d", idx)
 		}
+	}
+	if err := c.ApplyNodeAuthOverrides(); err != nil {
+		return err
 	}
 	if err := c.assignNodePorts(portMap, false); err != nil {
 		return err
@@ -1405,6 +1553,9 @@ func (c *Config) SaveNodes() error {
 		if err := writeFileWithLock(c.filePath, newData, 0o644); err != nil {
 			return fmt.Errorf("write config: %w", err)
 		}
+	}
+	if err := c.persistNodeAuthOverrides(); err != nil {
+		return err
 	}
 
 	return nil

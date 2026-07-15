@@ -67,6 +67,7 @@ multi_port:
   username: mpuser      # 默认认证用户名
   password: mppass      # 默认认证密码
   port_map_file: port-map.yaml  # 节点哈希 → 端口的持久化映射（相对 config.yaml）
+  auth_overrides_file: node-auth.yaml  # WebUI 设置的外部/订阅节点独立认证（权限 0600）
   port_reuse_delay: 24h         # 节点移除后多久才允许其他节点复用其端口
 
 # ───────────────────────────────────────────────────────────────
