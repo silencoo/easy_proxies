@@ -833,6 +833,9 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				"database_path":        "",
 				"listen":               "",
 				"port":                 0,
+				"exit_ip_url":          "",
+				"exit_ip_timeout":      "",
+				"exit_ip_concurrency":  0,
 				"auto_update_enabled":  false,
 				"auto_update_interval": "",
 			},
@@ -868,6 +871,9 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				"database_path":        cfg.GeoIP.DatabasePath,
 				"listen":               cfg.GeoIP.Listen,
 				"port":                 cfg.GeoIP.Port,
+				"exit_ip_url":          cfg.GeoIP.ExitIPURL,
+				"exit_ip_timeout":      cfg.GeoIP.ExitIPTimeout.String(),
+				"exit_ip_concurrency":  cfg.GeoIP.ExitIPConcurrency,
 				"auto_update_enabled":  cfg.GeoIP.AutoUpdateEnabled,
 				"auto_update_interval": cfg.GeoIP.AutoUpdateInterval.String(),
 			}
@@ -915,6 +921,9 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				DatabasePath       string `json:"database_path"`
 				Listen             string `json:"listen"`
 				Port               uint16 `json:"port"`
+				ExitIPURL          string `json:"exit_ip_url"`
+				ExitIPTimeout      string `json:"exit_ip_timeout"`
+				ExitIPConcurrency  int    `json:"exit_ip_concurrency"`
 				AutoUpdateEnabled  bool   `json:"auto_update_enabled"`
 				AutoUpdateInterval string `json:"auto_update_interval"`
 			} `json:"geoip"`
@@ -991,6 +1000,17 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				s.cfgSrc.GeoIP.DatabasePath = req.GeoIP.DatabasePath
 				s.cfgSrc.GeoIP.Listen = req.GeoIP.Listen
 				s.cfgSrc.GeoIP.Port = req.GeoIP.Port
+				if req.GeoIP.ExitIPURL != "" {
+					s.cfgSrc.GeoIP.ExitIPURL = req.GeoIP.ExitIPURL
+				}
+				if req.GeoIP.ExitIPConcurrency > 0 {
+					s.cfgSrc.GeoIP.ExitIPConcurrency = req.GeoIP.ExitIPConcurrency
+				}
+				if req.GeoIP.ExitIPTimeout != "" {
+					if d, err := time.ParseDuration(req.GeoIP.ExitIPTimeout); err == nil {
+						s.cfgSrc.GeoIP.ExitIPTimeout = d
+					}
+				}
 				s.cfgSrc.GeoIP.AutoUpdateEnabled = req.GeoIP.AutoUpdateEnabled
 				if req.GeoIP.AutoUpdateInterval != "" {
 					if d, err := time.ParseDuration(req.GeoIP.AutoUpdateInterval); err == nil {

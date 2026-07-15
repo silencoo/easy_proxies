@@ -38,6 +38,7 @@ type NodeInfo struct {
 	Port          uint16 `json:"port,omitempty"`
 	Region        string `json:"region,omitempty"`  // GeoIP region code: "jp", "kr", "us", "hk", "tw", "other"
 	Country       string `json:"country,omitempty"` // Full country name from GeoIP
+	ExitIP        string `json:"exit_ip,omitempty"` // Public egress IP observed through this node
 }
 
 // TimelineEvent represents a single usage event for debug tracking.
@@ -311,7 +312,9 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 		}
 		m.nodes[info.Tag] = e
 	} else {
+		e.mu.Lock()
 		e.info = info
+		e.mu.Unlock()
 	}
 	return &EntryHandle{ref: e}
 }

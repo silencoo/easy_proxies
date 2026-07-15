@@ -57,6 +57,9 @@ type GeoIPConfig struct {
 	DatabasePath       string        `yaml:"database_path"`        // GeoLite2-Country.mmdb 文件路径
 	Listen             string        `yaml:"listen"`               // GeoIP 路由监听地址，默认使用 listener 配置
 	Port               uint16        `yaml:"port"`                 // GeoIP 路由监听端口，默认 1221
+	ExitIPURL          string        `yaml:"exit_ip_url"`          // 通过每个节点请求的出口 IP 回显地址
+	ExitIPTimeout      time.Duration `yaml:"exit_ip_timeout"`      // 单节点出口 IP 探测超时
+	ExitIPConcurrency  int           `yaml:"exit_ip_concurrency"`  // 并发出口 IP 探测数
 	AutoUpdateEnabled  bool          `yaml:"auto_update_enabled"`  // 是否启用自动更新数据库
 	AutoUpdateInterval time.Duration `yaml:"auto_update_interval"` // 自动更新间隔，默认 24 小时
 }
@@ -302,6 +305,7 @@ func (c *Config) normalize() error {
 		defaultEnabled := true
 		c.Management.Enabled = &defaultEnabled
 	}
+	c.normalizeGeoIPConfig()
 
 	// Subscription refresh defaults
 	if c.SubscriptionRefresh.Interval <= 0 {
@@ -863,6 +867,7 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 		defaultEnabled := true
 		c.Management.Enabled = &defaultEnabled
 	}
+	c.normalizeGeoIPConfig()
 	if c.SubscriptionRefresh.Interval <= 0 {
 		c.SubscriptionRefresh.Interval = 1 * time.Hour
 	}
@@ -912,6 +917,18 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	c.normalizeLogConfig()
 
 	return nil
+}
+
+func (c *Config) normalizeGeoIPConfig() {
+	if c.GeoIP.ExitIPURL == "" {
+		c.GeoIP.ExitIPURL = "https://api.ipify.org"
+	}
+	if c.GeoIP.ExitIPTimeout <= 0 {
+		c.GeoIP.ExitIPTimeout = 10 * time.Second
+	}
+	if c.GeoIP.ExitIPConcurrency <= 0 {
+		c.GeoIP.ExitIPConcurrency = 16
+	}
 }
 
 // normalizeLogConfig applies defaults to the log config.

@@ -133,6 +133,9 @@ geoip:
   database_path: "./GeoLite2-Country.mmdb"
   listen: "0.0.0.0"          # defaults to listener.address if omitted
   port: 1221                  # defaults to listener.port if omitted
+  exit_ip_url: "https://api.ipify.org" # requested through every node
+  exit_ip_timeout: 10s
+  exit_ip_concurrency: 16
   auto_update_enabled: true   # auto-update the GeoIP database
   auto_update_interval: 24h   # check interval
 ```
@@ -142,8 +145,8 @@ The GeoIP router reuses the `listener.username` and `listener.password` for prox
 Key behaviors:
 - The GeoIP database (MaxMind GeoLite2-Country) is **auto-downloaded** on first startup
 - Auto-update is enabled by default (checks every 24h) with hot-reload -- no restart needed
-- Node region classification happens automatically during startup and on every reload
-- Nodes whose IP cannot be resolved or looked up are placed in the `other` category
+- Node region classification uses the public exit IP observed by requesting `exit_ip_url` through that exact outbound; it does not use the subscription server address
+- Classification runs at startup and after node reloads. A transient probe failure keeps the node's last observed exit IP when available; otherwise it is placed in `other`
 
 ### How to Use
 
@@ -233,12 +236,12 @@ resp, err := client.Get("http://example.com")
 
 ### How It Works
 
-1. On startup, each node's server IP is resolved and looked up in the MaxMind GeoLite2-Country database
-2. Nodes are grouped into per-region pools (`pool-jp`, `pool-kr`, `pool-us`, etc.) with independent health checking
+1. After outbounds start, each node requests the configured IP-echo endpoint through that exact proxy
+2. The observed public exit IP is looked up in MaxMind and nodes are grouped into per-region pools (`pool-jp`, `pool-kr`, `pool-us`, etc.)
 3. The GeoIP router listens on its own port and inspects the request path for a region prefix
 4. Matching requests are routed through the corresponding region pool; unmatched requests use the global pool
 5. Each region pool uses the same scheduling algorithm configured in the `pool` section
-6. DNS lookup results are cached to avoid repeated resolution on reload
+6. The last successfully observed exit IP is retained across a transient probe failure within the running process
 
 ## Supported Protocols
 

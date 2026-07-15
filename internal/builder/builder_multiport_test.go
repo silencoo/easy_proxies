@@ -71,3 +71,39 @@ func TestBuildMultiPortUsesPerNodeCredentialsAndDedicatedDispatch(t *testing.T) 
 		t.Fatalf("multi-port routing is not using the stable final pool: %#v", opts.Route)
 	}
 }
+
+func TestBuildDefersGeoIPUntilOutboundExitCanBeProbed(t *testing.T) {
+	cfg := &config.Config{
+		Mode: "pool",
+		Listener: config.ListenerConfig{
+			Address: "127.0.0.1",
+			Port:    2323,
+		},
+		Pool: config.PoolConfig{Mode: "sequential"},
+		GeoIP: config.GeoIPConfig{
+			Enabled:      true,
+			DatabasePath: "does-not-exist-and-must-not-be-opened-during-build.mmdb",
+		},
+		Nodes: []config.NodeConfig{{
+			Name: "server-location-is-not-exit-location",
+			URI:  "socks5://203.0.113.9:1080#node",
+		}},
+	}
+	opts, err := Build(cfg)
+	if err != nil {
+		t.Fatalf("builder unexpectedly performed GeoIP I/O: %v", err)
+	}
+	for _, outbound := range opts.Outbounds {
+		poolOptions, ok := outbound.Options.(*poolout.Options)
+		if !ok || outbound.Tag != poolout.Tag {
+			continue
+		}
+		for _, metadata := range poolOptions.Metadata {
+			if metadata.Region != "other" || metadata.Country != "Unknown" || metadata.ExitIP != "" {
+				t.Fatalf("builder classified the proxy server instead of deferring to exit probe: %#v", metadata)
+			}
+		}
+		return
+	}
+	t.Fatal("global pool not found")
+}

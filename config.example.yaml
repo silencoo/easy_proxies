@@ -99,10 +99,14 @@ dns:
 geoip:
   enabled: true                      # 是否启用 GeoIP 地域标记
   database_path: "./GeoLite2-Country.mmdb"           # GeoIP 数据库路径（首次启动时自动下载）
+  exit_ip_url: "https://api.ipify.org"               # 必须通过每个代理节点访问的出口 IP 回显地址
+  exit_ip_timeout: 10s                               # 单个节点出口探测超时
+  exit_ip_concurrency: 16                            # 同时探测的节点数
   auto_update_enabled: true                          # 是否启用自动更新数据库（推荐）
   auto_update_interval: 24h                          # 自动更新间隔（默认 24 小时）
   # 注意：
   #   - 首次启动会自动从 GitHub 下载 GeoIP 数据库（约 9MB）
+  #   - 地域以代理的真实出口 IP 为准，不以订阅中的服务器地址为准
   #   - 启用 auto_update_enabled 后，数据库会定期自动更新，无需重启容器
   #   - 更新过程采用热重载，不会中断现有连接
 

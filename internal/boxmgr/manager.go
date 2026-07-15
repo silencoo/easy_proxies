@@ -69,6 +69,9 @@ type Manager struct {
 	monitorMgr     *monitor.Manager
 	monitorServer  *monitor.Server
 	geoRouter      *geoip.Router
+	geoLookup      *geoip.Lookup
+	geoLookupPath  string
+	exitIPs        map[string]string
 	cfg            *config.Config
 	monitorCfg     monitor.Config
 
@@ -189,6 +192,9 @@ func (m *Manager) Start(ctx context.Context) error {
 
 	// Start GeoIP router if enabled
 	if cfg.GeoIP.Enabled {
+		if err := m.refreshExitGeoIP(ctx, cfg); err != nil {
+			m.logger.Warnf("failed to classify proxy exit IPs: %v", err)
+		}
 		m.startGeoIPRouter(ctx, cfg)
 	}
 
@@ -311,6 +317,9 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 
 	// Restart GeoIP router with new pools
 	if newCfg.GeoIP.Enabled {
+		if err := m.refreshExitGeoIP(ctx, newCfg); err != nil {
+			m.logger.Warnf("failed to classify proxy exit IPs: %v", err)
+		}
 		m.startGeoIPRouter(ctx, newCfg)
 	} else {
 		m.mu.Lock()
@@ -319,6 +328,7 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 			m.geoRouter = nil
 		}
 		m.mu.Unlock()
+		m.stopGeoLookup()
 	}
 
 	return nil
@@ -518,6 +528,9 @@ func (m *Manager) reloadNodesInPlace(
 		go m.drainRuntimeOutbound(instance, tag, outbound, drainTimeout)
 	}
 	if newCfg.GeoIP.Enabled {
+		if err := m.refreshExitGeoIP(ctx, newCfg); err != nil {
+			m.logger.Warnf("failed to classify proxy exit IPs: %v", err)
+		}
 		m.startGeoIPRouter(ctx, newCfg)
 	} else {
 		m.mu.Lock()
@@ -526,6 +539,7 @@ func (m *Manager) reloadNodesInPlace(
 			m.geoRouter = nil
 		}
 		m.mu.Unlock()
+		m.stopGeoLookup()
 	}
 
 	m.logger.Infof(
@@ -724,6 +738,9 @@ func (m *Manager) rollbackToOldConfig(ctx context.Context, oldCfg *config.Config
 		m.monitorMgr.RetainNodeURIs(nodeURISet(oldCfg.Nodes))
 	}
 	if oldCfg.GeoIP.Enabled {
+		if err := m.refreshExitGeoIP(ctx, oldCfg); err != nil {
+			m.logger.Warnf("failed to restore proxy exit IP classification: %v", err)
+		}
 		m.startGeoIPRouter(ctx, oldCfg)
 	}
 	m.logger.Infof("rollback successful")
@@ -767,6 +784,12 @@ func (m *Manager) Close() error {
 		m.geoRouter.Stop()
 		m.geoRouter = nil
 	}
+	if m.geoLookup != nil {
+		_ = m.geoLookup.Close()
+		m.geoLookup = nil
+		m.geoLookupPath = ""
+	}
+	m.exitIPs = nil
 	m.baseCtx = nil
 	return err
 }

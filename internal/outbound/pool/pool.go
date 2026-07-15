@@ -55,6 +55,9 @@ type Options struct {
 	// pool avoids per-node route rules, so listeners can be added and removed
 	// without rebuilding the sing-box router.
 	DedicatedMembers map[string]string
+	// SkipStartupProbe is used for metadata-only pool replacements after exit
+	// GeoIP discovery; shared health state is already initialized at that point.
+	SkipStartupProbe bool
 }
 
 // MemberMeta carries optional descriptive information for monitoring UI.
@@ -66,6 +69,7 @@ type MemberMeta struct {
 	Port          uint16
 	Region        string // GeoIP region code: "jp", "kr", "us", "hk", "tw", "other"
 	Country       string // Full country name from GeoIP
+	ExitIP        string // Public egress IP observed through this node
 }
 
 // Register wires the pool outbound into the registry.
@@ -219,7 +223,7 @@ func (p *poolOutbound) Start(stage adapter.StartStage) error {
 	// must not replace live monitor callbacks or GeoIP dialers.
 	registerDialer(p.Tag(), p)
 	// 在初始化完成后，立即在后台触发健康检查
-	if p.monitor != nil {
+	if p.monitor != nil && !p.options.SkipStartupProbe {
 		go p.probeAllMembersOnStartup()
 	}
 	return nil
@@ -265,6 +269,7 @@ func (p *poolOutbound) initializeMembersLocked() error {
 				Port:          meta.Port,
 				Region:        meta.Region,
 				Country:       meta.Country,
+				ExitIP:        meta.ExitIP,
 			}
 			entry := p.monitor.Register(info)
 			if entry != nil {
