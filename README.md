@@ -336,7 +336,7 @@ services:
 - **Create config files first**: `config.yaml` and `nodes.txt` must exist as files before running `docker compose up`. Use `./start.sh` which handles this automatically.
 - **Permissions**: Files need write permission for WebUI settings to persist (`chmod 666 config.yaml nodes.txt`).
 - **Multi-platform**: Supports amd64 and arm64 architectures.
-- **Reload**: `/api/reload` and subscription refresh will interrupt active connections.
+- **Reload**: node/subscription changes use a node-level diff. Unchanged listeners and active connections stay up; new candidates are health-checked before cutover when `min_available_nodes` is configured, and removed outbounds drain for `drain_timeout`. Immutable global listener/log changes still require a short validated full-instance handoff.
 
 ### Ports
 

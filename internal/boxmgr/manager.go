@@ -1,11 +1,15 @@
 package boxmgr
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"log"
+	"reflect"
 	"regexp"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,9 +22,14 @@ import (
 	"easy_proxies/internal/outbound/pool"
 
 	"github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/include"
+	singlog "github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/service"
 )
 
 // Ensure Manager implements monitor.NodeManager.
@@ -54,12 +63,14 @@ type Manager struct {
 	mu       sync.RWMutex
 	reloadMu sync.Mutex
 
-	currentBox    *box.Box
-	monitorMgr    *monitor.Manager
-	monitorServer *monitor.Server
-	geoRouter     *geoip.Router
-	cfg           *config.Config
-	monitorCfg    monitor.Config
+	currentBox     *box.Box
+	runtimeCtx     context.Context
+	runtimeOptions option.Options
+	monitorMgr     *monitor.Manager
+	monitorServer  *monitor.Server
+	geoRouter      *geoip.Router
+	cfg            *config.Config
+	monitorCfg     monitor.Config
 
 	drainTimeout      time.Duration
 	minAvailableNodes int
@@ -67,6 +78,12 @@ type Manager struct {
 
 	baseCtx            context.Context
 	healthCheckStarted bool
+}
+
+type builtInstance struct {
+	box     *box.Box
+	ctx     context.Context
+	options option.Options
 }
 
 // New creates a BoxManager with the given config.
@@ -112,16 +129,16 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.mu.Unlock()
 
 	// Try to start, with automatic port conflict resolution
-	var instance *box.Box
+	var built *builtInstance
 	maxRetries := 10
 	for retry := 0; retry < maxRetries; retry++ {
 		var err error
-		instance, err = m.createBox(ctx, cfg)
+		built, err = m.createBox(ctx, cfg)
 		if err != nil {
 			return err
 		}
-		if err = instance.Start(); err != nil {
-			_ = instance.Close()
+		if err = built.box.Start(); err != nil {
+			_ = built.box.Close()
 			// Check if it's a port conflict error
 			if conflictPort := extractPortFromBindError(err); conflictPort > 0 {
 				m.logger.Warnf("port %d is in use, reassigning and retrying...", conflictPort)
@@ -136,7 +153,9 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 
 	m.mu.Lock()
-	m.currentBox = instance
+	m.currentBox = built.box
+	m.runtimeCtx = built.ctx
+	m.runtimeOptions = built.options
 	m.mu.Unlock()
 	if err := cfg.PersistPortMap(); err != nil {
 		m.logger.Warnf("failed to persist dedicated port map after start: %v", err)
@@ -172,10 +191,8 @@ func (m *Manager) Start(ctx context.Context) error {
 	return nil
 }
 
-// Reload validates the replacement instance before releasing the old listeners,
-// then performs the shortest possible stop/start handoff. Existing connections
-// are still owned by sing-box and cannot be drained while rebinding the same
-// ports, but build errors no longer take the active instance down.
+// Reload applies node-only changes through sing-box's runtime managers. Global
+// topology changes still use the validated full-instance handoff below.
 func (m *Manager) Reload(newCfg *config.Config) error {
 	if newCfg == nil {
 		return errors.New("new config is nil")
@@ -191,6 +208,8 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	ctx := m.baseCtx
 	oldBox := m.currentBox
 	oldCfg := m.cfg
+	runtimeCtx := m.runtimeCtx
+	oldOptions := m.runtimeOptions
 	m.mu.RUnlock()
 
 	if ctx == nil {
@@ -198,10 +217,16 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	}
 
 	m.logger.Infof("reloading with %d nodes", len(newCfg.Nodes))
+	if canReloadNodesInPlace(oldCfg, newCfg) && runtimeCtx != nil {
+		if err := m.reloadNodesInPlace(ctx, runtimeCtx, oldBox, oldCfg, oldOptions, newCfg); !errors.Is(err, errRuntimeReloadUnsupported) {
+			return err
+		}
+		m.logger.Warnf("node-level reload is not available for this change; using full validated handoff")
+	}
 
 	// box.New performs outbound/inbound validation but does not bind listeners.
 	// Do this first so malformed subscriptions cannot interrupt live traffic.
-	instance, err := m.createBox(ctx, newCfg)
+	built, err := m.createBox(ctx, newCfg)
 	if err != nil {
 		return fmt.Errorf("create replacement box: %w", err)
 	}
@@ -221,8 +246,8 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	m.currentBox = nil
 	m.mu.Unlock()
 
-	if err := instance.Start(); err != nil {
-		_ = instance.Close()
+	if err := built.box.Start(); err != nil {
+		_ = built.box.Close()
 		rollbackErr := m.rollbackToOldConfig(ctx, oldCfg)
 		if rollbackErr != nil {
 			return fmt.Errorf("start replacement box: %w; rollback failed: %v", err, rollbackErr)
@@ -233,7 +258,9 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	m.applyConfigSettings(newCfg)
 
 	m.mu.Lock()
-	m.currentBox = instance
+	m.currentBox = built.box
+	m.runtimeCtx = built.ctx
+	m.runtimeOptions = built.options
 	m.cfg = newCfg
 	m.mu.Unlock()
 
@@ -256,7 +283,7 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 			m.monitorMgr.ProbeAllNow(healthTimeout)
 			available, total := m.availableNodeCount()
 			if available < m.minAvailableNodes {
-				_ = instance.Close()
+				_ = built.box.Close()
 				m.mu.Lock()
 				m.currentBox = nil
 				m.mu.Unlock()
@@ -292,25 +319,394 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	return nil
 }
 
+var errRuntimeReloadUnsupported = errors.New("runtime reload unsupported")
+
+func canReloadNodesInPlace(oldCfg, newCfg *config.Config) bool {
+	if oldCfg == nil || newCfg == nil || oldCfg.Mode != newCfg.Mode {
+		return false
+	}
+	// These settings are owned by immutable Box services or by listeners that
+	// are not node-scoped. Node credentials/ports and pool policy are handled by
+	// the runtime diff below.
+	if !reflect.DeepEqual(oldCfg.Listener, newCfg.Listener) ||
+		oldCfg.MultiPort.Address != newCfg.MultiPort.Address ||
+		oldCfg.LogLevel != newCfg.LogLevel ||
+		!reflect.DeepEqual(oldCfg.Log, newCfg.Log) ||
+		oldCfg.SkipCertVerify != newCfg.SkipCertVerify {
+		return false
+	}
+	return true
+}
+
+func (m *Manager) reloadNodesInPlace(
+	ctx context.Context,
+	runtimeCtx context.Context,
+	instance *box.Box,
+	oldCfg *config.Config,
+	oldOptions option.Options,
+	newCfg *config.Config,
+) error {
+	desiredOptions, err := builder.Build(newCfg)
+	if err != nil {
+		return fmt.Errorf("build runtime reload: %w", err)
+	}
+
+	oldBase, oldPools := splitRuntimeOutbounds(oldOptions)
+	desiredBase, desiredPools := splitRuntimeOutbounds(desiredOptions)
+	oldInbounds := runtimeInboundMap(oldOptions.Inbounds)
+	desiredInbounds := runtimeInboundMap(desiredOptions.Inbounds)
+	if _, ok := desiredPools[pool.Tag]; !ok {
+		return fmt.Errorf("%w: desired global pool is missing", errRuntimeReloadUnsupported)
+	}
+
+	// Replacing an outbound under the same tag would close its transports before
+	// the pool cutover. Stable node tags normally make this impossible; defer an
+	// unexpected global outbound mutation to the full validated handoff.
+	for tag, desired := range desiredBase {
+		if previous, ok := oldBase[tag]; ok && !reflect.DeepEqual(previous, desired) {
+			return fmt.Errorf("%w: outbound %s changed in place", errRuntimeReloadUnsupported, tag)
+		}
+	}
+
+	addedBaseTags := mapDifferenceKeys(desiredBase, oldBase)
+	removedBaseTags := mapDifferenceKeys(oldBase, desiredBase)
+	createdBaseTags := make([]string, 0, len(addedBaseTags))
+	for _, tag := range addedBaseTags {
+		if err := createRuntimeOutbound(runtimeCtx, instance, desiredBase[tag]); err != nil {
+			removeRuntimeOutbounds(instance, createdBaseTags)
+			return fmt.Errorf("create candidate outbound %s: %w", tag, err)
+		}
+		createdBaseTags = append(createdBaseTags, tag)
+	}
+
+	if err := m.preflightCandidateSet(ctx, instance, sortedMapKeys(desiredBase), newCfg); err != nil {
+		removeRuntimeOutbounds(instance, createdBaseTags)
+		return err
+	}
+
+	type outboundChange struct {
+		tag      string
+		previous option.Outbound
+		existed  bool
+	}
+	poolChanges := make([]outboundChange, 0)
+	rollbackPools := func() {
+		for idx := len(poolChanges) - 1; idx >= 0; idx-- {
+			change := poolChanges[idx]
+			if change.existed {
+				if err := createRuntimeOutbound(runtimeCtx, instance, change.previous); err != nil {
+					m.logger.Errorf("failed to roll back pool %s: %v", change.tag, err)
+				}
+			} else if err := instance.Outbound().Remove(change.tag); err != nil {
+				m.logger.Errorf("failed to remove added pool %s during rollback: %v", change.tag, err)
+			}
+		}
+	}
+
+	poolTags := sortedMapKeys(desiredPools)
+	sort.SliceStable(poolTags, func(i, j int) bool {
+		return poolTags[i] == pool.Tag && poolTags[j] != pool.Tag
+	})
+	for _, tag := range poolTags {
+		desired := desiredPools[tag]
+		previous, existed := oldPools[tag]
+		if existed && reflect.DeepEqual(previous, desired) {
+			continue
+		}
+		if err := createRuntimeOutbound(runtimeCtx, instance, desired); err != nil {
+			rollbackPools()
+			removeRuntimeOutbounds(instance, createdBaseTags)
+			return fmt.Errorf("switch pool %s: %w", tag, err)
+		}
+		poolChanges = append(poolChanges, outboundChange{tag: tag, previous: previous, existed: existed})
+	}
+
+	type inboundChange struct {
+		tag      string
+		previous option.Inbound
+		existed  bool
+	}
+	inboundChanges := make([]inboundChange, 0)
+	rollbackInbounds := func() {
+		for idx := len(inboundChanges) - 1; idx >= 0; idx-- {
+			change := inboundChanges[idx]
+			if _, exists := instance.Inbound().Get(change.tag); exists {
+				_ = instance.Inbound().Remove(change.tag)
+			}
+			if change.existed {
+				if err := createRuntimeInbound(runtimeCtx, instance, change.previous); err != nil {
+					m.logger.Errorf("failed to roll back inbound %s: %v", change.tag, err)
+				}
+			}
+		}
+	}
+	failRuntimeSwitch := func(cause error) error {
+		rollbackInbounds()
+		rollbackPools()
+		removeRuntimeOutbounds(instance, createdBaseTags)
+		return cause
+	}
+
+	for _, tag := range sortedMapKeys(desiredInbounds) {
+		desired := desiredInbounds[tag]
+		previous, existed := oldInbounds[tag]
+		if existed && reflect.DeepEqual(previous, desired) {
+			continue
+		}
+		if err := createRuntimeInbound(runtimeCtx, instance, desired); err != nil {
+			// Same-address credential changes cannot bind the new listener before
+			// closing the changed old one. Limit that short handoff to this node.
+			if !existed {
+				return failRuntimeSwitch(fmt.Errorf("create inbound %s: %w", tag, err))
+			}
+			if removeErr := instance.Inbound().Remove(tag); removeErr != nil {
+				return failRuntimeSwitch(fmt.Errorf("replace inbound %s: %v (remove old: %w)", tag, err, removeErr))
+			}
+			if retryErr := createRuntimeInbound(runtimeCtx, instance, desired); retryErr != nil {
+				_ = createRuntimeInbound(runtimeCtx, instance, previous)
+				return failRuntimeSwitch(fmt.Errorf("replace inbound %s after releasing listener: %w", tag, retryErr))
+			}
+		}
+		inboundChanges = append(inboundChanges, inboundChange{tag: tag, previous: previous, existed: existed})
+	}
+	for _, tag := range mapDifferenceKeys(oldInbounds, desiredInbounds) {
+		previous := oldInbounds[tag]
+		if err := instance.Inbound().Remove(tag); err != nil {
+			return failRuntimeSwitch(fmt.Errorf("remove inbound %s: %w", tag, err))
+		}
+		inboundChanges = append(inboundChanges, inboundChange{tag: tag, previous: previous, existed: true})
+	}
+
+	for _, tag := range mapDifferenceKeys(oldPools, desiredPools) {
+		previous := oldPools[tag]
+		if err := instance.Outbound().Remove(tag); err != nil {
+			return failRuntimeSwitch(fmt.Errorf("remove pool %s: %w", tag, err))
+		}
+		poolChanges = append(poolChanges, outboundChange{tag: tag, previous: previous, existed: true})
+	}
+
+	draining := make(map[string]adapter.Outbound, len(removedBaseTags))
+	for _, tag := range removedBaseTags {
+		if outbound, ok := instance.Outbound().Outbound(tag); ok {
+			draining[tag] = outbound
+		}
+	}
+
+	m.applyConfigSettings(newCfg)
+	m.mu.Lock()
+	m.cfg = newCfg
+	m.runtimeOptions = desiredOptions
+	drainTimeout := m.drainTimeout
+	m.mu.Unlock()
+	if m.monitorServer != nil {
+		m.monitorServer.SetConfig(newCfg)
+	}
+	if m.monitorMgr != nil {
+		m.monitorMgr.RetainNodeURIs(nodeURISet(newCfg.Nodes))
+	}
+	if err := newCfg.PersistPortMap(); err != nil {
+		m.logger.Warnf("failed to persist dedicated port map after reload: %v", err)
+	}
+
+	for tag, outbound := range draining {
+		go m.drainRuntimeOutbound(instance, tag, outbound, drainTimeout)
+	}
+	if newCfg.GeoIP.Enabled {
+		m.startGeoIPRouter(ctx, newCfg)
+	} else {
+		m.mu.Lock()
+		if m.geoRouter != nil {
+			m.geoRouter.Stop()
+			m.geoRouter = nil
+		}
+		m.mu.Unlock()
+	}
+
+	m.logger.Infof(
+		"node-level reload committed: %d added, %d removed, %d unchanged; draining removed outbounds for %s",
+		len(addedBaseTags), len(removedBaseTags), len(desiredBase)-len(addedBaseTags), drainTimeout,
+	)
+	return nil
+}
+
+func splitRuntimeOutbounds(options option.Options) (map[string]option.Outbound, map[string]option.Outbound) {
+	base := make(map[string]option.Outbound)
+	pools := make(map[string]option.Outbound)
+	for _, outbound := range options.Outbounds {
+		if outbound.Type == pool.Type {
+			pools[outbound.Tag] = outbound
+		} else {
+			base[outbound.Tag] = outbound
+		}
+	}
+	return base, pools
+}
+
+func runtimeInboundMap(inbounds []option.Inbound) map[string]option.Inbound {
+	result := make(map[string]option.Inbound, len(inbounds))
+	for _, inbound := range inbounds {
+		result[inbound.Tag] = inbound
+	}
+	return result
+}
+
+func sortedMapKeys[T any](values map[string]T) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func mapDifferenceKeys[T, U any](left map[string]T, right map[string]U) []string {
+	keys := make([]string, 0)
+	for key := range left {
+		if _, ok := right[key]; !ok {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func createRuntimeOutbound(runtimeCtx context.Context, instance *box.Box, outbound option.Outbound) error {
+	logger := singlog.NewNOPFactory().NewLogger("runtime/outbound/" + outbound.Tag)
+	outboundCtx := adapter.WithContext(runtimeCtx, &adapter.InboundContext{Outbound: outbound.Tag})
+	return instance.Outbound().Create(outboundCtx, instance.Router(), logger, outbound.Tag, outbound.Type, outbound.Options)
+}
+
+func createRuntimeInbound(runtimeCtx context.Context, instance *box.Box, inbound option.Inbound) error {
+	logger := singlog.NewNOPFactory().NewLogger("runtime/inbound/" + inbound.Tag)
+	return instance.Inbound().Create(runtimeCtx, instance.Router(), logger, inbound.Tag, inbound.Type, inbound.Options)
+}
+
+func removeRuntimeOutbounds(instance *box.Box, tags []string) {
+	for idx := len(tags) - 1; idx >= 0; idx-- {
+		_ = instance.Outbound().Remove(tags[idx])
+	}
+}
+
+func (m *Manager) preflightCandidateSet(ctx context.Context, instance *box.Box, tags []string, cfg *config.Config) error {
+	minimum := cfg.SubscriptionRefresh.MinAvailableNodes
+	if minimum <= 0 {
+		return nil
+	}
+	if len(tags) < minimum {
+		return fmt.Errorf("health check rejected candidate: %d nodes built (need >= %d)", len(tags), minimum)
+	}
+	destination, configured := m.monitorMgr.DestinationForProbe()
+	if !configured {
+		return nil
+	}
+	timeout := cfg.SubscriptionRefresh.HealthCheckTimeout
+	if timeout <= 0 {
+		timeout = defaultHealthCheckTimeout
+	}
+
+	workerCount := runtime.NumCPU() * 2
+	if workerCount < 8 {
+		workerCount = 8
+	}
+	if workerCount > len(tags) {
+		workerCount = len(tags)
+	}
+	jobs := make(chan string)
+	results := make(chan bool, len(tags))
+	var wg sync.WaitGroup
+	for worker := 0; worker < workerCount; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for tag := range jobs {
+				outbound, ok := instance.Outbound().Outbound(tag)
+				if !ok {
+					results <- false
+					continue
+				}
+				probeCtx, cancel := context.WithTimeout(ctx, timeout)
+				err := probeOutbound(probeCtx, outbound, destination)
+				cancel()
+				results <- err == nil
+			}
+		}()
+	}
+	go func() {
+		for _, tag := range tags {
+			jobs <- tag
+		}
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+	available := 0
+	for success := range results {
+		if success {
+			available++
+		}
+	}
+	if available < minimum {
+		return fmt.Errorf("health check rejected candidate before cutover: %d/%d nodes available (need >= %d)", available, len(tags), minimum)
+	}
+	m.logger.Infof("candidate health check passed before cutover: %d/%d nodes available", available, len(tags))
+	return nil
+}
+
+func probeOutbound(ctx context.Context, outbound adapter.Outbound, destination M.Socksaddr) error {
+	connection, err := outbound.DialContext(ctx, N.NetworkTCP, destination)
+	if err != nil {
+		return err
+	}
+	defer connection.Close()
+	deadline, hasDeadline := ctx.Deadline()
+	if hasDeadline {
+		_ = connection.SetDeadline(deadline)
+	}
+	request := fmt.Sprintf("GET /generate_204 HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", destination.AddrString())
+	if _, err := connection.Write([]byte(request)); err != nil {
+		return err
+	}
+	_, err = bufio.NewReader(connection).ReadByte()
+	return err
+}
+
+func (m *Manager) drainRuntimeOutbound(instance *box.Box, tag string, expected adapter.Outbound, timeout time.Duration) {
+	if timeout > 0 {
+		timer := time.NewTimer(timeout)
+		<-timer.C
+	}
+	current, ok := instance.Outbound().Outbound(tag)
+	if !ok || current != expected {
+		return
+	}
+	if err := instance.Outbound().Remove(tag); err != nil {
+		m.logger.Warnf("failed to retire drained outbound %s: %v", tag, err)
+		return
+	}
+	m.logger.Infof("retired outbound %s after %s drain", tag, timeout)
+}
+
 // rollbackToOldConfig attempts to restart with the previous configuration.
 func (m *Manager) rollbackToOldConfig(ctx context.Context, oldCfg *config.Config) error {
 	if oldCfg == nil {
 		return errors.New("old config is nil")
 	}
 	m.logger.Warnf("attempting rollback to previous config...")
-	instance, err := m.createBox(ctx, oldCfg)
+	built, err := m.createBox(ctx, oldCfg)
 	if err != nil {
 		m.logger.Errorf("rollback failed to create box: %v", err)
 		return err
 	}
-	if err := instance.Start(); err != nil {
-		_ = instance.Close()
+	if err := built.box.Start(); err != nil {
+		_ = built.box.Close()
 		m.logger.Errorf("rollback failed to start box: %v", err)
 		return err
 	}
 	m.applyConfigSettings(oldCfg)
 	m.mu.Lock()
-	m.currentBox = instance
+	m.currentBox = built.box
+	m.runtimeCtx = built.ctx
+	m.runtimeOptions = built.options
 	m.cfg = oldCfg
 	m.mu.Unlock()
 	// Sync config pointer to monitor server after rollback
@@ -345,6 +741,8 @@ func (m *Manager) Close() error {
 		err = m.currentBox.Close()
 		m.currentBox = nil
 	}
+	m.runtimeCtx = nil
+	m.runtimeOptions = option.Options{}
 	if m.monitorServer != nil {
 		m.monitorServer.Shutdown(context.Background())
 		m.monitorServer = nil
@@ -439,7 +837,7 @@ func (m *Manager) startGeoIPRouter(ctx context.Context, cfg *config.Config) {
 // createBox builds a sing-box instance from config.
 // It retries automatically when individual outbounds fail sing-box validation,
 // removing the offending outbound each time.
-func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, error) {
+func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*builtInstance, error) {
 	if cfg == nil {
 		return nil, errors.New("config is nil")
 	}
@@ -465,13 +863,17 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, 
 
 		boxCtx := box.Context(ctx, inboundRegistry, outboundRegistry, endpointRegistry, dnsRegistry, serviceRegistry)
 		boxCtx = monitor.ContextWith(boxCtx, m.monitorMgr)
+		// Pre-install the service registry so the context retained here observes
+		// the managers that box.New registers on its derived context. This enables
+		// safe runtime InboundManager/OutboundManager Create calls during reload.
+		boxCtx = service.ContextWithDefaultRegistry(boxCtx)
 
 		instance, err := box.New(box.Options{Context: boxCtx, Options: opts})
 		if err == nil {
 			if attempt > 0 {
 				log.Printf("✅ sing-box instance created after removing %d invalid outbound(s)", attempt)
 			}
-			return instance, nil
+			return &builtInstance{box: instance, ctx: boxCtx, options: opts}, nil
 		}
 
 		// Check if this is an outbound initialization error we can recover from
@@ -499,6 +901,11 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, 
 				if poolOpts, ok := ob.Options.(*pool.Options); ok {
 					poolOpts.Members = removeFromSlice(poolOpts.Members, badTag)
 					delete(poolOpts.Metadata, badTag)
+					for inboundTag, memberTag := range poolOpts.DedicatedMembers {
+						if memberTag == badTag {
+							delete(poolOpts.DedicatedMembers, inboundTag)
+						}
+					}
 
 					// If the pool is now empty, remove it to avoid another validation error
 					if len(poolOpts.Members) == 0 {
@@ -511,6 +918,29 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, 
 			newOutbounds = append(newOutbounds, ob)
 		}
 		opts.Outbounds = newOutbounds
+		if len(opts.Inbounds) > 0 {
+			validDedicated := make(map[string]struct{})
+			for _, outboundOptions := range opts.Outbounds {
+				if outboundOptions.Tag != pool.Tag {
+					continue
+				}
+				if poolOptions, ok := outboundOptions.Options.(*pool.Options); ok {
+					for inboundTag := range poolOptions.DedicatedMembers {
+						validDedicated[inboundTag] = struct{}{}
+					}
+				}
+			}
+			filtered := opts.Inbounds[:0]
+			for _, inboundOptions := range opts.Inbounds {
+				if strings.HasPrefix(inboundOptions.Tag, "in-node-") {
+					if _, ok := validDedicated[inboundOptions.Tag]; !ok {
+						continue
+					}
+				}
+				filtered = append(filtered, inboundOptions)
+			}
+			opts.Inbounds = filtered
+		}
 
 		// Also remove any routes that pointed to the removed pools or the badTag
 		if (len(removedPoolTags) > 0 || badTag != "") && opts.Route != nil {

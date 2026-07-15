@@ -10,7 +10,7 @@ import (
 	"github.com/sagernet/sing-box/option"
 )
 
-func TestBuildMultiPortUsesPerNodeCredentialsAndDedicatedPool(t *testing.T) {
+func TestBuildMultiPortUsesPerNodeCredentialsAndDedicatedDispatch(t *testing.T) {
 	cfg := &config.Config{
 		Mode: "multi-port",
 		MultiPort: config.MultiPortConfig{
@@ -51,17 +51,23 @@ func TestBuildMultiPortUsesPerNodeCredentialsAndDedicatedPool(t *testing.T) {
 		t.Fatalf("inbound used wrong credentials: %#v", mixed.Users[0])
 	}
 
-	foundDedicated := false
+	foundDispatcher := false
 	for _, outbound := range opts.Outbounds {
 		poolOptions, ok := outbound.Options.(*poolout.Options)
-		if ok && poolOptions.Dedicated {
-			foundDedicated = true
-			if len(poolOptions.Members) != 1 {
-				t.Fatalf("dedicated pool has %d members", len(poolOptions.Members))
+		if ok && outbound.Tag == poolout.Tag {
+			foundDispatcher = true
+			if len(poolOptions.Members) != 1 || len(poolOptions.DedicatedMembers) != 1 {
+				t.Fatalf("unexpected dispatcher options: members=%d dedicated=%d", len(poolOptions.Members), len(poolOptions.DedicatedMembers))
+			}
+			if poolOptions.DedicatedMembers[opts.Inbounds[0].Tag] != poolOptions.Members[0] {
+				t.Fatal("dedicated inbound was not mapped to its exact member")
 			}
 		}
 	}
-	if !foundDedicated {
-		t.Fatal("multi-port build did not mark its single-node pool as dedicated")
+	if !foundDispatcher {
+		t.Fatal("multi-port build did not create the stable dispatcher pool")
+	}
+	if opts.Route == nil || opts.Route.Final != poolout.Tag || len(opts.Route.Rules) != 0 {
+		t.Fatalf("multi-port routing is not using the stable final pool: %#v", opts.Route)
 	}
 }

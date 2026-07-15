@@ -30,7 +30,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 	metadata := make(map[string]poolout.MemberMeta)
 	nodesByTag := make(map[string]config.NodeConfig)
 	var failedNodes []string
-	usedTags := make(map[string]int) // Track tag usage for uniqueness
+	usedNodeKeys := make(map[string]int) // Track duplicate upstreams deterministically.
 
 	// Initialize GeoIP lookup if enabled
 	var geoLookup *geoip.Lookup
@@ -64,18 +64,15 @@ func Build(cfg *config.Config) (option.Options, error) {
 		if i > 0 && i%1000 == 0 {
 			log.Printf("⏳ Building nodes... %d/%d", i, totalNodes)
 		}
-		baseTag := sanitizeTag(node.Name)
-		if baseTag == "" {
-			baseTag = fmt.Sprintf("node-%d", len(memberTags)+1)
-		}
-
-		// Ensure tag uniqueness by appending a counter if needed
-		tag := baseTag
-		if count, exists := usedTags[baseTag]; exists {
-			usedTags[baseTag] = count + 1
-			tag = fmt.Sprintf("%s-%d", baseTag, count+1)
-		} else {
-			usedTags[baseTag] = 1
+		// Runtime reloads diff outbounds by tag. Derive the tag from the stable
+		// node identity instead of the display name/order so an unchanged node
+		// keeps the same live outbound across subscription refreshes.
+		nodeKey := node.NodeKey()
+		occurrence := usedNodeKeys[nodeKey]
+		usedNodeKeys[nodeKey] = occurrence + 1
+		tag := "node-" + nodeKey
+		if occurrence > 0 {
+			tag = fmt.Sprintf("%s-%d", tag, occurrence+1)
 		}
 
 		outbound, err := buildNodeOutbound(tag, node.URI, cfg.SkipCertVerify)
@@ -223,30 +220,17 @@ func Build(cfg *config.Config) (option.Options, error) {
 		return option.Options{}, fmt.Errorf("unsupported mode %s", cfg.Mode)
 	}
 
-	// Build pool inbound (single entry point for all nodes)
+	// Build pool inbound (single entry point for all nodes).
 	if enablePoolInbound {
 		inbound, err := buildPoolInbound(cfg)
 		if err != nil {
 			return option.Options{}, err
 		}
 		inbounds = append(inbounds, inbound)
-		poolOptions := poolout.Options{
-			Mode:              cfg.Pool.Mode,
-			Members:           memberTags,
-			FailureThreshold:  cfg.Pool.FailureThreshold,
-			BlacklistDuration: cfg.Pool.BlacklistDuration,
-			Metadata:          metadata,
-			FailOpen:          cfg.Pool.FailOpen,
-		}
-		outbounds = append(outbounds, option.Outbound{
-			Type:    poolout.Type,
-			Tag:     poolout.Tag,
-			Options: &poolOptions,
-		})
-		route.Final = poolout.Tag
 	}
 
 	// Build multi-port inbounds (one port per node)
+	dedicatedMembers := make(map[string]string, len(memberTags))
 	if enableMultiPort {
 		addr, err := parseAddr(cfg.MultiPort.Address)
 		if err != nil {
@@ -254,22 +238,6 @@ func Build(cfg *config.Config) (option.Options, error) {
 		}
 		for _, tag := range memberTags {
 			meta := metadata[tag]
-			perMeta := map[string]poolout.MemberMeta{tag: meta}
-			poolTag := fmt.Sprintf("%s-%s", poolout.Tag, tag)
-			perOptions := poolout.Options{
-				Mode:              "sequential",
-				Members:           []string{tag},
-				FailureThreshold:  cfg.Pool.FailureThreshold,
-				BlacklistDuration: cfg.Pool.BlacklistDuration,
-				Metadata:          perMeta,
-				Dedicated:         true,
-			}
-			perPool := option.Outbound{
-				Type:    poolout.Type,
-				Tag:     poolTag,
-				Options: &perOptions,
-			}
-			outbounds = append(outbounds, perPool)
 			inboundOptions := &option.HTTPMixedInboundOptions{
 				ListenOptions: option.ListenOptions{
 					Listen:     addr,
@@ -287,27 +255,34 @@ func Build(cfg *config.Config) (option.Options, error) {
 				inboundOptions.Users = []auth.User{{Username: username, Password: password}}
 			}
 			inboundTag := fmt.Sprintf("in-%s", tag)
+			dedicatedMembers[inboundTag] = tag
 			inbounds = append(inbounds, option.Inbound{
 				Type:    C.TypeMixed,
 				Tag:     inboundTag,
 				Options: inboundOptions,
 			})
-			route.Rules = append(route.Rules, option.Rule{
-				Type: C.RuleTypeDefault,
-				DefaultOptions: option.DefaultRule{
-					RawDefaultRule: option.RawDefaultRule{
-						Inbound: badoption.Listable[string]{inboundTag},
-					},
-					RuleAction: option.RuleAction{
-						Action: C.RuleActionTypeRoute,
-						RouteOptions: option.RouteActionOptions{
-							Outbound: poolTag,
-						},
-					},
-				},
-			})
 		}
 	}
+
+	// All modes use one stable pool outbound as the route final. Dedicated
+	// listeners are dispatched by inbound tag inside the pool. This keeps the
+	// route graph immutable, which lets reload add/remove nodes and listeners
+	// through sing-box's runtime managers without rebuilding the whole Box.
+	poolOptions := poolout.Options{
+		Mode:              cfg.Pool.Mode,
+		Members:           memberTags,
+		FailureThreshold:  cfg.Pool.FailureThreshold,
+		BlacklistDuration: cfg.Pool.BlacklistDuration,
+		Metadata:          metadata,
+		FailOpen:          cfg.Pool.FailOpen,
+		DedicatedMembers:  dedicatedMembers,
+	}
+	outbounds = append(outbounds, option.Outbound{
+		Type:    poolout.Type,
+		Tag:     poolout.Tag,
+		Options: &poolOptions,
+	})
+	route.Final = poolout.Tag
 
 	// Build GeoIP region-based pool outbounds and routing
 	if cfg.GeoIP.Enabled && enablePoolInbound {

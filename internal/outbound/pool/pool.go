@@ -50,6 +50,11 @@ type Options struct {
 	// always attempts that exact node even when the shared pool has blacklisted
 	// it; it must never clear the shared blacklist merely to make progress.
 	Dedicated bool
+	// DedicatedMembers maps a mixed inbound tag to the exact upstream member
+	// backing that listener. Keeping this dispatch table in the stable global
+	// pool avoids per-node route rules, so listeners can be added and removed
+	// without rebuilding the sing-box router.
+	DedicatedMembers map[string]string
 }
 
 // MemberMeta carries optional descriptive information for monitoring UI.
@@ -103,7 +108,11 @@ func newPool(ctx context.Context, _ adapter.Router, logger singlog.ContextLogger
 	normalized := normalizeOptions(options)
 	memberCount := len(normalized.Members)
 	p := &poolOutbound{
-		Adapter: outbound.NewAdapter(Type, tag, []string{N.NetworkTCP, N.NetworkUDP}, normalized.Members),
+		// Members are resolved from the already-populated runtime manager. Do not
+		// expose them as manager dependencies: replacement pools otherwise leave
+		// stale dependency edges that prevent drained node outbounds from being
+		// removed after a node-level reload.
+		Adapter: outbound.NewAdapter(Type, tag, []string{N.NetworkTCP, N.NetworkUDP}, nil),
 		ctx:     ctx,
 		logger:  logger,
 		manager: manager,
@@ -119,6 +128,14 @@ func newPool(ctx context.Context, _ adapter.Router, logger singlog.ContextLogger
 	}
 
 	return p, nil
+}
+
+// Close only releases the external dialer registration. Connections already
+// handed out by this pool keep their member/outbound references and can drain
+// naturally after the runtime manager swaps in a replacement pool.
+func (p *poolOutbound) Close() error {
+	unregisterDialer(p.Tag(), p)
+	return nil
 }
 
 func normalizeOptions(options Options) Options {
@@ -313,7 +330,7 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 }
 
 func (p *poolOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	member, err := p.pickMember(network)
+	member, err := p.pickMember(ctx, network)
 	if err != nil {
 		return nil, err
 	}
@@ -329,7 +346,7 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 }
 
 func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	member, err := p.pickMember(N.NetworkUDP)
+	member, err := p.pickMember(ctx, N.NetworkUDP)
 	if err != nil {
 		return nil, err
 	}
@@ -344,7 +361,7 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 	return p.wrapPacketConn(conn, member), nil
 }
 
-func (p *poolOutbound) pickMember(network string) (*memberState, error) {
+func (p *poolOutbound) pickMember(ctx context.Context, network string) (*memberState, error) {
 	now := time.Now()
 	candidates := p.getCandidateBuffer()
 
@@ -354,6 +371,20 @@ func (p *poolOutbound) pickMember(network string) (*memberState, error) {
 			p.mu.Unlock()
 			p.putCandidateBuffer(candidates)
 			return nil, err
+		}
+	}
+	if inbound := adapter.ContextFrom(ctx); inbound != nil {
+		if dedicatedTag := p.options.DedicatedMembers[inbound.Inbound]; dedicatedTag != "" {
+			for _, member := range p.members {
+				if member.tag == dedicatedTag && (network == "" || common.Contains(member.outbound.Network(), network)) {
+					p.mu.Unlock()
+					p.putCandidateBuffer(candidates)
+					return member, nil
+				}
+			}
+			p.mu.Unlock()
+			p.putCandidateBuffer(candidates)
+			return nil, E.New("dedicated proxy member not found: ", dedicatedTag)
 		}
 	}
 	candidates = p.availableMembersLocked(now, network, candidates)

@@ -30,6 +30,20 @@ func registerDialer(tag string, p *poolOutbound) {
 	dialerRegistry.Store(tag, &poolDialerAdapter{pool: p})
 }
 
+// unregisterDialer removes a registration only when it still belongs to p.
+// During runtime replacement the new pool registers before sing-box closes
+// the old one, so an unconditional delete would erase the new registration.
+func unregisterDialer(tag string, p *poolOutbound) {
+	value, ok := dialerRegistry.Load(tag)
+	if !ok {
+		return
+	}
+	adapter, ok := value.(*poolDialerAdapter)
+	if ok && adapter.pool == p {
+		dialerRegistry.CompareAndDelete(tag, value)
+	}
+}
+
 // GetDialer returns a NetDialer for the given pool tag.
 func GetDialer(tag string) (NetDialer, bool) {
 	v, ok := dialerRegistry.Load(tag)

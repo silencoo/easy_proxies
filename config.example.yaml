@@ -111,7 +111,7 @@ geoip:
 #   interval: 1h                # 刷新间隔（默认 1 小时）
 #   timeout: 30s                # 获取订阅的超时时间
 #   health_check_timeout: 60s   # 新节点健康检查超时
-#   drain_timeout: 30s          # 兼容保留；同端口切换目前无法排空旧连接
+#   drain_timeout: 30s          # 节点移出流量池后，旧 outbound 延迟回收时间
 #   min_available_nodes: 1      # 最少可用节点数，低于此值不切换
 
 # ═══════════════════════════════════════════════════════════════
