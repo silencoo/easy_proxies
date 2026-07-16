@@ -6,39 +6,51 @@
   <title>Easy Proxies - 监控中心</title>
   <style>
     :root {
-      /* Dark Theme (Default) */
-      --bg-base: #0f172a;
-      --bg-panel: #1e293b;
-      --bg-hover: #334155;
-      --bg-input: #0f172a;
-      --border: #334155;
-      --border-light: rgba(255, 255, 255, 0.1);
-      --text-main: #f8fafc;
-      --text-muted: #94a3b8;
-      --primary: #3b82f6;
-      --primary-hover: #2563eb;
-      --success: #10b981;
-      --success-bg: rgba(16, 185, 129, 0.1);
-      --warning: #f59e0b;
-      --warning-bg: rgba(245, 158, 11, 0.1);
-      --error: #ef4444;
-      --error-bg: rgba(239, 68, 68, 0.1);
+      /* Monochrome dark theme */
+      --bg-base: #090909;
+      --bg-panel: #111111;
+      --bg-hover: #1d1d1d;
+      --bg-input: #0d0d0d;
+      --border: #2b2b2b;
+      --border-light: rgba(255, 255, 255, 0.08);
+      --text-main: #f5f5f5;
+      --text-muted: #a1a1a1;
+      --primary: #f5f5f5;
+      --primary-hover: #d4d4d4;
+      --primary-contrast: #0a0a0a;
+      --success: #d4d4d4;
+      --success-bg: rgba(255, 255, 255, 0.07);
+      --warning: #b8b8b8;
+      --warning-bg: rgba(255, 255, 255, 0.06);
+      --error: #ef7a7a;
+      --error-bg: rgba(239, 122, 122, 0.08);
+      --chart-primary: #f5f5f5;
+      --chart-secondary: #8a8a8a;
       --font-ui: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       --font-mono: "JetBrains Mono", "Fira Code", Consolas, monospace;
-      --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
-      --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.4);
+      --shadow-sm: 0 1px 0 rgba(255, 255, 255, 0.03);
+      --shadow-md: 0 12px 30px rgba(0, 0, 0, 0.45);
     }
     [data-theme="light"] {
-      --bg-base: #f8fafc;
+      --bg-base: #f4f4f4;
       --bg-panel: #ffffff;
-      --bg-hover: #f1f5f9;
-      --bg-input: #f8fafc;
-      --border: #e2e8f0;
-      --border-light: rgba(0, 0, 0, 0.05);
-      --text-main: #0f172a;
-      --text-muted: #64748b;
-      --primary: #2563eb;
-      --primary-hover: #1d4ed8;
+      --bg-hover: #ebebeb;
+      --bg-input: #fafafa;
+      --border: #d4d4d4;
+      --border-light: rgba(0, 0, 0, 0.07);
+      --text-main: #111111;
+      --text-muted: #666666;
+      --primary: #111111;
+      --primary-hover: #2b2b2b;
+      --primary-contrast: #ffffff;
+      --success: #333333;
+      --success-bg: rgba(0, 0, 0, 0.05);
+      --warning: #555555;
+      --warning-bg: rgba(0, 0, 0, 0.04);
+      --error: #a52828;
+      --error-bg: rgba(165, 40, 40, 0.06);
+      --chart-primary: #171717;
+      --chart-secondary: #8a8a8a;
       --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
       --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
     }
@@ -65,7 +77,8 @@
       color: var(--text-main);
       font-size: 13px;
       display: flex;
-      height: 100vh;
+      min-height: 100vh;
+      height: 100dvh;
       overflow: hidden;
     }
     /* Layout */
@@ -89,26 +102,28 @@
     }
     .brand-icon {
       width: 28px; height: 28px;
-      background: linear-gradient(135deg, rgba(59,130,246,0.15), rgba(139,92,246,0.15));
-      border-radius: 8px;
+      background: var(--text-main);
+      color: var(--primary-contrast);
+      border: 1px solid var(--text-main);
+      border-radius: 6px;
       display: flex; align-items: center; justify-content: center;
-      box-shadow: 0 0 12px rgba(96,165,250,0.3);
-      animation: brandGlow 3s ease-in-out infinite;
-    }
-    @keyframes brandGlow {
-      0%, 100% { box-shadow: 0 0 8px rgba(96,165,250,0.2); }
-      50% { box-shadow: 0 0 16px rgba(139,92,246,0.4); }
     }
     .nav { padding: 16px 0; flex: 1; }
     .nav-item {
+      width: 100%;
+      border: 0;
+      border-right: 3px solid transparent;
+      background: transparent;
+      font: inherit;
+      text-align: left;
       padding: 10px 20px;
       display: flex; align-items: center; gap: 12px;
       color: var(--text-muted);
       cursor: pointer;
-      transition: all 0.2s;
+      transition: background-color 0.18s, color 0.18s, border-color 0.18s;
     }
-    .nav-item:hover { background: rgba(100,100,100,0.05); color: var(--text-main); }
-    .nav-item.active { background: rgba(59, 130, 246, 0.1); color: var(--primary); border-right: 3px solid var(--primary); }
+    .nav-item:hover { background: var(--bg-hover); color: var(--text-main); }
+    .nav-item.active { background: var(--bg-hover); color: var(--text-main); border-right-color: var(--text-main); }
     
     .main {
       flex: 1;
@@ -150,7 +165,7 @@
       width: 32px;
       height: 32px;
       border-radius: 6px;
-      transition: all 0.2s;
+      transition: background-color 0.18s, color 0.18s;
       position: relative;
     }
     .theme-toggle:hover {
@@ -196,13 +211,18 @@
       cursor: pointer;
       font-size: 12px;
       display: inline-flex; align-items: center; gap: 6px;
-      transition: all 0.2s;
+      transition: background-color 0.18s, border-color 0.18s, color 0.18s;
     }
-    .btn:hover { filter: brightness(1.1); }
-    .btn-primary { background: var(--primary); border-color: var(--primary); color: #fff; }
-    .btn-success { background: var(--success); border-color: var(--success); color: #fff; }
-    .btn-danger { background: var(--error); border-color: var(--error); color: #fff; }
+    .btn:hover { background: var(--text-main); border-color: var(--text-main); color: var(--primary-contrast); }
+    .btn-primary { background: var(--primary); border-color: var(--primary); color: var(--primary-contrast); }
+    .btn-primary:hover { background: var(--primary-hover); border-color: var(--primary-hover); color: var(--primary-contrast); }
+    .btn-success { background: var(--text-main); border-color: var(--text-main); color: var(--primary-contrast); }
+    .btn-danger { background: transparent; border-color: var(--error); color: var(--error); }
+    .btn-danger:hover { background: var(--error); border-color: var(--error); color: #fff; }
+    .btn-warning { background: transparent; border-color: var(--text-muted); color: var(--text-main); }
     .btn-sm { padding: 4px 10px; font-size: 11px; }
+    .icon { width: 15px; height: 15px; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+    .icon-sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
 
     /* Dashboard Grid */
     .overview-grid {
@@ -309,7 +329,7 @@
       border: 1px solid var(--border);
       border-radius: 6px;
       cursor: pointer;
-      transition: all 0.2s;
+      transition: border-color 0.2s ease, background-color 0.2s ease;
     }
     .checkbox-row:hover { border-color: var(--primary); }
     .checkbox-row input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; margin: 0; }
@@ -327,7 +347,12 @@
     
     .region-filters { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
     .region-btn { padding: 4px 10px; border-radius: 4px; background: var(--bg-input); border: 1px solid var(--border); color: var(--text-muted); cursor: pointer; font-size: 12px; }
-    .region-btn.active { background: rgba(59,130,246,0.1); border-color: var(--primary); color: var(--primary); }
+    .region-btn.active { background: var(--text-main); border-color: var(--text-main); color: var(--primary-contrast); }
+
+    :where(button, a, input, select, textarea):focus-visible {
+      outline: 2px solid var(--text-main);
+      outline-offset: 2px;
+    }
 
     .toast-container { position: fixed; bottom: 24px; right: 24px; display: flex; flex-direction: column; gap: 10px; z-index: 2000; }
     .toast { padding: 12px 16px; border-radius: 6px; background: var(--bg-panel); border-left: 4px solid var(--primary); box-shadow: 0 5px 15px rgba(0,0,0,0.3); font-size: 13px; animation: slideInX 0.3s; }
@@ -366,6 +391,30 @@
       z-index: 10;
     }
     .chart-container { width: 100%; height: 100%; }
+
+    @media (max-width: 900px) {
+      body { flex-direction: column; overflow: auto; }
+      .sidebar { width: 100%; height: auto; border-right: 0; border-bottom: 1px solid var(--border); }
+      .brand { height: 52px; }
+      .nav { display: flex; padding: 0 8px 8px; overflow-x: auto; }
+      .nav-item { width: auto; min-width: max-content; padding: 9px 12px; border-right: 0; border-bottom: 2px solid transparent; }
+      .nav-item.active { border-bottom-color: var(--text-main); }
+      .main { min-height: 0; overflow: visible; }
+      .header { min-height: 60px; height: auto; padding: 10px 16px; align-items: flex-start; gap: 12px; }
+      .header-actions { justify-content: flex-end; flex-wrap: wrap; }
+      .content { overflow: visible; padding: 16px; }
+      .charts-grid { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 600px) {
+      .overview-grid { grid-template-columns: 1fr; }
+      .header { flex-direction: column; }
+      .header-actions { justify-content: flex-start; }
+      .checkbox-grid { grid-template-columns: 1fr; }
+      .modal { width: min(400px, calc(100vw - 24px)); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+    }
   </style>
   <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
   <script>
@@ -385,47 +434,41 @@
 </head>
 <body>
 
+  <svg class="icon-sprite" aria-hidden="true">
+    <symbol id="i-network" viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="7" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="m8.3 7 7.3-.1M7.5 8.2l3.2 7.5m5.8-6.5-3.2 6.5"/></symbol>
+    <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></symbol>
+    <symbol id="i-edit" viewBox="0 0 24 24"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></symbol>
+    <symbol id="i-activity" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6M8 13h8M8 17h8"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5v.2a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3h.1a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8v.1a1.7 1.7 0 0 0 1.5 1h.2a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 6v5h-5M4 18v-5h5"/><path d="M18.5 9A7 7 0 0 0 6.2 6.2L4 8m2 7a7 7 0 0 0 11.8 2.8L20 16"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 21h16"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7Z"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.3 3.7 2.5 18a2 2 0 0 0 1.8 3h15.4a2 2 0 0 0 1.8-3L13.7 3.7a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4m0 4h.01"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></symbol>
+    <symbol id="i-unlock" viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 7.5-2"/></symbol>
+    <symbol id="i-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m5.6 5.6 12.8 12.8"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16m-10 4v6m4-6v6M9 7l1-3h4l1 3m3 0-1 14H7L6 7"/></symbol>
+    <symbol id="i-save" viewBox="0 0 24 24"><path d="M4 3h13l3 3v15H4Z"/><path d="M8 3v6h8V3M8 21v-7h8v7"/></symbol>
+    <symbol id="i-map" viewBox="0 0 24 24"><path d="M12 21s7-5.2 7-12a7 7 0 1 0-14 0c0 6.8 7 12 7 12Z"/><circle cx="12" cy="9" r="2"/></symbol>
+  </svg>
+
   <!-- Sidebar -->
   <aside class="sidebar">
     <div class="brand">
       <div class="brand-icon">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-          <path d="M2 16l4-4 4 6 4-10 4 4 4-6" stroke="url(#brandGrad)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-            <animate attributeName="stroke-dasharray" values="0,100;50,0;0,100" dur="3s" repeatCount="indefinite"/>
-          </path>
-          <defs><linearGradient id="brandGrad" x1="0" y1="0" x2="24" y2="0"><stop offset="0%" stop-color="#60a5fa"/><stop offset="100%" stop-color="#a78bfa"/></linearGradient></defs>
-        </svg>
+        <svg class="icon"><use href="#i-network"></use></svg>
       </div>
       Easy Proxies
     </div>
     <div class="nav">
-      <div class="nav-item active" onclick="switchTab('dashboard')">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
-        监控看板
-      </div>
-      <div class="nav-item" onclick="switchTab('manage')">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"></path><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path></svg>
-        节点配置
-      </div>
-      <div class="nav-item" onclick="switchTab('debug')">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg>
-        诊断分析
-      </div>
-      <div class="nav-item" onclick="switchTab('logs')">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line></svg>
-        控制台日志
-      </div>
-      <div class="nav-item" onclick="switchTab('settings')">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
-        系统设置
-      </div>
-    </div>
-    <div style="padding: 0 20px 16px; text-align: center;">
-      <a href="https://github.com/jasonwong1991/easy_proxies" target="_blank" rel="noopener" style="display:inline-flex; align-items:center; gap:6px; color:var(--text-muted); text-decoration:none; font-size:12px; padding:6px 10px; border-radius:6px; border:1px solid var(--border); transition:all 0.2s;" onmouseover="this.style.borderColor='var(--primary)';this.style.color='var(--text-main)'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text-muted)'">
-        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon></svg>
-        <span id="githubStars">-</span>
-      </a>
+      <button type="button" class="nav-item active" data-tab="dashboard" aria-current="page" onclick="switchTab('dashboard')"><svg class="icon"><use href="#i-dashboard"></use></svg><span>监控看板</span></button>
+      <button type="button" class="nav-item" data-tab="manage" onclick="switchTab('manage')"><svg class="icon"><use href="#i-edit"></use></svg><span>节点配置</span></button>
+      <button type="button" class="nav-item" data-tab="debug" onclick="switchTab('debug')"><svg class="icon"><use href="#i-activity"></use></svg><span>诊断分析</span></button>
+      <button type="button" class="nav-item" data-tab="logs" onclick="switchTab('logs')"><svg class="icon"><use href="#i-file"></use></svg><span>控制台日志</span></button>
+      <button type="button" class="nav-item" data-tab="settings" onclick="switchTab('settings')"><svg class="icon"><use href="#i-settings"></use></svg><span>系统设置</span></button>
     </div>
   </aside>
 
@@ -445,21 +488,21 @@
       <div class="header-left">
         <div class="status-indicator">
           <div class="status-dot"></div>
-          <span id="lastUpdate">System Online</span>
+          <span id="lastUpdate">系统在线</span>
         </div>
       </div>
       <div class="header-actions">
-        <button class="theme-toggle" id="themeToggleBtn" onclick="toggleTheme()" title="切换主题" data-mode="auto">
+        <button type="button" class="theme-toggle" id="themeToggleBtn" onclick="toggleTheme()" title="切换主题" data-mode="auto">
           <svg class="icon-sun" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
           <svg class="icon-moon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
           <svg class="icon-auto" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
           <span class="theme-mode-label" id="themeModeLabel">跟随系统</span>
         </button>
-        <button class="btn btn-primary" onclick="probeAllNodes()">⚡ 批量探测</button>
-        <button class="btn" id="refreshSubBtn" onclick="refreshSubscription()" style="display:none;">刷新订阅</button>
-        <button class="btn" onclick="exportNodes()">导出配置</button>
-        <button class="btn" onclick="toggleAutoRefresh()" id="autoRefreshBtn">⏹ 关闭自动刷新</button>
-        <button class="btn" onclick="refresh()">↺ 刷新</button>
+        <button type="button" class="btn btn-primary" onclick="probeAllNodes()"><svg class="icon"><use href="#i-activity"></use></svg><span>批量探测</span></button>
+        <button type="button" class="btn" id="refreshSubBtn" onclick="refreshSubscription()" style="display:none;"><svg class="icon"><use href="#i-refresh"></use></svg><span>刷新订阅</span></button>
+        <button type="button" class="btn" onclick="exportNodes()"><svg class="icon"><use href="#i-download"></use></svg><span>导出配置</span></button>
+        <button type="button" class="btn" onclick="toggleAutoRefresh()" id="autoRefreshBtn"><svg class="icon"><use id="autoRefreshIcon" href="#i-pause"></use></svg><span id="autoRefreshLabel">关闭自动刷新</span></button>
+        <button type="button" class="btn" onclick="refresh()"><svg class="icon"><use href="#i-refresh"></use></svg><span>刷新</span></button>
       </div>
     </header>
 
@@ -475,7 +518,7 @@
           <div class="stat-panel">
             <div class="stat-title">健康在线</div>
             <div class="stat-value" style="color: var(--success);" id="healthyNodes">0</div>
-            <div class="stat-sub">Active & Ready</div>
+            <div class="stat-sub">活跃且就绪</div>
           </div>
           <div class="stat-panel">
             <div class="stat-title">活跃连接数</div>
@@ -489,12 +532,12 @@
           </div>
           <div class="stat-panel">
             <div class="stat-title">↑ 上行速率</div>
-            <div class="stat-value" style="color: #3b82f6; font-size: 22px;" id="liveUpSpeed">0 B/s</div>
+            <div class="stat-value" style="color: var(--chart-primary); font-size: 22px;" id="liveUpSpeed">0 B/s</div>
             <div class="stat-sub" style="color: var(--text-muted);">实时上传</div>
           </div>
           <div class="stat-panel">
             <div class="stat-title">↓ 下行速率</div>
-            <div class="stat-value" style="color: #10b981; font-size: 22px;" id="liveDownSpeed">0 B/s</div>
+            <div class="stat-value" style="color: var(--chart-secondary); font-size: 22px;" id="liveDownSpeed">0 B/s</div>
             <div class="stat-sub" style="color: var(--text-muted);">实时下载</div>
           </div>
         </div>
@@ -516,14 +559,14 @@
 
         <div class="region-filters" id="regionFilter">
           <span style="color: var(--text-muted); font-size: 12px; margin-top: 4px;">过滤:</span>
-          <button class="region-btn active" data-region="all" onclick="filterByRegion('all')">All</button>
-          <button class="region-btn" data-region="jp" onclick="filterByRegion('jp')">🇯🇵 JP</button>
-          <button class="region-btn" data-region="kr" onclick="filterByRegion('kr')">🇰🇷 KR</button>
-          <button class="region-btn" data-region="us" onclick="filterByRegion('us')">🇺🇸 US</button>
-          <button class="region-btn" data-region="hk" onclick="filterByRegion('hk')">🇭🇰 HK</button>
-          <button class="region-btn" data-region="tw" onclick="filterByRegion('tw')">🇹🇼 TW</button>
-          <button class="region-btn" data-region="sg" onclick="filterByRegion('sg')">🇸🇬 SG</button>
-          <button class="region-btn" data-region="other" onclick="filterByRegion('other')">Other</button>
+          <button type="button" class="region-btn active" data-region="all" onclick="filterByRegion('all')">全部</button>
+          <button type="button" class="region-btn" data-region="jp" onclick="filterByRegion('jp')">JP</button>
+          <button type="button" class="region-btn" data-region="kr" onclick="filterByRegion('kr')">KR</button>
+          <button type="button" class="region-btn" data-region="us" onclick="filterByRegion('us')">US</button>
+          <button type="button" class="region-btn" data-region="hk" onclick="filterByRegion('hk')">HK</button>
+          <button type="button" class="region-btn" data-region="tw" onclick="filterByRegion('tw')">TW</button>
+          <button type="button" class="region-btn" data-region="sg" onclick="filterByRegion('sg')">SG</button>
+          <button type="button" class="region-btn" data-region="other" onclick="filterByRegion('other')">其他</button>
         </div>
 
         <div class="panel">
@@ -561,13 +604,13 @@
             <p style="color: var(--text-muted); font-size: 12px;">修改配置后点击上方重载按钮生效</p>
           </div>
           <div style="display:flex; gap: 10px;">
-            <button class="btn btn-primary" onclick="showAddNodeModal()">➕ 添加节点</button>
-            <button class="btn btn-warning" onclick="triggerReload()" id="reloadBtn" style="color:#000;">⚡ 重载核心</button>
+            <button type="button" class="btn btn-primary" onclick="showAddNodeModal()"><svg class="icon"><use href="#i-plus"></use></svg><span>添加节点</span></button>
+            <button type="button" class="btn btn-warning" onclick="triggerReload()" id="reloadBtn"><svg class="icon"><use href="#i-refresh"></use></svg><span>重载核心</span></button>
           </div>
         </div>
         
-        <div id="subscriptionWarning" style="display:none; background: rgba(245, 158, 11, 0.1); border: 1px solid var(--warning); padding: 12px; border-radius: 6px; color: var(--warning); margin-bottom: 16px; font-size: 12px;">
-          ⚠️ 警告：当前使用订阅模式。手动修改配置将在下次订阅刷新时被覆盖。
+        <div id="subscriptionWarning" style="display:none; background: var(--warning-bg); border: 1px solid var(--warning); padding: 12px; border-radius: 6px; color: var(--warning); margin-bottom: 16px; font-size: 12px;">
+          <svg class="icon" style="vertical-align:middle; margin-right:6px;"><use href="#i-alert"></use></svg><span>警告：当前使用订阅模式。手动修改配置将在下次订阅刷新时被覆盖。</span>
         </div>
 
         <div class="panel">
@@ -634,7 +677,7 @@
             <div class="panel-title">控制台日志 (Console Logs)</div>
             <div style="display:flex; align-items:center; gap:12px;">
               <label style="font-size:13px; color:var(--text-muted); display:flex; align-items:center; gap:6px;"><input type="checkbox" id="autoScrollLogs" checked> 自动滚动</label>
-              <button class="btn btn-sm" onclick="pollLogs()">↺ 刷新</button>
+              <button type="button" class="btn btn-sm" onclick="pollLogs()"><svg class="icon"><use href="#i-refresh"></use></svg><span>刷新</span></button>
             </div>
           </div>
           <div style="padding: 0;">
@@ -648,6 +691,22 @@
         <div style="max-width: 800px; margin: 0 auto;">
           <div style="font-size: 20px; font-weight: 700; margin-bottom: 24px; color: var(--text-main);">系统设置</div>
           <form onsubmit="handleSettingsSave(event)">
+
+            <div class="panel" style="margin-bottom: 16px;">
+              <div class="panel-header"><div class="panel-title">界面偏好</div></div>
+              <div style="padding: 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+                <div class="form-group">
+                  <label for="settingLanguage">界面语言</label>
+                  <select id="settingLanguage" class="setting-input" onchange="setLanguage(this.value)">
+                    <option value="zh-CN">简体中文</option>
+                    <option value="en">English</option>
+                  </select>
+                </div>
+                <div class="form-group" style="justify-content:flex-end;">
+                  <div style="font-size: 11px; color: var(--text-muted);">语言设置保存在当前浏览器并立即生效</div>
+                </div>
+              </div>
+            </div>
 
             <div class="panel" style="margin-bottom: 16px;">
               <div class="panel-header"><div class="panel-title">基础配置</div></div>
@@ -787,7 +846,7 @@
             </div>
 
             <div style="display: flex; justify-content: flex-end; gap: 12px; padding: 8px 0 24px;">
-              <button type="submit" class="btn btn-primary" style="padding: 10px 32px; font-size: 14px;">保存配置</button>
+              <button type="submit" class="btn btn-primary" style="padding: 10px 32px; font-size: 14px;"><svg class="icon"><use href="#i-save"></use></svg><span id="settingsSaveLabel">保存配置</span></button>
             </div>
           </form>
         </div>
@@ -805,7 +864,7 @@
         <div class="modal-body">
           <div class="form-group">
             <label>系统密码</label>
-            <input type="password" id="password" required placeholder="Enter password..." />
+            <input type="password" id="password" required placeholder="请输入密码..." />
           </div>
           <div id="loginError" style="color: var(--error); font-size: 12px; display: none;"></div>
         </div>
@@ -851,7 +910,7 @@
 
   <!-- Full-screen Loading Overlay -->
   <div id="fullscreenLoading" style="display:none; position:fixed; inset:0; z-index:9999; background:rgba(0,0,0,0.5); backdrop-filter:blur(4px); display:none; align-items:center; justify-content:center;">
-    <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:12px; padding:32px 48px; text-align:center; box-shadow:0 8px 32px rgba(0,0,0,0.3);">
+    <div style="background:var(--bg-panel); border:1px solid var(--border); border-radius:12px; padding:32px 48px; text-align:center; box-shadow:0 8px 32px rgba(0,0,0,0.3);">
       <div style="margin-bottom:16px;">
         <svg width="40" height="40" viewBox="0 0 40 40" style="animation:spin 1s linear infinite;">
           <circle cx="20" cy="20" r="16" fill="none" stroke="var(--border)" stroke-width="3"/>
@@ -875,8 +934,248 @@
     let _savedSubSnapshot = '';
     let _savedCoreSnapshot = '';
 
+    const TRANSLATIONS = {
+      '监控看板': 'Dashboard',
+      '节点配置': 'Nodes',
+      '诊断分析': 'Diagnostics',
+      '控制台日志': 'Console logs',
+      '系统设置': 'System settings',
+      '探测中:': 'Probing:',
+      '成功:': 'Succeeded:',
+      '失败:': 'Failed:',
+      '切换主题': 'Change theme',
+      '跟随系统': 'System theme',
+      '深色模式': 'Dark theme',
+      '浅色模式': 'Light theme',
+      '批量探测': 'Probe all',
+      '刷新订阅': 'Refresh subscription',
+      '导出配置': 'Export configuration',
+      '关闭自动刷新': 'Disable auto refresh',
+      '开启自动刷新': 'Enable auto refresh',
+      '刷新': 'Refresh',
+      '系统在线': 'System online',
+      '总节点数': 'Total nodes',
+      '健康在线': 'Healthy',
+      '活跃且就绪': 'Active and ready',
+      '活跃连接数': 'Active connections',
+      '当前建立会话': 'Current sessions',
+      '异常/拉黑': 'Unavailable / blocked',
+      '不可用节点': 'Unavailable nodes',
+      '↑ 上行速率': 'Upload rate',
+      '↓ 下行速率': 'Download rate',
+      '实时上传': 'Live upload',
+      '实时下载': 'Live download',
+      '地域连通率 (Region Availability)': 'Region availability',
+      '最优节点延迟 (Top Fastest Nodes)': 'Fastest nodes',
+      '实时流量带宽 (Real-time Traffic)': 'Real-time traffic',
+      '过滤:': 'Filter:',
+      '全部': 'All',
+      '其他': 'Other',
+      '节点监控列表': 'Node monitor',
+      '状态': 'Status',
+      '地域': 'Region',
+      '延迟': 'Latency',
+      '上行': 'Upload',
+      '下行': 'Download',
+      '区域总数': 'Total nodes',
+      '区域可用': 'Available',
+      '调用失败': 'Failures',
+      '名称 (Name/Tag)': 'Name / tag',
+      '端口': 'Port',
+      '延迟 / 质量': 'Latency / quality',
+      '连接': 'Connections',
+      '失败': 'Failures',
+      '操作': 'Actions',
+      '暂无数据': 'No data available',
+      '配置管理': 'Configuration management',
+      '修改配置后点击上方重载按钮生效': 'Reload the core after changing node configuration.',
+      '添加节点': 'Add node',
+      '重载核心': 'Reload core',
+      '警告：当前使用订阅模式。手动修改配置将在下次订阅刷新时被覆盖。': 'Subscription mode is active. Manual node changes will be overwritten by the next subscription refresh.',
+      '名称': 'Name',
+      '来源': 'Source',
+      '总调用次数': 'Total calls',
+      '总成功次数': 'Successful calls',
+      '全局成功率': 'Overall success rate',
+      '全局质量分数 (Overall Health Score)': 'Overall health score',
+      '稳定性掉线排行 (Top Unstable Nodes)': 'Most unstable nodes',
+      '节点质量分析': 'Node quality analysis',
+      '节点': 'Node',
+      '成功率': 'Success rate',
+      '成功 / 失败': 'Success / failure',
+      '最近调用时间线': 'Recent call timeline',
+      '控制台日志 (Console Logs)': 'Console logs',
+      '自动滚动': 'Auto scroll',
+      '界面偏好': 'Interface preferences',
+      '界面语言': 'Interface language',
+      '语言设置保存在当前浏览器并立即生效': 'The language preference is stored in this browser and applied immediately.',
+      '基础配置': 'General',
+      '运行模式 (Mode)': 'Runtime mode',
+      'pool - 单端口负载池': 'pool - single-port load balancing',
+      'multi-port - 多端口模式': 'multi-port - one port per node',
+      'hybrid - 混合模式': 'hybrid - pool and per-node ports',
+      '外部 IP (External IP)': 'External IP',
+      '探测目标 (Probe Target)': 'Probe target',
+      '跳过 SSL 证书验证': 'Skip SSL certificate verification',
+      '监听配置 (Listener)': 'Pool listener',
+      '监听地址': 'Listen address',
+      '监听端口': 'Listen port',
+      '用户名 (可选)': 'Username (optional)',
+      '密码 (可选)': 'Password (optional)',
+      '多端口配置 (Multi-Port)': 'Per-node listeners',
+      '起始端口': 'Base port',
+      '节点池配置 (Pool)': 'Proxy pool',
+      '调度模式': 'Scheduling mode',
+      'random - 随机': 'random',
+      'round-robin - 轮询': 'round-robin',
+      'balance - 均衡': 'balance',
+      '故障阈值': 'Failure threshold',
+      '黑名单时长': 'Blacklist duration',
+      '管理面板 (Management)': 'Management UI',
+      '访问密码': 'Access password',
+      'GeoIP 地域路由': 'GeoIP region routing',
+      '启用 GeoIP 地域路由': 'Enable GeoIP region routing',
+      '自动更新数据库': 'Automatically update database',
+      '数据库路径': 'Database path',
+      '路由监听地址': 'Router listen address',
+      '路由端口': 'Router port',
+      '更新间隔': 'Update interval',
+      '首次启用会自动下载 GeoIP 数据库（约 9MB），需重载核心生效': 'The GeoIP database is downloaded on first use (about 9 MB). Reload the core to apply this setting.',
+      '日志配置': 'Logging',
+      '日志输出': 'Log output',
+      '仅控制台 (stdout)': 'Console only (stdout)',
+      '控制台 + 文件 (stdout + file)': 'Console and file',
+      '单文件最大 MB': 'Maximum file size (MB)',
+      '保留旧日志个数': 'Log backups',
+      '保留天数': 'Retention days',
+      '压缩旧日志': 'Compress old logs',
+      '日志设置需重启服务生效': 'Restart the service to apply logging changes.',
+      '订阅配置': 'Subscriptions',
+      '启用订阅自动刷新': 'Enable automatic subscription refresh',
+      '刷新间隔': 'Refresh interval',
+      '10 分钟': '10 minutes',
+      '30 分钟': '30 minutes',
+      '1 小时': '1 hour',
+      '3 小时': '3 hours',
+      '6 小时': '6 hours',
+      '12 小时': '12 hours',
+      '24 小时': '24 hours',
+      '订阅链接 (每行一个 URL)': 'Subscription URLs (one per line)',
+      '订阅配置变更保存后立即生效': 'Subscription changes take effect immediately after saving.',
+      '保存配置': 'Save configuration',
+      '身份验证': 'Authentication',
+      '身份验证失败': 'Authentication failed',
+      '系统密码': 'System password',
+      '请输入密码...': 'Enter password...',
+      '验证授权': 'Sign in',
+      '节点名称 Name': 'Node name',
+      '节点 URI': 'Node URI',
+      'vless://... 或 anytls://...': 'vless://... or anytls://...',
+      '映射端口 (可选)': 'Mapped port (optional)',
+      '取消': 'Cancel',
+      '保存': 'Save',
+      '处理中...': 'Processing...',
+      '编辑节点': 'Edit node',
+      '编辑': 'Edit',
+      '删除': 'Delete',
+      '探测': 'Probe',
+      '解封': 'Release',
+      '拉黑': 'Block',
+      '拉黑 Blocked': 'Blocked',
+      '未测试 Unknown': 'Not tested',
+      '异常 Error': 'Error',
+      '在线 Healthy': 'Healthy',
+      '探测中...': 'Probing...',
+      '已解封': 'Node released',
+      '拉黑失败': 'Failed to block node',
+      '确定拉黑该节点 24 小时？': 'Block this node for 24 hours?',
+      '探测完成：成功 {success}，失败 {failed}': 'Probe complete: {success} succeeded, {failed} failed',
+      '导出失败': 'Export failed',
+      '开始刷新订阅...': 'Refreshing subscription...',
+      '本地节点已修改，刷新将覆盖，继续？': 'Local nodes have changed. Refreshing the subscription will overwrite them. Continue?',
+      '成功获取 {count} 个节点': 'Loaded {count} nodes',
+      '刷新失败：{error}': 'Refresh failed: {error}',
+      '成功': 'Success',
+      '确定删除节点 {name}？': 'Delete node {name}?',
+      '删除成功': 'Node deleted',
+      '立即重载核心？': 'Reload the core now?',
+      '重载成功': 'Core reloaded',
+      '配置未变更': 'No configuration changes',
+      '保存中...': 'Saving...',
+      '保存失败': 'Save failed',
+      '更新订阅中...': 'Updating subscription...',
+      '正在拉取订阅并重载节点，请稍候': 'Fetching subscriptions and reloading nodes.',
+      '订阅配置保存失败': 'Failed to save subscription settings',
+      '订阅已保存，但刷新失败：{error}': 'Subscription saved, but refresh failed: {error}',
+      '已保存，获取 {count} 个节点': 'Saved and loaded {count} nodes',
+      '设置已保存': 'Settings saved',
+      '重载核心中...': 'Reloading core...',
+      '正在应用新配置': 'Applying the new configuration.',
+      '已保存并重载成功': 'Saved and reloaded successfully',
+      '已保存，重载失败': 'Saved, but reload failed'
+    };
+
+    let currentLanguage = localStorage.getItem('uiLanguage') || (navigator.language && navigator.language.toLowerCase().startsWith('zh') ? 'zh-CN' : 'en');
+
+    function tr(source, values) {
+      let result = currentLanguage === 'en' ? (TRANSLATIONS[source] || source) : source;
+      if (values) {
+        Object.keys(values).forEach(key => { result = result.replace(`{${key}}`, values[key]); });
+      }
+      return result;
+    }
+
+    function translateTree(root) {
+      if (!root) return;
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      let node;
+      while ((node = walker.nextNode())) {
+        const parent = node.parentElement;
+        if (!parent || parent.closest('script, style, svg')) continue;
+        const trimmed = node.nodeValue.trim();
+        if (!trimmed) continue;
+        if (!node.__i18nSource) node.__i18nSource = trimmed;
+        const translated = currentLanguage === 'en' ? (TRANSLATIONS[node.__i18nSource] || node.__i18nSource) : node.__i18nSource;
+        node.nodeValue = node.nodeValue.replace(trimmed, translated);
+      }
+      root.querySelectorAll('[placeholder], [title]').forEach(element => {
+        ['placeholder', 'title'].forEach(attribute => {
+          if (!element.hasAttribute(attribute)) return;
+          const dataKey = `i18n${attribute[0].toUpperCase()}${attribute.slice(1)}`;
+          if (!element.dataset[dataKey]) element.dataset[dataKey] = element.getAttribute(attribute);
+          const source = element.dataset[dataKey];
+          element.setAttribute(attribute, currentLanguage === 'en' ? (TRANSLATIONS[source] || source) : source);
+        });
+      });
+    }
+
+    function iconMarkup(name) {
+      return `<svg class="icon" aria-hidden="true"><use href="#i-${name}"></use></svg>`;
+    }
+
+    function syncAutoRefreshButton() {
+      document.getElementById('autoRefreshIcon').setAttribute('href', isAutoRefresh ? '#i-pause' : '#i-play');
+      document.getElementById('autoRefreshLabel').textContent = tr(isAutoRefresh ? '关闭自动刷新' : '开启自动刷新');
+    }
+
+    function setLanguage(language) {
+      currentLanguage = language === 'en' ? 'en' : 'zh-CN';
+      localStorage.setItem('uiLanguage', currentLanguage);
+      document.documentElement.lang = currentLanguage;
+      document.title = currentLanguage === 'en' ? 'Easy Proxies - Control Center' : 'Easy Proxies - 监控中心';
+      translateTree(document.body);
+      const selector = document.getElementById('settingLanguage');
+      if (selector) selector.value = currentLanguage;
+      syncAutoRefreshButton();
+      syncToggleButton(localStorage.getItem('themeMode') || 'auto');
+      if (document.getElementById('dashboardTab').classList.contains('active')) filterByRegion(currentRegionFilter);
+      if (document.getElementById('manageTab').classList.contains('active')) loadConfigNodes();
+      if (document.getElementById('debugTab').classList.contains('active')) loadDebugData();
+      reRenderCharts();
+    }
+
     function showFullscreenLoading(text, subtext) {
-      document.getElementById('fullscreenLoadingText').textContent = text || '处理中...';
+      document.getElementById('fullscreenLoadingText').textContent = text || tr('处理中...');
       document.getElementById('fullscreenLoadingSubtext').textContent = subtext || '';
       const el = document.getElementById('fullscreenLoading');
       el.style.display = 'flex';
@@ -905,8 +1204,6 @@
       trafficChartInst && trafficChartInst.resize();
     });
 
-    const EMOJIS = { jp: '🇯🇵', kr: '🇰🇷', us: '🇺🇸', hk: '🇭🇰', tw: '🇹🇼', sg: '🇸🇬', other: '🌍' };
-
     function showToast(msg, type='success') {
       const c = document.getElementById('toastContainer');
       const t = document.createElement('div');
@@ -930,15 +1227,17 @@
       try {
         const res = await fetch('/api/auth', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({password:pwd})});
         if (res.ok) { document.getElementById('loginOverlay').classList.remove('show'); refresh(); }
-        else { err.textContent = 'Auth Failed'; err.style.display = 'block'; }
+        else { err.textContent = tr('身份验证失败'); err.style.display = 'block'; }
       } catch (ex) { err.textContent = ex.message; err.style.display = 'block'; }
     }
 
     function switchTab(name) {
       document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
-      document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.nav-item').forEach(el => { el.classList.remove('active'); el.removeAttribute('aria-current'); });
       document.getElementById(`${name}Tab`).classList.add('active');
-      document.querySelector(`.nav-item[onclick="switchTab('${name}')"]`).classList.add('active');
+      const activeNav = document.querySelector(`.nav-item[data-tab="${name}"]`);
+      activeNav.classList.add('active');
+      activeNav.setAttribute('aria-current', 'page');
       if (name === 'dashboard') {
         setTimeout(updateDashboardCharts, 100);
       }
@@ -957,7 +1256,7 @@
 
     function toggleAutoRefresh() {
       isAutoRefresh = !isAutoRefresh;
-      document.getElementById('autoRefreshBtn').textContent = isAutoRefresh ? '⏹ 关闭自动刷新' : '▶ 开启自动刷新';
+      syncAutoRefreshButton();
       if(isAutoRefresh) startAutoRefresh(); else stopAutoRefresh();
     }
     function startAutoRefresh() { if(!autoRefreshInterval) autoRefreshInterval = setInterval(()=> { if(!document.hidden && document.getElementById('dashboardTab').classList.contains('active')) refresh(); }, 10000); }
@@ -975,7 +1274,7 @@
       return 'var(--error)';
     }
     function formatTime(ts) {
-      if(tsc || ts==='0001-01-01T00:00:00Z') return '-';
+      if(!ts || ts==='0001-01-01T00:00:00Z') return '-';
       return new Date(ts).toLocaleTimeString();
     }
 
@@ -1038,7 +1337,7 @@
       const regionData = Object.keys(regionStats).map(k => ({
         name: k,
         value: regionStats[k].total,
-        itemStyle: { color: regionStats[k].healthy === 0 ? '#ef4444' : (regionStats[k].healthy < regionStats[k].total ? '#f59e0b' : '#3b82f6') }
+        itemStyle: { color: regionStats[k].healthy === 0 ? getCssVar('--error') : (regionStats[k].healthy < regionStats[k].total ? getCssVar('--chart-secondary') : getCssVar('--chart-primary')) }
       }));
 
       regionChartInst && regionChartInst.setOption({
@@ -1047,12 +1346,12 @@
           backgroundColor: getCssVar('--bg-panel'), borderColor: getCssVar('--border'), textStyle: { color: getCssVar('--text-main') },
           formatter: (params) => {
              const stat = regionStats[params.name];
-             return `${params.name} Region<br/>Total Node: ${stat.total}<br/>Available: ${stat.healthy}`;
+             return `${params.name}<br/>${tr('区域总数')}: ${stat.total}<br/>${tr('区域可用')}: ${stat.healthy}`;
           }
         },
         legend: { top: 'bottom', textStyle: { color: getCssVar('--text-muted') } },
         series: [{
-          name: 'Regions', type: 'pie', radius: ['40%', '70%'], center: ['50%', '55%'],
+          name: tr('地域'), type: 'pie', radius: ['40%', '70%'], center: ['50%', '55%'],
           itemStyle: { borderRadius: 10, borderColor: getCssVar('--bg-panel'), borderWidth: 2 },
           label: { show: false, position: 'center' },
           emphasis: { label: { show: true, fontSize: '20', fontWeight: 'bold', color: getCssVar('--text-main') } },
@@ -1072,11 +1371,11 @@
         xAxis: { type: 'value', splitLine: { lineStyle: { color: getCssVar('--border'), type: 'dashed' } }, axisLabel: { color: getCssVar('--text-muted'), formatter: '{value} ms' } },
         yAxis: { type: 'category', data: latencyX.reverse(), axisLabel: { color: getCssVar('--text-muted'), width: 90, overflow: 'truncate' } },
         series: [{
-          name: 'Latency', type: 'bar', data: latencyY.reverse(),
+          name: tr('延迟'), type: 'bar', data: latencyY.reverse(),
           itemStyle: {
             color: new echarts.graphic.LinearGradient(1, 0, 0, 0, [
-              { offset: 0, color: '#10b981' },
-              { offset: 1, color: '#3b82f6' }
+              { offset: 0, color: getCssVar('--chart-secondary') },
+              { offset: 1, color: getCssVar('--chart-primary') }
             ]),
             borderRadius: [0, 4, 4, 0]
           }
@@ -1098,8 +1397,8 @@
           xAxis: { type: 'category', boundaryGap: false, data: trafficTime, axisLine: { lineStyle: { color: getCssVar('--border') } }, axisLabel: { color: getCssVar('--text-muted') } },
           yAxis: { type: 'value', splitLine: { lineStyle: { color: getCssVar('--border'), type: 'dashed' } }, axisLabel: { color: getCssVar('--text-muted'), formatter: (v) => formatBytes(v) + '/s' } },
           series: [
-            { name: 'Up', type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 2, color: '#3b82f6' }, areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{offset: 0, color: 'rgba(59,130,246,0.5)'}, {offset: 1, color: 'rgba(59,130,246,0)'}]) }, data: trafficDataUp },
-            { name: 'Down', type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 2, color: '#10b981' }, areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{offset: 0, color: 'rgba(16,185,129,0.5)'}, {offset: 1, color: 'rgba(16,185,129,0)'}]) }, data: trafficDataDown }
+            { name: tr('上行'), type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 2, color: getCssVar('--chart-primary') }, areaStyle: { color: getCssVar('--chart-primary'), opacity: 0.12 }, data: trafficDataUp },
+            { name: tr('下行'), type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 2, type: 'dashed', color: getCssVar('--chart-secondary') }, areaStyle: { color: getCssVar('--chart-secondary'), opacity: 0.08 }, data: trafficDataDown }
           ]
         });
         connectTrafficSSE(); // connect SSE on init
@@ -1163,14 +1462,14 @@
       tbody.innerHTML = nodes.map(n => {
         const ms = n.last_latency_ms || -1;
         let badge = '', statusText = '';
-        if (n.blacklisted) { badge = 'badge-error'; statusText = '拉黑 Blocked'; }
-        else if (ms < 0) { badge = 'badge-offline'; statusText = '未测试 Unknown'; }
-        else if (n.failure_count >= 1) { badge = 'badge-error'; statusText = '异常 Error'; }
-        else { badge = 'badge-healthy'; statusText = '在线 Healthy'; }
+        if (n.blacklisted) { badge = 'badge-error'; statusText = tr('拉黑 Blocked'); }
+        else if (ms < 0) { badge = 'badge-offline'; statusText = tr('未测试 Unknown'); }
+        else if (n.failure_count >= 1) { badge = 'badge-error'; statusText = tr('异常 Error'); }
+        else { badge = 'badge-healthy'; statusText = tr('在线 Healthy'); }
 
         return `<tr>
           <td><span class="badge ${badge}">${statusText}</span></td>
-          <td>${EMOJIS[n.region||'other']} ${(n.region||'other').toUpperCase()}</td>
+          <td><span style="display:inline-flex;align-items:center;gap:6px">${iconMarkup('map')} ${(n.region||'other').toUpperCase()}</span></td>
           <td>
             <div style="font-weight: 500">${escapeHtml(n.name || n.tag)}</div>
             <div style="font-size: 11px; color: var(--text-muted)">${escapeHtml(n.tag)}</div>
@@ -1185,15 +1484,15 @@
           <td class="tt-mono">${n.active_connections||0}</td>
           <td class="tt-mono" style="color: ${n.failure_count>0 ? 'var(--error)' : 'inherit'}">${n.failure_count||0}</td>
           <td>
-            <button class="btn btn-sm" onclick="probeNode('${escapeHtml(n.tag)}')">探测</button>
-            ${n.blacklisted ? `<button class="btn btn-sm btn-primary" onclick="releaseNode('${escapeHtml(n.tag)}')">解封</button>` : `<button class="btn btn-sm btn-danger" onclick="blacklistNode('${escapeHtml(n.tag)}')">拉黑</button>`}
+            <button type="button" class="btn btn-sm" onclick="probeNode('${escapeHtml(n.tag)}')">${iconMarkup('search')}<span>${tr('探测')}</span></button>
+            ${n.blacklisted ? `<button type="button" class="btn btn-sm btn-primary" onclick="releaseNode('${escapeHtml(n.tag)}')">${iconMarkup('unlock')}<span>${tr('解封')}</span></button>` : `<button type="button" class="btn btn-sm btn-danger" onclick="blacklistNode('${escapeHtml(n.tag)}')">${iconMarkup('ban')}<span>${tr('拉黑')}</span></button>`}
           </td>
         </tr>`;
       }).join('');
     }
 
     async function probeNode(tag) {
-      showToast('探测中...');
+      showToast(tr('探测中...'));
       try {
         const r = await fetch('/api/nodes/'+encodeURIComponent(tag)+'/probe', {method:'POST'});
         const d = await r.json();
@@ -1204,17 +1503,17 @@
     async function releaseNode(tag) {
       try {
         const r = await fetch('/api/nodes/'+encodeURIComponent(tag)+'/release', {method:'POST'});
-        showToast('已解封'); refresh();
+        showToast(tr('已解封')); refresh();
       } catch(e) { }
     }
 
     async function blacklistNode(tag) {
-      if(!confirm('确定拉黑该节点 24 小时？')) return;
+      if(!confirm(tr('确定拉黑该节点 24 小时？'))) return;
       try {
         const r = await fetch('/api/nodes/'+encodeURIComponent(tag)+'/blacklist', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({duration:'24h'})});
         const d = await r.json();
         if(d.error) showToast(d.error, 'error'); else { showToast(d.message); refresh(); }
-      } catch(e) { showToast('拉黑失败', 'error'); }
+      } catch(e) { showToast(tr('拉黑失败'), 'error'); }
     }
 
     // Probe All
@@ -1248,7 +1547,7 @@
                    document.getElementById('probeSuccess').textContent = suc;
                    document.getElementById('probeFail').textContent = fail;
                  } else if (d.type === 'complete') {
-                   showToast(`探测完成: 成功${d.success}, 失败${d.failed}`);
+                   showToast(tr('探测完成：成功 {success}，失败 {failed}', {success: d.success, failed: d.failed}));
                  }
                } catch(e){}
             }
@@ -1269,7 +1568,7 @@
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a'); a.href = url; a.download = 'nodes.txt';
         document.body.appendChild(a); a.click(); document.body.removeChild(a); window.URL.revokeObjectURL(url);
-      } catch(e) { showToast('导出失败', 'error');}
+      } catch(e) { showToast(tr('导出失败'), 'error');}
     }
 
     // Subscriptions
@@ -1289,12 +1588,12 @@
     async function refreshSubscription() {
       try {
         const s = await fetch('/api/subscription/status').then(r=>r.json());
-        if(s.nodes_modified && !confirm('本地节点已修改，刷新将覆盖，继续？')) return;
-        showToast('开始刷新订阅...');
+        if(s.nodes_modified && !confirm(tr('本地节点已修改，刷新将覆盖，继续？'))) return;
+        showToast(tr('开始刷新订阅...'));
         const r = await fetch('/api/subscription/refresh', {method:'POST'});
         const res = await r.json();
-        if(res.error) showToast(res.error, 'error'); else { showToast(`成功获取 ${res.node_count} 节点`); refresh(); }
-      } catch(e) { showToast('失败'+e, 'error'); }
+        if(res.error) showToast(res.error, 'error'); else { showToast(tr('成功获取 {count} 个节点', {count: res.node_count})); refresh(); }
+      } catch(e) { showToast(tr('刷新失败：{error}', {error: e}), 'error'); }
     }
 
     // Manage Nodes
@@ -1311,8 +1610,8 @@
             <td class="tt-mono">${n.port || '-'}</td>
             <td><span class="badge ${n.source==='subscription'?'badge-warning':'badge-healthy'}">${n.source||'manual'}</span></td>
             <td>
-              <button class="btn btn-sm" onclick="showEditNodeModal('${escapeHtml(n.name)}')">编辑</button>
-              <button class="btn btn-sm btn-danger" onclick="deleteNode('${escapeHtml(n.name)}')">删除</button>
+              <button type="button" class="btn btn-sm" onclick="showEditNodeModal('${escapeHtml(n.name)}')">${iconMarkup('edit')}<span>${tr('编辑')}</span></button>
+              <button type="button" class="btn btn-sm btn-danger" onclick="deleteNode('${escapeHtml(n.name)}')">${iconMarkup('trash')}<span>${tr('删除')}</span></button>
             </td>
           </tr>
         `).join('');
@@ -1320,10 +1619,10 @@
       } catch(e){}
     }
 
-    function showAddNodeModal() { isEditMode=false; document.getElementById('nodeModalTitle').textContent='添加节点'; document.getElementById('nodeName').value=''; document.getElementById('nodeUri').value=''; document.getElementById('nodePort').value=''; document.getElementById('nodeModalOverlay').classList.add('show');}
+    function showAddNodeModal() { isEditMode=false; document.getElementById('nodeModalTitle').textContent=tr('添加节点'); document.getElementById('nodeName').value=''; document.getElementById('nodeUri').value=''; document.getElementById('nodePort').value=''; document.getElementById('nodeModalOverlay').classList.add('show');}
     function showEditNodeModal(name) { 
       const n = configNodes.find(x=>x.name===name); if(!n) return;
-      isEditMode=true; document.getElementById('nodeModalTitle').textContent='编辑节点';
+      isEditMode=true; document.getElementById('nodeModalTitle').textContent=tr('编辑节点');
       document.getElementById('nodeName').value=n.name; document.getElementById('nodeUri').value=n.uri; document.getElementById('nodePort').value=n.port||''; document.getElementById('nodeEditName').value=n.name;
       document.getElementById('nodeModalOverlay').classList.add('show');
     }
@@ -1335,19 +1634,19 @@
         const url = isEditMode ? '/api/nodes/config/'+encodeURIComponent(editName) : '/api/nodes/config';
         const method = isEditMode ? 'PUT' : 'POST';
         const r = await fetch(url, {method, headers:{'Content-Type':'application/json'}, body:JSON.stringify(p)});
-        if(r.ok) { document.getElementById('nodeModalOverlay').classList.remove('show'); showToast('成功'); loadConfigNodes(); } else { const d = await r.json(); showToast(d.error, 'error'); }
+        if(r.ok) { document.getElementById('nodeModalOverlay').classList.remove('show'); showToast(tr('成功')); loadConfigNodes(); } else { const d = await r.json(); showToast(d.error, 'error'); }
       } catch(e){}
     }
     async function deleteNode(name) {
-      if(!confirm('Delete '+name+'?')) return;
+      if(!confirm(tr('确定删除节点 {name}？', {name}))) return;
       try {
         const r = await fetch('/api/nodes/config/'+encodeURIComponent(name), {method:'DELETE'});
-        if(r.ok) { showToast('删除成功'); loadConfigNodes(); }
+        if(r.ok) { showToast(tr('删除成功')); loadConfigNodes(); }
       } catch(e){}
     }
     async function triggerReload() {
-      if(!confirm('重载核心将中断连接，确认？')) return;
-      try { const r = await fetch('/api/reload', {method:'POST'}); if(r.ok) {showToast('重载成功'); refresh();} } catch(e){}
+      if(!confirm(tr('立即重载核心？'))) return;
+      try { const r = await fetch('/api/reload', {method:'POST'}); if(r.ok) {showToast(tr('重载成功')); refresh();} } catch(e){}
     }
 
     // Debug
@@ -1401,14 +1700,14 @@
           startAngle: 180, endAngle: 0,
           center: ['50%', '75%'], radius: '90%',
           min: 0, max: 100, splitNumber: 10,
-          axisLine: { lineStyle: { width: 12, color: [ [0.7, '#ef4444'], [0.9, '#f59e0b'], [1, '#10b981'] ] } },
+          axisLine: { lineStyle: { width: 12, color: [ [0.7, getCssVar('--error')], [0.9, getCssVar('--chart-secondary')], [1, getCssVar('--chart-primary')] ] } },
           pointer: { icon: 'path://M12.8,0.7l12,40.1H0.7L12.8,0.7z', length: '12%', width: 10, offsetCenter: [0, '-60%'], itemStyle: { color: 'auto' } },
           axisTick: { length: 12, lineStyle: { color: 'auto', width: 2 } },
           splitLine: { length: 20, lineStyle: { color: 'auto', width: 3 } },
           axisLabel: { color: getCssVar('--text-muted'), fontSize: 10, distance: -50 },
           title: { offsetCenter: [0, '-20%'], fontSize: 14, color: getCssVar('--text-muted') },
           detail: { fontSize: 36, offsetCenter: [0, '0%'], valueAnimation: true, formatter: function (value) { return Math.round(value) + '%'; }, color: 'auto' },
-          data: [{ value: rate, name: 'Success Rate' }]
+          data: [{ value: rate, name: tr('成功率') }]
         }]
       });
 
@@ -1425,11 +1724,11 @@
         xAxis: { type: 'category', data: failX, axisLabel: { color: getCssVar('--text-muted'), width: 60, overflow: 'truncate' } },
         yAxis: { type: 'value', splitLine: { lineStyle: { color: getCssVar('--border'), type: 'dashed' } }, axisLabel: { color: getCssVar('--text-muted') } },
         series: [{
-          name: 'Failures', type: 'bar', data: failY,
+          name: tr('调用失败'), type: 'bar', data: failY,
           itemStyle: {
             color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-              { offset: 0, color: '#f43f5e' },
-              { offset: 1, color: '#9f1239' }
+              { offset: 0, color: getCssVar('--chart-primary') },
+              { offset: 1, color: getCssVar('--chart-secondary') }
             ]),
             borderRadius: [4, 4, 0, 0]
           }
@@ -1441,6 +1740,7 @@
     async function loadSettingsPage() {
       try {
         const r = await fetch('/api/settings'); const d = await r.json();
+        document.getElementById('settingLanguage').value = currentLanguage;
         // General
         document.getElementById('settingMode').value = d.mode || 'pool';
         document.getElementById('settingExternalIP').value = d.external_ip||'';
@@ -1539,7 +1839,8 @@
     async function handleSettingsSave(e) {
       e.preventDefault();
       const saveBtn = e.target.querySelector('button[type="submit"]');
-      const originalText = saveBtn.textContent;
+      const saveLabel = document.getElementById('settingsSaveLabel');
+      const originalText = saveLabel.textContent;
 
       // Build current snapshots for change detection
       const currentCoreSnapshot = _buildCoreSnapshot();
@@ -1552,12 +1853,12 @@
       const subChanged = currentSubSnapshot !== _savedSubSnapshot;
 
       if (!coreChanged && !subChanged) {
-        showToast('配置未变更'); return;
+        showToast(tr('配置未变更')); return;
       }
 
       // Save core settings if changed
       if (coreChanged) {
-        saveBtn.disabled = true; saveBtn.textContent = '保存中...'; saveBtn.style.opacity = '0.6';
+        saveBtn.disabled = true; saveLabel.textContent = tr('保存中...'); saveBtn.style.opacity = '0.6';
         const p = {
           external_ip: document.getElementById('settingExternalIP').value,
           probe_target: document.getElementById('settingProbeTarget').value,
@@ -1602,39 +1903,39 @@
         };
         try {
           const r = await fetch('/api/settings', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(p)});
-          if(!r.ok) { showToast('保存失败', 'error'); saveBtn.disabled = false; saveBtn.textContent = originalText; saveBtn.style.opacity = '1'; return; }
-        } catch(e){ showToast('保存失败', 'error'); saveBtn.disabled = false; saveBtn.textContent = originalText; saveBtn.style.opacity = '1'; return; }
+          if(!r.ok) { showToast(tr('保存失败'), 'error'); saveBtn.disabled = false; saveLabel.textContent = originalText; saveBtn.style.opacity = '1'; return; }
+        } catch(e){ showToast(tr('保存失败'), 'error'); saveBtn.disabled = false; saveLabel.textContent = originalText; saveBtn.style.opacity = '1'; return; }
         _savedCoreSnapshot = currentCoreSnapshot;
       }
 
       // Save subscription config if changed
       if (subChanged) {
-        showFullscreenLoading('更新订阅中...', '正在拉取订阅并重载节点，请稍候');
+        showFullscreenLoading(tr('更新订阅中...'), tr('正在拉取订阅并重载节点，请稍候'));
         const subPayload = { subscriptions: subURLs, enabled: subEnabled, interval: subInterval };
         try {
           const sr = await fetch('/api/subscription/config', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(subPayload)});
           hideFullscreenLoading();
-          if(!sr.ok) { showToast('订阅配置保存失败', 'error'); saveBtn.disabled = false; saveBtn.textContent = originalText; saveBtn.style.opacity = '1'; return; }
+          if(!sr.ok) { showToast(tr('订阅配置保存失败'), 'error'); saveBtn.disabled = false; saveLabel.textContent = originalText; saveBtn.style.opacity = '1'; return; }
           const sd = await sr.json();
           _savedSubSnapshot = currentSubSnapshot;
           if (sd.refresh_error) {
-            showToast('订阅已保存，但刷新失败: ' + sd.refresh_error, 'error');
+            showToast(tr('订阅已保存，但刷新失败：{error}', {error: sd.refresh_error}), 'error');
           } else if (sd.node_count !== undefined) {
-            showToast('已保存，获取 ' + sd.node_count + ' 个节点');
+            showToast(tr('已保存，获取 {count} 个节点', {count: sd.node_count}));
           } else {
-            showToast('设置已保存');
+            showToast(tr('设置已保存'));
           }
-        } catch(e){ hideFullscreenLoading(); showToast('订阅配置保存失败', 'error'); saveBtn.disabled = false; saveBtn.textContent = originalText; saveBtn.style.opacity = '1'; return; }
+        } catch(e){ hideFullscreenLoading(); showToast(tr('订阅配置保存失败'), 'error'); saveBtn.disabled = false; saveLabel.textContent = originalText; saveBtn.style.opacity = '1'; return; }
       } else if (coreChanged) {
         // Core changed but no sub change — trigger reload
-        showFullscreenLoading('重载核心中...', '正在应用新配置');
+        showFullscreenLoading(tr('重载核心中...'), tr('正在应用新配置'));
         try {
           const rr = await fetch('/api/reload', {method:'POST'});
           hideFullscreenLoading();
-          if (rr.ok) { showToast('已保存并重载成功'); } else { showToast('已保存，重载失败', 'error'); }
-        } catch(e) { hideFullscreenLoading(); showToast('已保存，重载失败', 'error'); }
+          if (rr.ok) { showToast(tr('已保存并重载成功')); } else { showToast(tr('已保存，重载失败'), 'error'); }
+        } catch(e) { hideFullscreenLoading(); showToast(tr('已保存，重载失败'), 'error'); }
       }
-      saveBtn.disabled = false; saveBtn.textContent = originalText; saveBtn.style.opacity = '1';
+      saveBtn.disabled = false; saveLabel.textContent = originalText; saveBtn.style.opacity = '1';
       refresh();
     }
 
@@ -1697,7 +1998,7 @@
       const btn = document.getElementById('themeToggleBtn');
       const label = document.getElementById('themeModeLabel');
       if (btn) btn.setAttribute('data-mode', mode);
-      if (label) label.textContent = THEME_LABELS[mode] || mode;
+      if (label) label.textContent = tr(THEME_LABELS[mode] || mode);
     }
 
     function toggleTheme() {
@@ -1741,13 +2042,8 @@
     })();
 
     // Init App
+    setLanguage(currentLanguage);
     checkAuth().then(ok => { if(ok) { refresh(); startAutoRefresh(); } });
-
-    // Fetch GitHub stars
-    fetch('https://api.github.com/repos/jasonwong1991/easy_proxies')
-      .then(r => r.json())
-      .then(d => { if(d.stargazers_count !== undefined) document.getElementById('githubStars').textContent = d.stargazers_count; })
-      .catch(() => {});
   </script>
 </body>
 </html>
