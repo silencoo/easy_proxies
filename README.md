@@ -284,9 +284,12 @@ subscriptions:
 subscription_refresh:
   enabled: true
   interval: 1h
+  fetch_concurrency: 16 # default 16, capped at 32
 ```
 
-Supports Base64, plain text, and Clash YAML formats. When subscriptions are configured, fetched nodes are written to `nodes_file`. Subscription changes are validated before the active sing-box instance is stopped, failed replacements roll back automatically, and dedicated node ports are restored from `port-map.yaml`. Rebinding the same listen ports still interrupts existing TCP connections briefly.
+Supports Base64, plain text, and Clash YAML formats. Subscription URLs are fetched with bounded concurrency, responses are strictly limited to 10 MB, and URL credentials/query data are redacted from errors and logs. Duplicate URLs and nodes are removed by stable identity. Runtime refreshes cache each URL independently so one failed provider can reuse only its own last known-good nodes; after a restart, `nodes_file` is the conservative aggregate fallback until every provider has refreshed successfully. Inline and WebUI-added nodes remain explicit configuration and are never overwritten by a subscription refresh.
+
+When subscriptions are configured, fetched nodes are written to `nodes_file`. Subscription changes are validated before the active sing-box instance is stopped, failed replacements roll back automatically, and dedicated node ports are restored from `port-map.yaml`. Rebinding the same listen ports still interrupts existing TCP connections briefly.
 
 ## WebUI Dashboard
 

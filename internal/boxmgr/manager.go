@@ -1232,15 +1232,9 @@ func (m *Manager) CreateNode(ctx context.Context, node config.NodeConfig) (confi
 		return config.NodeConfig{}, err
 	}
 
-	// Determine source: if subscriptions exist, new nodes go to nodes.txt (subscription source)
-	// Otherwise, if nodes_file exists, use file source; else inline
-	if len(m.cfg.Subscriptions) > 0 {
-		normalized.Source = config.NodeSourceSubscription
-	} else if m.cfg.NodesFile != "" {
-		normalized.Source = config.NodeSourceFile
-	} else {
-		normalized.Source = config.NodeSourceInline
-	}
+	// A node explicitly added through the WebUI belongs to user configuration.
+	// Persist it inline so rewriting the subscription cache cannot remove it.
+	normalized.Source = config.NodeSourceInline
 
 	m.cfg.Nodes = append(m.cfg.Nodes, normalized)
 	if err := m.cfg.Save(); err != nil {

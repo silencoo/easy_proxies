@@ -7,10 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -128,6 +126,7 @@ type SubscriptionRefreshConfig struct {
 	HealthCheckTimeout time.Duration `yaml:"health_check_timeout"` // 新节点健康检查超时
 	DrainTimeout       time.Duration `yaml:"drain_timeout"`        // 旧实例排空超时时间
 	MinAvailableNodes  int           `yaml:"min_available_nodes"`  // 最少可用节点数，低于此值不切换
+	FetchConcurrency   int           `yaml:"fetch_concurrency"`    // 订阅抓取并发数，默认 16，最大 32
 }
 
 // NodeSource indicates where a node configuration originated from.
@@ -337,6 +336,7 @@ func (c *Config) normalize() error {
 	if c.SubscriptionRefresh.MinAvailableNodes <= 0 {
 		c.SubscriptionRefresh.MinAvailableNodes = 1
 	}
+	c.SubscriptionRefresh.FetchConcurrency = NormalizeSubscriptionFetchConcurrency(c.SubscriptionRefresh.FetchConcurrency)
 
 	// Mark inline nodes with source
 	for idx := range c.Nodes {
@@ -355,30 +355,32 @@ func (c *Config) normalize() error {
 		c.Nodes = append(c.Nodes, fileNodes...)
 	}
 
-	// Load nodes from subscriptions (highest priority - writes to nodes.txt)
+	// Load nodes from subscriptions concurrently (highest priority - writes to nodes.txt).
+	// Startup cannot attribute a legacy nodes.txt entry to a specific URL, so a
+	// partial failure keeps that last known-good aggregate. Runtime refreshes use
+	// a finer per-URL cache in the subscription manager.
 	if len(c.Subscriptions) > 0 {
-		var subNodes []NodeConfig
-		subTimeout := c.SubscriptionRefresh.Timeout
-		for _, subURL := range c.Subscriptions {
-			nodes, err := loadNodesFromSubscription(subURL, subTimeout)
-			if err != nil {
-				log.Printf("⚠️ Failed to load subscription %q: %v (skipping)", subURL, err)
-				continue
-			}
-			log.Printf("✅ Loaded %d nodes from subscription", len(nodes))
-			subNodes = append(subNodes, nodes...)
+		nodesFilePath := c.NodesFile
+		if nodesFilePath == "" {
+			nodesFilePath = filepath.Join(filepath.Dir(c.filePath), "nodes.txt")
+			c.NodesFile = nodesFilePath
+		}
+		cachedNodes, cacheErr := loadNodesFromFile(nodesFilePath)
+
+		subNodes, stats := FetchSubscriptionNodes(nil, c.Subscriptions, SubscriptionFetchOptions{
+			Timeout:     c.SubscriptionRefresh.Timeout,
+			Concurrency: c.SubscriptionRefresh.FetchConcurrency,
+			Loggerf:     log.Printf,
+		})
+		if (stats.Failed > 0 || stats.Empty > 0 || len(subNodes) == 0) && cacheErr == nil && len(cachedNodes) > 0 {
+			log.Printf("⚠️ Keeping %d cached subscription nodes after an incomplete startup refresh", len(cachedNodes))
+			subNodes = cachedNodes
 		}
 		// Mark subscription nodes and write to nodes.txt
 		for idx := range subNodes {
 			subNodes[idx].Source = NodeSourceSubscription
 		}
 		if len(subNodes) > 0 {
-			// Determine nodes.txt path
-			nodesFilePath := c.NodesFile
-			if nodesFilePath == "" {
-				nodesFilePath = filepath.Join(filepath.Dir(c.filePath), "nodes.txt")
-				c.NodesFile = nodesFilePath
-			}
 			// Write subscription nodes to nodes.txt
 			if err := writeNodesToFile(nodesFilePath, subNodes); err != nil {
 				log.Printf("⚠️ Failed to write nodes to %q: %v", nodesFilePath, err)
@@ -387,14 +389,6 @@ func (c *Config) normalize() error {
 			}
 		}
 		c.Nodes = append(c.Nodes, subNodes...)
-		// Fallback: if all subscriptions failed, try loading cached nodes.txt
-		if len(subNodes) == 0 && c.NodesFile != "" {
-			cachedNodes, err := loadNodesFromFile(c.NodesFile)
-			if err == nil && len(cachedNodes) > 0 {
-				log.Printf("⚠️  All subscriptions failed, using %d cached nodes from %s", len(cachedNodes), c.NodesFile)
-				c.Nodes = append(c.Nodes, cachedNodes...)
-			}
-		}
 	}
 
 	if len(c.Nodes) == 0 {
@@ -891,6 +885,7 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	if c.SubscriptionRefresh.MinAvailableNodes <= 0 {
 		c.SubscriptionRefresh.MinAvailableNodes = 1
 	}
+	c.SubscriptionRefresh.FetchConcurrency = NormalizeSubscriptionFetchConcurrency(c.SubscriptionRefresh.FetchConcurrency)
 
 	if len(c.Nodes) == 0 {
 		return errors.New("config.nodes cannot be empty")
@@ -1029,48 +1024,6 @@ func loadNodesFromFile(path string) ([]NodeConfig, error) {
 		return nil, err
 	}
 	return parseNodesFromContent(string(data))
-}
-
-// loadNodesFromSubscription fetches and parses nodes from a subscription URL
-// Supports multiple formats: base64 encoded, plain text, clash yaml, etc.
-func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConfig, error) {
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
-	client := &http.Client{
-		Timeout: timeout,
-	}
-
-	req, err := http.NewRequest("GET", subURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-
-	// Use clash-compatible User-Agent to get Clash YAML format from subscription servers
-	// This ensures we receive structured YAML with all proxy types (AnyTLS, TUIC, etc.)
-	// instead of base64-encoded content that may only contain basic SS nodes
-	req.Header.Set("User-Agent", "clash-verge/v2.2.3")
-	req.Header.Set("Accept", "*/*")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("fetch subscription: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("subscription returned status %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-
-	content := string(body)
-
-	// Try to detect and parse different formats
-	return parseSubscriptionContent(content)
 }
 
 // parseSubscriptionContent tries to parse subscription content in various formats (optimized)

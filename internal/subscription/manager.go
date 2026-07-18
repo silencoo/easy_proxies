@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -31,6 +30,10 @@ type boxManager interface {
 	ReloadWithPortMap(newCfg *config.Config, portMap map[string]uint16) error
 }
 
+type configNodeLister interface {
+	ListConfigNodes(ctx context.Context) ([]config.NodeConfig, error)
+}
+
 // Option configures the Manager.
 type Option func(*Manager)
 
@@ -51,8 +54,13 @@ type Manager struct {
 	status        monitor.SubscriptionStatus
 	ctx           context.Context
 	cancel        context.CancelFunc
-	refreshMu     sync.Mutex // prevents concurrent refreshes
+	refreshMu     sync.Mutex // serializes refreshes with subscription config changes
+	loopOnce      sync.Once
 	manualRefresh chan struct{}
+	configChanged chan struct{}
+	requestSeq    uint64
+	waiters       map[uint64]chan error
+	sourceCache   map[string][]config.NodeConfig
 
 	// Track nodes.txt content hash to detect modifications
 	lastSubHash      string    // Hash of nodes.txt content after last subscription refresh
@@ -90,6 +98,9 @@ func New(cfg *config.Config, boxMgr boxManager, opts ...Option) *Manager {
 		ctx:           ctx,
 		cancel:        cancel,
 		manualRefresh: make(chan struct{}, 1),
+		configChanged: make(chan struct{}, 1),
+		waiters:       make(map[uint64]chan error),
+		sourceCache:   make(map[string][]config.NodeConfig),
 		httpClient:    httpClient,
 	}
 	for _, opt := range opts {
@@ -107,9 +118,8 @@ func (m *Manager) Start() {
 	enabled := m.baseCfg.SubscriptionRefresh.Enabled
 	hasSubscriptions := len(m.baseCfg.Subscriptions) > 0
 	interval := m.baseCfg.SubscriptionRefresh.Interval
-	loopCtx := m.ctx
-	manualRefresh := m.manualRefresh
 	m.mu.RUnlock()
+	m.startLoop()
 	if !enabled {
 		m.logger.Infof("subscription refresh disabled")
 		return
@@ -120,7 +130,6 @@ func (m *Manager) Start() {
 	}
 
 	m.logger.Infof("starting subscription refresh, interval: %s", interval)
-	go m.refreshLoop(loopCtx, manualRefresh, interval, enabled)
 }
 
 // Stop stops the periodic refresh.
@@ -140,58 +149,17 @@ func (m *Manager) Stop() {
 
 // UpdateConfig hot-reloads subscription URLs and refresh settings without restart.
 func (m *Manager) UpdateConfig(urls []string, enabled bool, interval time.Duration) {
-	m.mu.Lock()
-	oldCancel := m.cancel
-	m.baseCfg.Subscriptions = urls
-	m.baseCfg.SubscriptionRefresh.Enabled = enabled
-	if interval > 0 {
-		m.baseCfg.SubscriptionRefresh.Interval = interval
-	}
-	effectiveInterval := m.baseCfg.SubscriptionRefresh.Interval
-	if err := m.baseCfg.SaveSettings(); err != nil {
-		m.logger.Errorf("failed to save subscription config: %v", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	manualRefresh := make(chan struct{}, 1)
-	m.ctx = ctx
-	m.cancel = cancel
-	m.manualRefresh = manualRefresh
-	m.mu.Unlock()
-	if oldCancel != nil {
-		oldCancel()
-	}
-
-	if len(urls) == 0 {
-		m.logger.Infof("no subscription URLs configured, skipping refresh")
-		return
-	}
-
-	// Always start the refresh loop to handle the immediate refresh signal
-	m.logger.Infof("subscription config updated: %d URLs, enabled=%v, interval=%s", len(urls), enabled, effectiveInterval)
-	go m.refreshLoop(ctx, manualRefresh, effectiveInterval, enabled)
-
-	// Always trigger an immediate fetch when URLs are provided,
-	// regardless of the "enabled" flag (which only controls periodic auto-refresh)
-	select {
-	case manualRefresh <- struct{}{}:
-		m.logger.Infof("triggered immediate refresh after config update")
-	default:
-		// A refresh is already pending
-	}
+	m.updateConfig(urls, enabled, interval, false)
 }
 
 // UpdateConfigAndRefresh updates subscription config and synchronously waits for
 // the first refresh to complete before returning. This ensures the caller (WebUI API)
 // can confirm the update took effect.
 func (m *Manager) UpdateConfigAndRefresh(urls []string, enabled bool, interval time.Duration) error {
-	startCount := m.Status().RefreshCount
-	m.UpdateConfig(urls, enabled, interval)
-
-	if len(urls) == 0 {
+	waiter := m.updateConfig(urls, enabled, interval, true)
+	if waiter == nil {
 		return nil
 	}
-
-	// Wait for the refresh triggered by UpdateConfig to complete
 	m.mu.RLock()
 	timeout := m.baseCfg.SubscriptionRefresh.Timeout
 	healthTimeout := m.baseCfg.SubscriptionRefresh.HealthCheckTimeout
@@ -205,39 +173,27 @@ func (m *Manager) UpdateConfigAndRefresh(urls []string, enabled bool, interval t
 	ctx, cancel := context.WithTimeout(waitCtx, deadline)
 	defer cancel()
 
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("刷新超时")
-		case <-ticker.C:
-			status := m.Status()
-			if status.RefreshCount > startCount {
-				if status.LastError != "" {
-					return fmt.Errorf("刷新失败: %s", status.LastError)
-				}
-				return nil
-			}
-		}
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("refresh timeout: %w", ctx.Err())
+	case err := <-waiter:
+		return err
 	}
 }
 
 // RefreshNow triggers an immediate refresh.
 func (m *Manager) RefreshNow() error {
-	startCount := m.Status().RefreshCount
 	m.mu.RLock()
-	manualRefresh := m.manualRefresh
+	hasSubscriptions := len(m.baseCfg.Subscriptions) > 0
 	timeout := m.baseCfg.SubscriptionRefresh.Timeout
 	healthTimeout := m.baseCfg.SubscriptionRefresh.HealthCheckTimeout
 	waitCtx := m.ctx
 	m.mu.RUnlock()
-	select {
-	case manualRefresh <- struct{}{}:
-	default:
-		// Already a refresh pending
+	if !hasSubscriptions {
+		return fmt.Errorf("no subscription URLs configured")
 	}
+	m.startLoop()
+	waiter := m.requestRefresh(true)
 
 	// Wait for refresh to complete or timeout
 	if timeout <= 0 {
@@ -247,24 +203,89 @@ func (m *Manager) RefreshNow() error {
 	ctx, cancel := context.WithTimeout(waitCtx, timeout+healthTimeout)
 	defer cancel()
 
-	// Poll status until refresh completes
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("refresh timeout")
-		case <-ticker.C:
-			status := m.Status()
-			if status.RefreshCount > startCount {
-				if status.LastError != "" {
-					return fmt.Errorf("refresh failed: %s", status.LastError)
-				}
-				return nil
-			}
-		}
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("refresh timeout: %w", ctx.Err())
+	case err := <-waiter:
+		return err
 	}
+}
+
+func (m *Manager) startLoop() {
+	m.loopOnce.Do(func() {
+		go m.refreshLoop()
+	})
+}
+
+func (m *Manager) updateConfig(urls []string, enabled bool, interval time.Duration, wait bool) <-chan error {
+	m.startLoop()
+
+	// Do not allow an in-flight refresh based on the old URLs to publish after
+	// the new settings have been persisted.
+	m.refreshMu.Lock()
+	m.mu.Lock()
+	m.baseCfg.Subscriptions = append([]string(nil), urls...)
+	m.baseCfg.SubscriptionRefresh.Enabled = enabled
+	if interval > 0 {
+		m.baseCfg.SubscriptionRefresh.Interval = interval
+	}
+	effectiveInterval := m.baseCfg.SubscriptionRefresh.Interval
+	saveErr := m.baseCfg.SaveSettings()
+	m.mu.Unlock()
+	m.refreshMu.Unlock()
+	if saveErr != nil {
+		m.logger.Errorf("failed to save subscription config: %v", saveErr)
+	}
+
+	select {
+	case m.configChanged <- struct{}{}:
+	default:
+	}
+	if len(urls) == 0 {
+		m.logger.Infof("no subscription URLs configured, skipping refresh")
+		return nil
+	}
+
+	m.logger.Infof("subscription config updated: %d URLs, enabled=%v, interval=%s", len(urls), enabled, effectiveInterval)
+	return m.requestRefresh(wait)
+}
+
+func (m *Manager) requestRefresh(wait bool) <-chan error {
+	m.mu.Lock()
+	m.requestSeq++
+	sequence := m.requestSeq
+	var waiter chan error
+	if wait {
+		waiter = make(chan error, 1)
+		m.waiters[sequence] = waiter
+	}
+	m.mu.Unlock()
+
+	select {
+	case m.manualRefresh <- struct{}{}:
+	default:
+	}
+	return waiter
+}
+
+func (m *Manager) requestedSequence() uint64 {
+	m.mu.RLock()
+	sequence := m.requestSeq
+	m.mu.RUnlock()
+	return sequence
+}
+
+func (m *Manager) completeRequests(upTo uint64, err error) {
+	m.mu.Lock()
+	for sequence, waiter := range m.waiters {
+		if sequence > upTo {
+			continue
+		}
+		waiter <- err
+		close(waiter)
+		delete(m.waiters, sequence)
+	}
+	m.mu.Unlock()
 }
 
 // Status returns the current refresh status.
@@ -278,118 +299,123 @@ func (m *Manager) Status() monitor.SubscriptionStatus {
 	return status
 }
 
-// refreshLoop runs the periodic refresh.
-func (m *Manager) refreshLoop(loopCtx context.Context, manualRefresh <-chan struct{}, interval time.Duration, autoEnabled bool) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	if autoEnabled {
-		// Update next refresh time only when auto-refresh is enabled
-		m.mu.Lock()
-		m.status.NextRefresh = time.Now().Add(interval)
-		m.mu.Unlock()
+// refreshLoop is the manager's only scheduler. A stable loop/channel pair
+// avoids dropped manual requests while settings are being changed.
+func (m *Manager) refreshLoop() {
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
 	}
+	defer timer.Stop()
 
 	for {
-		select {
-		case <-loopCtx.Done():
-			return
-		case <-ticker.C:
-			// Only do periodic refresh when auto-refresh is enabled
-			if !autoEnabled {
-				continue
-			}
-			m.doRefresh()
+		m.mu.RLock()
+		autoEnabled := m.baseCfg.SubscriptionRefresh.Enabled && len(m.baseCfg.Subscriptions) > 0
+		interval := m.baseCfg.SubscriptionRefresh.Interval
+		loopCtx := m.ctx
+		m.mu.RUnlock()
+		if interval <= 0 {
+			interval = time.Hour
+		}
+
+		var timerChannel <-chan time.Time
+		if autoEnabled {
+			timer.Reset(interval)
+			timerChannel = timer.C
 			m.mu.Lock()
 			m.status.NextRefresh = time.Now().Add(interval)
 			m.mu.Unlock()
-		case <-manualRefresh:
-			// Always honor manual/immediate refresh regardless of enabled flag
-			m.doRefresh()
-			if autoEnabled {
-				ticker.Reset(interval)
-				m.mu.Lock()
-				m.status.NextRefresh = time.Now().Add(interval)
-				m.mu.Unlock()
-			}
+		} else {
+			m.mu.Lock()
+			m.status.NextRefresh = time.Time{}
+			m.mu.Unlock()
+		}
+
+		select {
+		case <-loopCtx.Done():
+			return
+		case <-m.configChanged:
+			stopTimer(timer)
+			continue
+		case <-timerChannel:
+			target := m.requestedSequence()
+			err := m.doRefresh()
+			m.completeRequests(target, err)
+		case <-m.manualRefresh:
+			stopTimer(timer)
+			target := m.requestedSequence()
+			err := m.doRefresh()
+			m.completeRequests(target, err)
 		}
 	}
 }
 
-// doRefresh performs a single refresh operation.
-func (m *Manager) doRefresh() {
-	// Prevent concurrent refreshes
-	if !m.refreshMu.TryLock() {
-		m.logger.Warnf("refresh already in progress, skipping")
-		return
+func stopTimer(timer *time.Timer) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
 	}
+}
+
+// doRefresh performs one atomic fetch, file update, and runtime reload.
+func (m *Manager) doRefresh() (refreshErr error) {
+	m.refreshMu.Lock()
 	defer m.refreshMu.Unlock()
 
 	m.mu.Lock()
 	m.status.IsRefreshing = true
 	m.mu.Unlock()
-
 	defer func() {
 		m.mu.Lock()
 		m.status.IsRefreshing = false
 		m.status.RefreshCount++
+		m.status.LastRefresh = time.Now()
+		if refreshErr != nil {
+			m.status.LastError = refreshErr.Error()
+		} else {
+			m.status.LastError = ""
+		}
 		m.mu.Unlock()
 	}()
 
-	m.logger.Infof("starting subscription refresh")
+	m.mu.RLock()
+	baseCfg := *m.baseCfg
+	baseCfg.Nodes = cloneNodes(m.baseCfg.Nodes)
+	baseCfg.Subscriptions = append([]string(nil), m.baseCfg.Subscriptions...)
+	fetchCtx := m.ctx
+	m.mu.RUnlock()
+	nodesFilePath := nodesFilePathForConfig(&baseCfg)
 
-	// Fetch nodes from all subscriptions
-	nodes, err := m.fetchAllSubscriptions()
+	m.logger.Infof("starting subscription refresh")
+	plan, err := m.fetchAllSubscriptions(fetchCtx, &baseCfg, nodesFilePath)
 	if err != nil {
 		m.logger.Errorf("fetch subscriptions failed: %v", err)
-		m.mu.Lock()
-		m.status.LastError = err.Error()
-		m.status.LastRefresh = time.Now()
-		m.mu.Unlock()
-		return
+		return err
+	}
+	m.logger.Infof("prepared %d subscription nodes", len(plan.nodes))
+	if lister, ok := m.boxMgr.(configNodeLister); ok {
+		currentNodes, listErr := lister.ListConfigNodes(fetchCtx)
+		if listErr != nil {
+			return fmt.Errorf("snapshot current explicit nodes: %w", listErr)
+		}
+		baseCfg.Nodes = cloneNodes(currentNodes)
 	}
 
-	if len(nodes) == 0 {
-		m.logger.Warnf("no nodes fetched from subscriptions")
-		m.mu.Lock()
-		m.status.LastError = "no nodes fetched"
-		m.status.LastRefresh = time.Now()
-		m.mu.Unlock()
-		return
-	}
-
-	m.logger.Infof("fetched %d nodes from subscriptions", len(nodes))
-
-	// Persist the candidate nodes before switching runtime, but retain the old
-	// bytes so a failed reload can restore the last bootable configuration.
-	nodesFilePath := m.getNodesFilePath()
+	// Persist the candidate before switching runtime, retaining the previous
+	// bytes so a rejected candidate cannot replace the last bootable cache.
 	previousNodes, readErr := os.ReadFile(nodesFilePath)
 	previousFileExisted := readErr == nil
 	if readErr != nil && !os.IsNotExist(readErr) {
-		m.logger.Errorf("failed to snapshot nodes.txt: %v", readErr)
-		m.mu.Lock()
-		m.status.LastError = fmt.Sprintf("snapshot nodes.txt: %v", readErr)
-		m.status.LastRefresh = time.Now()
-		m.mu.Unlock()
-		return
+		return fmt.Errorf("snapshot nodes.txt: %w", readErr)
 	}
-	if err := m.writeNodesToFile(nodesFilePath, nodes); err != nil {
-		m.logger.Errorf("failed to write nodes.txt: %v", err)
-		m.mu.Lock()
-		m.status.LastError = fmt.Sprintf("write nodes.txt: %v", err)
-		m.status.LastRefresh = time.Now()
-		m.mu.Unlock()
-		return
+	if err := m.writeNodesToFile(nodesFilePath, plan.nodes); err != nil {
+		return fmt.Errorf("write nodes.txt: %w", err)
 	}
-	m.logger.Infof("written %d nodes to %s", len(nodes), nodesFilePath)
 
-	// Get current port mapping to preserve existing node ports
 	portMap := m.boxMgr.CurrentPortMap()
-
-	// Create new config with updated nodes
-	newCfg := m.createNewConfig(nodes)
-
-	// Trigger BoxManager reload with port preservation
+	newCfg := m.createNewConfig(&baseCfg, cloneNodes(plan.nodes))
 	if err := m.boxMgr.ReloadWithPortMap(newCfg, portMap); err != nil {
 		var restoreErr error
 		if previousFileExisted {
@@ -400,35 +426,46 @@ func (m *Manager) doRefresh() {
 				restoreErr = nil
 			}
 		}
-		m.logger.Errorf("reload failed: %v", err)
-		m.mu.Lock()
 		if restoreErr != nil {
-			m.status.LastError = fmt.Sprintf("%v; restore nodes.txt: %v", err, restoreErr)
-		} else {
-			m.status.LastError = err.Error()
+			return fmt.Errorf("reload: %w; restore nodes.txt: %v", err, restoreErr)
 		}
-		m.status.LastRefresh = time.Now()
-		m.mu.Unlock()
-		return
+		return fmt.Errorf("reload: %w", err)
 	}
 
-	// Only publish modification metadata after both disk and runtime agree.
-	newHash := m.computeNodesHash(nodes)
+	newHash := m.computeNodesHash(plan.nodes)
 	m.mu.Lock()
 	m.baseCfg = newCfg
+	for key := range m.sourceCache {
+		if _, active := plan.activeKeys[key]; !active {
+			delete(m.sourceCache, key)
+		}
+	}
+	for key, nodes := range plan.cacheUpdates {
+		m.sourceCache[key] = cloneNodes(nodes)
+	}
 	m.lastSubHash = newHash
-	if info, err := os.Stat(nodesFilePath); err == nil {
+	if info, statErr := os.Stat(nodesFilePath); statErr == nil {
 		m.lastNodesModTime = info.ModTime()
 	} else {
 		m.lastNodesModTime = time.Now()
 	}
 	m.status.NodesModified = false
-	m.status.LastRefresh = time.Now()
-	m.status.NodeCount = len(nodes)
-	m.status.LastError = ""
+	m.status.NodeCount = len(newCfg.Nodes)
 	m.mu.Unlock()
 
-	m.logger.Infof("subscription refresh completed, %d nodes active", len(nodes))
+	if plan.usedFallback {
+		m.logger.Warnf("subscription refresh completed with the aggregate restart cache")
+	} else {
+		m.logger.Infof("subscription refresh completed, %d nodes active", len(newCfg.Nodes))
+	}
+	return nil
+}
+
+func nodesFilePathForConfig(cfg *config.Config) string {
+	if cfg.NodesFile != "" {
+		return cfg.NodesFile
+	}
+	return filepath.Join(filepath.Dir(cfg.FilePath()), "nodes.txt")
 }
 
 // getNodesFilePath returns the path to nodes.txt.
@@ -520,98 +557,123 @@ func (m *Manager) MarkNodesModified() {
 	m.mu.Unlock()
 }
 
-// fetchAllSubscriptions fetches nodes from all configured subscription URLs.
-func (m *Manager) fetchAllSubscriptions() ([]config.NodeConfig, error) {
-	var allNodes []config.NodeConfig
-	var lastErr error
+type subscriptionFetchPlan struct {
+	nodes        []config.NodeConfig
+	cacheUpdates map[string][]config.NodeConfig
+	activeKeys   map[string]struct{}
+	usedFallback bool
+}
 
-	m.mu.RLock()
-	timeout := m.baseCfg.SubscriptionRefresh.Timeout
-	urls := append([]string(nil), m.baseCfg.Subscriptions...)
-	fetchCtx := m.ctx
-	m.mu.RUnlock()
-	if timeout <= 0 {
-		timeout = 30 * time.Second
+// fetchAllSubscriptions fetches all unique URLs concurrently. Once a complete
+// refresh has populated sourceCache, a failed source can be replaced by only
+// that source's last known-good nodes. On the first incomplete refresh after a
+// restart, nodes.txt remains the conservative aggregate fallback.
+func (m *Manager) fetchAllSubscriptions(ctx context.Context, baseCfg *config.Config, nodesFilePath string) (subscriptionFetchPlan, error) {
+	results, stats := config.FetchSubscriptionSources(ctx, baseCfg.Subscriptions, config.SubscriptionFetchOptions{
+		Timeout:     baseCfg.SubscriptionRefresh.Timeout,
+		Concurrency: baseCfg.SubscriptionRefresh.FetchConcurrency,
+		Client:      m.httpClient,
+		Loggerf: func(format string, args ...any) {
+			m.logger.Infof(format, args...)
+		},
+	})
+	if stats.DedupedURLs > 0 {
+		m.logger.Infof("subscription URL dedupe removed %d duplicate entries", stats.DedupedURLs)
 	}
 
-	for _, subURL := range urls {
-		nodes, err := m.fetchSubscription(fetchCtx, subURL, timeout)
-		if err != nil {
-			m.logger.Warnf("failed to fetch %s: %v", subURL, err)
-			lastErr = err
+	plan := subscriptionFetchPlan{
+		cacheUpdates: make(map[string][]config.NodeConfig),
+		activeKeys:   make(map[string]struct{}, len(results)),
+	}
+	unresolved := 0
+	var lastErr error
+	for _, result := range results {
+		plan.activeKeys[result.Key] = struct{}{}
+		if result.Err == nil && len(result.Nodes) > 0 {
+			nodes := cloneNodes(result.Nodes)
+			plan.nodes = append(plan.nodes, nodes...)
+			plan.cacheUpdates[result.Key] = nodes
 			continue
 		}
-		m.logger.Infof("fetched %d nodes from subscription", len(nodes))
-		allNodes = append(allNodes, nodes...)
-	}
 
-	if len(allNodes) == 0 && lastErr != nil {
-		return nil, lastErr
-	}
-
-	return allNodes, nil
-}
-
-// fetchSubscription fetches and parses a single subscription URL.
-func (m *Manager) fetchSubscription(parent context.Context, subURL string, timeout time.Duration) ([]config.NodeConfig, error) {
-	ctx, cancel := context.WithTimeout(parent, timeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, "GET", subURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-
-	req.Header.Set("User-Agent", "clash-verge/v2.2.3")
-	req.Header.Set("Accept", "*/*")
-
-	// Use custom HTTP client with connection pooling
-	resp, err := m.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("fetch: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
-	}
-
-	// Limit read size to prevent memory exhaustion
-	const maxBodySize = 10 * 1024 * 1024 // 10MB
-	limitedReader := io.LimitReader(resp.Body, maxBodySize)
-
-	body, err := io.ReadAll(limitedReader)
-	if err != nil {
-		return nil, fmt.Errorf("read body: %w", err)
-	}
-
-	return config.ParseSubscriptionContent(string(body))
-}
-
-// createNewConfig creates a new config with updated nodes while preserving other settings.
-func (m *Manager) createNewConfig(nodes []config.NodeConfig) *config.Config {
-	// Deep copy base config
-	m.mu.RLock()
-	newCfg := *m.baseCfg
-	m.mu.RUnlock()
-
-	// Process node names
-	for i := range nodes {
-		nodes[i].Source = config.NodeSourceSubscription
-		nodes[i].Name = strings.TrimSpace(nodes[i].Name)
-		nodes[i].URI = strings.TrimSpace(nodes[i].URI)
-
-		// Auto-extract name from URI if not provided
-		if nodes[i].Name == "" {
-			nodes[i].Name = config.ExtractNodeName(nodes[i].URI)
+		m.mu.RLock()
+		cached := cloneNodes(m.sourceCache[result.Key])
+		m.mu.RUnlock()
+		if len(cached) > 0 {
+			m.logger.Warnf("using %d cached nodes for one unavailable subscription", len(cached))
+			plan.nodes = append(plan.nodes, cached...)
+			continue
 		}
-		if nodes[i].Name == "" {
-			nodes[i].Name = fmt.Sprintf("node-%d", i)
+		unresolved++
+		if result.Err != nil {
+			lastErr = result.Err
+		} else {
+			lastErr = fmt.Errorf("subscription returned no usable nodes")
 		}
 	}
 
-	newCfg.Nodes = nodes
+	if unresolved > 0 {
+		cachedNodes, cacheErr := config.LoadNodesFromFile(nodesFilePath)
+		if cacheErr == nil && len(cachedNodes) > 0 {
+			cachedNodes, _ = config.DedupeNodesByStableIdentity(cachedNodes)
+			m.logger.Warnf("keeping %d aggregate cached nodes because %d subscription sources have no runtime cache", len(cachedNodes), unresolved)
+			plan.nodes = cachedNodes
+			plan.cacheUpdates = nil
+			plan.usedFallback = true
+			return plan, nil
+		}
+		if lastErr == nil {
+			lastErr = fmt.Errorf("%d subscription sources could not be refreshed", unresolved)
+		}
+		if cacheErr != nil && !os.IsNotExist(cacheErr) {
+			return subscriptionFetchPlan{}, fmt.Errorf("%w; read aggregate cache: %v", lastErr, cacheErr)
+		}
+		return subscriptionFetchPlan{}, lastErr
+	}
+
+	plan.nodes, stats.DedupedNodes = config.DedupeNodesByStableIdentity(plan.nodes)
+	if stats.DedupedNodes > 0 {
+		m.logger.Infof("subscription node dedupe removed %d duplicate entries", stats.DedupedNodes)
+	}
+	if len(plan.nodes) == 0 {
+		return subscriptionFetchPlan{}, fmt.Errorf("no nodes fetched from subscriptions")
+	}
+	return plan, nil
+}
+
+// createNewConfig merges explicit inline nodes with refreshed subscription
+// nodes. Inline nodes win stable-identity collisions so user configuration is
+// never replaced by subscription metadata.
+func (m *Manager) createNewConfig(baseCfg *config.Config, nodes []config.NodeConfig) *config.Config {
+	newCfg := *baseCfg
+	merged := make([]config.NodeConfig, 0, len(baseCfg.Nodes)+len(nodes))
+	for _, node := range baseCfg.Nodes {
+		if node.Source == config.NodeSourceInline {
+			merged = append(merged, node)
+		}
+	}
+	for _, node := range nodes {
+		node.Source = config.NodeSourceSubscription
+		merged = append(merged, node)
+	}
+	merged, _ = config.DedupeNodesByStableIdentity(merged)
+	for index := range merged {
+		merged[index].Name = strings.TrimSpace(merged[index].Name)
+		merged[index].URI = strings.TrimSpace(merged[index].URI)
+		if merged[index].Name == "" {
+			merged[index].Name = config.ExtractNodeName(merged[index].URI)
+		}
+		if merged[index].Name == "" {
+			merged[index].Name = fmt.Sprintf("node-%d", index)
+		}
+	}
+	newCfg.Nodes = merged
+	newCfg.Subscriptions = append([]string(nil), baseCfg.Subscriptions...)
 	return &newCfg
+}
+
+func cloneNodes(nodes []config.NodeConfig) []config.NodeConfig {
+	return append([]config.NodeConfig(nil), nodes...)
 }
 
 type defaultLogger struct{}
