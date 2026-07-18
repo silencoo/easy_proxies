@@ -1370,8 +1370,8 @@
     function getNodeStatusRank(node) {
       if (node.blacklisted) return 3;
       if (node.cooling_down) return 2.5;
-      if ((node.last_latency_ms || -1) < 0) return 2;
-      if ((node.failure_count || 0) > 0) return 1;
+      if (!node.initial_check_done || (node.last_latency_ms || -1) < 0) return 2;
+      if (!node.available) return 1;
       return 0;
     }
 
@@ -1889,8 +1889,8 @@
         let badge = '', statusText = '';
         if (n.blacklisted) { badge = 'badge-error'; statusText = tr('拉黑 Blocked'); }
         else if (n.cooling_down) { badge = 'badge-warning'; statusText = tr('冷却 Cooling'); }
-        else if (ms < 0) { badge = 'badge-offline'; statusText = tr('未测试 Unknown'); }
-        else if (n.failure_count >= 1) { badge = 'badge-error'; statusText = tr('异常 Error'); }
+        else if (!n.initial_check_done || ms < 0) { badge = 'badge-offline'; statusText = tr('未测试 Unknown'); }
+        else if (!n.available) { badge = 'badge-error'; statusText = tr('异常 Error'); }
         else { badge = 'badge-healthy'; statusText = tr('在线 Healthy'); }
 
         return `<tr>

@@ -115,6 +115,8 @@ func TestEmbeddedWebUIHasScalableNodeOperations(t *testing.T) {
 		`trafficRetryAttempts >= 3`,
 		`Math.min(60000, 2000 * Math.pow(2`,
 		`function maskNodeURI(uri)`,
+		`if (!node.available) return 1;`,
+		`else if (!n.available) { badge = 'badge-error';`,
 		`fetch('/api/nodes/config/' + encodeURIComponent(id))`,
 		`function localizedAPIMessage(message, fallback='请求失败')`,
 		`async function readAPIJSON(response, fallback='请求失败')`,
@@ -136,6 +138,9 @@ func TestEmbeddedWebUIHasScalableNodeOperations(t *testing.T) {
 		if strings.Contains(html, value) {
 			t.Errorf("embedded WebUI still contains %q", value)
 		}
+	}
+	if strings.Contains(html, `else if (n.failure_count >= 1)`) {
+		t.Error("node status still treats historical failures as a current outage")
 	}
 }
 
