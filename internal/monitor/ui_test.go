@@ -40,3 +40,45 @@ func TestEmbeddedWebUIHasMonochromeIconsAndLanguageSwitcher(t *testing.T) {
 		}
 	}
 }
+
+func TestEmbeddedWebUIHasScalableNodeOperations(t *testing.T) {
+	data, err := embeddedFS.ReadFile("assets/index.html")
+	if err != nil {
+		t.Fatalf("read embedded WebUI: %v", err)
+	}
+	html := string(data)
+
+	required := []string{
+		`id="nodeSearch"`,
+		`id="nodePageSize"`,
+		`id="configNodeSearch"`,
+		`id="debugNodeSearch"`,
+		`data-sort-table="nodes"`,
+		`data-sort-table="debug"`,
+		`function sortNodeTable(key)`,
+		`function sortDebugTable(key)`,
+		`const REGION_NAME_PATTERNS`,
+		`['resident',`,
+		`function getNodeRegion(node)`,
+		`CHART_FONT_FAMILY`,
+		`function renderConsoleLogs(payload)`,
+		`.log-warn`,
+		`.log-error`,
+		`class="setting-input sensitive-textarea masked"`,
+		`function toggleSensitiveField(fieldId, button)`,
+	}
+	for _, value := range required {
+		if !strings.Contains(html, value) {
+			t.Errorf("embedded WebUI is missing %q", value)
+		}
+	}
+
+	forbidden := []string{
+		`<textarea id="consoleLogs"`,
+	}
+	for _, value := range forbidden {
+		if strings.Contains(html, value) {
+			t.Errorf("embedded WebUI still contains %q", value)
+		}
+	}
+}

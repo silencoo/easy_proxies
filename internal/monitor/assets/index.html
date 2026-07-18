@@ -20,10 +20,13 @@
       --primary-contrast: #0a0a0a;
       --success: #d4d4d4;
       --success-bg: rgba(255, 255, 255, 0.07);
-      --warning: #b8b8b8;
-      --warning-bg: rgba(255, 255, 255, 0.06);
+      --warning: #facc15;
+      --warning-bg: rgba(250, 204, 21, 0.09);
       --error: #ef7a7a;
       --error-bg: rgba(239, 122, 122, 0.08);
+      --log-info: #60a5fa;
+      --log-debug: #a1a1aa;
+      --log-trace: #c084fc;
       --chart-primary: #f5f5f5;
       --chart-secondary: #8a8a8a;
       --font-ui: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -45,10 +48,13 @@
       --primary-contrast: #ffffff;
       --success: #333333;
       --success-bg: rgba(0, 0, 0, 0.05);
-      --warning: #555555;
-      --warning-bg: rgba(0, 0, 0, 0.04);
+      --warning: #a16207;
+      --warning-bg: rgba(161, 98, 7, 0.08);
       --error: #a52828;
       --error-bg: rgba(165, 40, 40, 0.06);
+      --log-info: #1d4ed8;
+      --log-debug: #52525b;
+      --log-trace: #7e22ce;
       --chart-primary: #171717;
       --chart-secondary: #8a8a8a;
       --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
@@ -268,6 +274,27 @@
     }
     .panel-title { font-size: 14px; font-weight: 600; }
     .table-container { overflow-x: auto; }
+    .table-toolbar {
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      padding: 12px 16px; border-bottom: 1px solid var(--border); flex-wrap: wrap;
+    }
+    .table-search { position: relative; width: min(340px, 100%); }
+    .table-search .icon { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: var(--text-muted); pointer-events: none; }
+    .table-search input { width: 100%; padding-left: 34px; }
+    .table-page-size { display: inline-flex; align-items: center; gap: 8px; color: var(--text-muted); font-size: 12px; }
+    .table-page-size select { width: auto; min-width: 76px; padding: 6px 28px 6px 10px; }
+    .pagination {
+      display: flex; align-items: center; justify-content: flex-end; gap: 10px;
+      padding: 12px 16px; border-top: 1px solid var(--border); color: var(--text-muted); font-size: 12px;
+    }
+    .pagination .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .sort-button {
+      appearance: none; border: 0; background: transparent; color: inherit; font: inherit;
+      text-transform: inherit; font-weight: inherit; letter-spacing: inherit; cursor: pointer;
+      display: inline-flex; align-items: center; gap: 5px; padding: 0; white-space: nowrap;
+    }
+    .sort-button:hover { color: var(--text-main); }
+    .sort-indicator { width: 13px; height: 13px; color: var(--text-muted); }
     table { width: 100%; border-collapse: collapse; text-align: left; }
     th {
       padding: 12px 16px;
@@ -344,6 +371,19 @@
       padding: 8px 12px; border-radius: 6px; font-family: var(--font-mono); font-size: 13px; outline: none;
     }
     input:focus { border-color: var(--primary); }
+    .sensitive-field { position: relative; }
+    .sensitive-field .setting-input,
+    .sensitive-field > input { width: 100%; padding-right: 42px; }
+    .sensitive-field textarea { padding-right: 42px; }
+    .sensitive-toggle {
+      position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+      width: 30px; height: 30px; padding: 0; border: 0; background: transparent;
+      color: var(--text-muted); border-radius: 5px; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+    }
+    .sensitive-field.textarea-field .sensitive-toggle { top: 8px; transform: none; }
+    .sensitive-toggle:hover { color: var(--text-main); background: var(--bg-hover); }
+    .sensitive-textarea.masked { -webkit-text-security: disc; text-security: disc; }
     
     .region-filters { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
     .region-btn { padding: 4px 10px; border-radius: 4px; background: var(--bg-input); border: 1px solid var(--border); color: var(--text-muted); cursor: pointer; font-size: 12px; }
@@ -368,6 +408,22 @@
     .tl-dot { width: 6px; height: 16px; border-radius: 2px; }
     .tl-dot.success { background: var(--success); }
     .tl-dot.error { background: var(--error); }
+
+    .console-logs {
+      width: 100%; height: calc(100vh - 220px); min-height: 400px;
+      background: var(--bg-input); color: var(--text-main); font-family: var(--font-mono);
+      font-size: 12px; line-height: 1.7; border-top: 1px solid var(--border);
+      padding: 16px; white-space: pre; overflow: auto;
+    }
+    .log-line { display: block; min-width: max-content; border-left: 2px solid transparent; padding-left: 8px; }
+    .log-line:hover { background: var(--bg-hover); }
+    .log-level { display: inline-block; width: 5.2em; font-weight: 700; }
+    .log-info { color: var(--log-info); border-left-color: var(--log-info); }
+    .log-warn { color: var(--warning); border-left-color: var(--warning); }
+    .log-error, .log-fatal, .log-panic { color: var(--error); border-left-color: var(--error); }
+    .log-debug { color: var(--log-debug); border-left-color: var(--log-debug); }
+    .log-trace { color: var(--log-trace); border-left-color: var(--log-trace); }
+    .log-unknown { color: var(--text-main); }
     
     /* ECharts containers */
     .charts-grid {
@@ -453,6 +509,13 @@
     <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16m-10 4v6m4-6v6M9 7l1-3h4l1 3m3 0-1 14H7L6 7"/></symbol>
     <symbol id="i-save" viewBox="0 0 24 24"><path d="M4 3h13l3 3v15H4Z"/><path d="M8 3v6h8V3M8 21v-7h8v7"/></symbol>
     <symbol id="i-map" viewBox="0 0 24 24"><path d="M12 21s7-5.2 7-12a7 7 0 1 0-14 0c0 6.8 7 12 7 12Z"/><circle cx="12" cy="9" r="2"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></symbol>
+    <symbol id="i-eye-off" viewBox="0 0 24 24"><path d="m3 3 18 18M10.6 10.6a2 2 0 0 0 2.8 2.8M9.9 4.2A10.8 10.8 0 0 1 12 4c6.5 0 10 8 10 8a16.8 16.8 0 0 1-2.1 3.2M6.6 6.6C3.5 8.5 2 12 2 12s3.5 8 10 8a9.8 9.8 0 0 0 5.4-1.6"/></symbol>
+    <symbol id="i-sort" viewBox="0 0 24 24"><path d="m8 7 4-4 4 4M12 3v18m4-4-4 4-4-4"/></symbol>
+    <symbol id="i-chevron-up" viewBox="0 0 24 24"><path d="m6 15 6-6 6 6"/></symbol>
+    <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="i-chevron-left" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></symbol>
+    <symbol id="i-chevron-right" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
   </svg>
 
   <!-- Sidebar -->
@@ -566,6 +629,7 @@
           <button type="button" class="region-btn" data-region="hk" onclick="filterByRegion('hk')">HK</button>
           <button type="button" class="region-btn" data-region="tw" onclick="filterByRegion('tw')">TW</button>
           <button type="button" class="region-btn" data-region="sg" onclick="filterByRegion('sg')">SG</button>
+          <button type="button" class="region-btn" data-region="resident" onclick="filterByRegion('resident')">Resident</button>
           <button type="button" class="region-btn" data-region="other" onclick="filterByRegion('other')">其他</button>
         </div>
 
@@ -573,17 +637,28 @@
           <div class="panel-header">
             <div class="panel-title">节点监控列表</div>
           </div>
+          <div class="table-toolbar">
+            <div class="table-search">
+              <svg class="icon"><use href="#i-search"></use></svg>
+              <input id="nodeSearch" class="setting-input" type="search" placeholder="搜索名称、标签、地域或端口" oninput="setNodeSearch(this.value)" />
+            </div>
+            <label class="table-page-size">每页
+              <select id="nodePageSize" class="setting-input" onchange="setNodePageSize(this.value)">
+                <option value="25">25</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option>
+              </select>
+            </label>
+          </div>
           <div class="table-container">
             <table>
               <thead>
                 <tr>
-                  <th>状态</th>
-                  <th>地域</th>
-                  <th>名称 (Name/Tag)</th>
-                  <th>端口</th>
-                  <th>延迟 / 质量</th>
-                  <th>连接</th>
-                  <th>失败</th>
+                  <th><button type="button" class="sort-button" data-sort-table="nodes" data-sort-key="status" onclick="sortNodeTable('status')">状态<svg class="icon sort-indicator"><use href="#i-sort"></use></svg></button></th>
+                  <th><button type="button" class="sort-button" data-sort-table="nodes" data-sort-key="region" onclick="sortNodeTable('region')">地域<svg class="icon sort-indicator"><use href="#i-sort"></use></svg></button></th>
+                  <th><button type="button" class="sort-button" data-sort-table="nodes" data-sort-key="name" onclick="sortNodeTable('name')">名称 (Name/Tag)<svg class="icon sort-indicator"><use href="#i-sort"></use></svg></button></th>
+                  <th><button type="button" class="sort-button" data-sort-table="nodes" data-sort-key="port" onclick="sortNodeTable('port')">端口<svg class="icon sort-indicator"><use href="#i-sort"></use></svg></button></th>
+                  <th><button type="button" class="sort-button" data-sort-table="nodes" data-sort-key="latency" onclick="sortNodeTable('latency')">延迟 / 质量<svg class="icon sort-indicator"><use href="#i-sort"></use></svg></button></th>
+                  <th><button type="button" class="sort-button" data-sort-table="nodes" data-sort-key="connections" onclick="sortNodeTable('connections')">连接<svg class="icon sort-indicator"><use href="#i-sort"></use></svg></button></th>
+                  <th><button type="button" class="sort-button" data-sort-table="nodes" data-sort-key="failures" onclick="sortNodeTable('failures')">失败<svg class="icon sort-indicator"><use href="#i-sort"></use></svg></button></th>
                   <th>操作</th>
                 </tr>
               </thead>
@@ -592,6 +667,11 @@
               </tbody>
             </table>
             <div id="emptyState" style="display:none; text-align:center; padding: 40px; color: var(--text-muted);">暂无数据</div>
+          </div>
+          <div class="pagination" id="nodePagination">
+            <span id="nodePageInfo">0 / 0</span>
+            <button type="button" class="btn btn-sm" id="nodePrevPage" onclick="changeNodePage(-1)" aria-label="上一页"><svg class="icon"><use href="#i-chevron-left"></use></svg></button>
+            <button type="button" class="btn btn-sm" id="nodeNextPage" onclick="changeNodePage(1)" aria-label="下一页"><svg class="icon"><use href="#i-chevron-right"></use></svg></button>
           </div>
         </div>
       </div>
@@ -614,11 +694,27 @@
         </div>
 
         <div class="panel">
+          <div class="table-toolbar">
+            <div class="table-search">
+              <svg class="icon"><use href="#i-search"></use></svg>
+              <input id="configNodeSearch" class="setting-input" type="search" placeholder="搜索节点名称、URI、端口或来源" oninput="setConfigNodeSearch(this.value)" />
+            </div>
+            <label class="table-page-size">每页
+              <select id="configNodePageSize" class="setting-input" onchange="setConfigNodePageSize(this.value)">
+                <option value="25">25</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option>
+              </select>
+            </label>
+          </div>
           <div class="table-container">
             <table>
               <thead><tr><th>名称</th><th>URI</th><th>端口</th><th>来源</th><th>操作</th></tr></thead>
               <tbody id="configNodesTableBody"></tbody>
             </table>
+          </div>
+          <div class="pagination">
+            <span id="configNodePageInfo">0 / 0</span>
+            <button type="button" class="btn btn-sm" id="configNodePrevPage" onclick="changeConfigNodePage(-1)" aria-label="上一页"><svg class="icon"><use href="#i-chevron-left"></use></svg></button>
+            <button type="button" class="btn btn-sm" id="configNodeNextPage" onclick="changeConfigNodePage(1)" aria-label="下一页"><svg class="icon"><use href="#i-chevron-right"></use></svg></button>
           </div>
         </div>
       </div>
@@ -653,19 +749,35 @@
 
         <div class="panel">
           <div class="panel-header"><div class="panel-title">节点质量分析</div></div>
+          <div class="table-toolbar">
+            <div class="table-search">
+              <svg class="icon"><use href="#i-search"></use></svg>
+              <input id="debugNodeSearch" class="setting-input" type="search" placeholder="搜索诊断节点" oninput="setDebugNodeSearch(this.value)" />
+            </div>
+            <label class="table-page-size">每页
+              <select id="debugNodePageSize" class="setting-input" onchange="setDebugNodePageSize(this.value)">
+                <option value="25">25</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option>
+              </select>
+            </label>
+          </div>
           <div class="table-container">
             <table>
               <thead>
                 <tr>
-                  <th>节点</th>
-                  <th>成功率</th>
-                  <th>成功 / 失败</th>
-                  <th>连接</th>
+                  <th><button type="button" class="sort-button" data-sort-table="debug" data-sort-key="name" onclick="sortDebugTable('name')">节点<svg class="icon sort-indicator"><use href="#i-sort"></use></svg></button></th>
+                  <th><button type="button" class="sort-button" data-sort-table="debug" data-sort-key="successRate" onclick="sortDebugTable('successRate')">成功率<svg class="icon sort-indicator"><use href="#i-sort"></use></svg></button></th>
+                  <th><button type="button" class="sort-button" data-sort-table="debug" data-sort-key="calls" onclick="sortDebugTable('calls')">成功 / 失败<svg class="icon sort-indicator"><use href="#i-sort"></use></svg></button></th>
+                  <th><button type="button" class="sort-button" data-sort-table="debug" data-sort-key="connections" onclick="sortDebugTable('connections')">连接<svg class="icon sort-indicator"><use href="#i-sort"></use></svg></button></th>
                   <th>最近调用时间线</th>
                 </tr>
               </thead>
               <tbody id="debugNodesTableBody"></tbody>
             </table>
+          </div>
+          <div class="pagination">
+            <span id="debugNodePageInfo">0 / 0</span>
+            <button type="button" class="btn btn-sm" id="debugNodePrevPage" onclick="changeDebugNodePage(-1)" aria-label="上一页"><svg class="icon"><use href="#i-chevron-left"></use></svg></button>
+            <button type="button" class="btn btn-sm" id="debugNodeNextPage" onclick="changeDebugNodePage(1)" aria-label="下一页"><svg class="icon"><use href="#i-chevron-right"></use></svg></button>
           </div>
         </div>
       </div>
@@ -680,9 +792,7 @@
               <button type="button" class="btn btn-sm" onclick="pollLogs()"><svg class="icon"><use href="#i-refresh"></use></svg><span>刷新</span></button>
             </div>
           </div>
-          <div style="padding: 0;">
-            <textarea id="consoleLogs" readonly style="width:100%; height:calc(100vh - 220px); min-height:400px; background:var(--bg-input); color:var(--text-main); font-family:'JetBrains Mono',monospace; font-size:12px; line-height:1.7; border:none; border-top:1px solid var(--border); padding:16px; resize:none; box-sizing:border-box; white-space:pre; overflow-x:auto;"></textarea>
-          </div>
+          <div id="consoleLogs" class="console-logs" role="log" aria-live="off" aria-label="控制台日志"></div>
         </div>
       </div>
 
@@ -740,7 +850,7 @@
                 <div class="form-group"><label>监听地址</label><input type="text" id="settingListenerAddr" class="setting-input" placeholder="0.0.0.0" /></div>
                 <div class="form-group"><label>监听端口</label><input type="number" id="settingListenerPort" class="setting-input" min="1" max="65535" placeholder="7890" /></div>
                 <div class="form-group"><label>用户名 (可选)</label><input type="text" id="settingListenerUser" class="setting-input" /></div>
-                <div class="form-group"><label>密码 (可选)</label><input type="password" id="settingListenerPass" class="setting-input" /></div>
+                <div class="form-group"><label for="settingListenerPass">密码 (可选)</label><div class="sensitive-field"><input type="password" id="settingListenerPass" class="setting-input" /><button type="button" class="sensitive-toggle" aria-label="显示敏感信息" title="显示敏感信息" aria-pressed="false" onclick="toggleSensitiveField('settingListenerPass', this)"><svg class="icon"><use href="#i-eye"></use></svg></button></div></div>
               </div>
             </div>
 
@@ -750,7 +860,7 @@
                 <div class="form-group"><label>监听地址</label><input type="text" id="settingMPAddr" class="setting-input" placeholder="0.0.0.0" /></div>
                 <div class="form-group"><label>起始端口</label><input type="number" id="settingMPBasePort" class="setting-input" min="1" max="65535" placeholder="10000" /></div>
                 <div class="form-group"><label>用户名 (可选)</label><input type="text" id="settingMPUser" class="setting-input" /></div>
-                <div class="form-group"><label>密码 (可选)</label><input type="password" id="settingMPPass" class="setting-input" /></div>
+                <div class="form-group"><label for="settingMPPass">密码 (可选)</label><div class="sensitive-field"><input type="password" id="settingMPPass" class="setting-input" /><button type="button" class="sensitive-toggle" aria-label="显示敏感信息" title="显示敏感信息" aria-pressed="false" onclick="toggleSensitiveField('settingMPPass', this)"><svg class="icon"><use href="#i-eye"></use></svg></button></div></div>
               </div>
             </div>
 
@@ -774,7 +884,7 @@
               <div class="panel-header"><div class="panel-title">管理面板 (Management)</div></div>
               <div style="padding: 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
                 <div class="form-group"><label>监听地址</label><input type="text" id="settingMgmtListen" class="setting-input" placeholder="0.0.0.0:8080" /></div>
-                <div class="form-group"><label>访问密码</label><input type="password" id="settingMgmtPassword" class="setting-input" /></div>
+                <div class="form-group"><label for="settingMgmtPassword">访问密码</label><div class="sensitive-field"><input type="password" id="settingMgmtPassword" class="setting-input" /><button type="button" class="sensitive-toggle" aria-label="显示敏感信息" title="显示敏感信息" aria-pressed="false" onclick="toggleSensitiveField('settingMgmtPassword', this)"><svg class="icon"><use href="#i-eye"></use></svg></button></div></div>
               </div>
             </div>
 
@@ -838,8 +948,11 @@
                   </div>
                 </div>
                 <div class="form-group" style="margin-top: 12px;">
-                  <label>订阅链接 (每行一个 URL)</label>
-                  <textarea id="settingSubURLs" rows="4" class="setting-input" placeholder="https://example.com/subscribe?token=xxx" style="resize:vertical; font-size:12px;"></textarea>
+                  <label for="settingSubURLs">订阅链接 (每行一个 URL)</label>
+                  <div class="sensitive-field textarea-field">
+                    <textarea id="settingSubURLs" rows="4" class="setting-input sensitive-textarea masked" placeholder="https://example.com/subscribe?token=xxx" spellcheck="false" style="resize:vertical; font-size:12px;"></textarea>
+                    <button type="button" class="sensitive-toggle" aria-label="显示敏感信息" title="显示敏感信息" aria-pressed="false" onclick="toggleSensitiveField('settingSubURLs', this)"><svg class="icon"><use href="#i-eye"></use></svg></button>
+                  </div>
                 </div>
                 <div style="font-size: 11px; color: var(--success); margin-top: 8px;">订阅配置变更保存后立即生效</div>
               </div>
@@ -863,8 +976,8 @@
       <form onsubmit="handleLogin(event)">
         <div class="modal-body">
           <div class="form-group">
-            <label>系统密码</label>
-            <input type="password" id="password" required placeholder="请输入密码..." />
+            <label for="password">系统密码</label>
+            <div class="sensitive-field"><input type="password" id="password" required placeholder="请输入密码..." /><button type="button" class="sensitive-toggle" aria-label="显示敏感信息" title="显示敏感信息" aria-pressed="false" onclick="toggleSensitiveField('password', this)"><svg class="icon"><use href="#i-eye"></use></svg></button></div>
           </div>
           <div id="loginError" style="color: var(--error); font-size: 12px; display: none;"></div>
         </div>
@@ -933,6 +1046,20 @@
     let configNodes = [];
     let _savedSubSnapshot = '';
     let _savedCoreSnapshot = '';
+    let _lastLogsPayload = null;
+    const CHART_FONT_FAMILY = '"Segoe UI", "Microsoft YaHei UI", "Segoe UI Emoji", "Noto Color Emoji", sans-serif';
+    const nodeTableState = { search: '', page: 1, pageSize: 50, sortKey: 'latency', sortDir: 'asc' };
+    const configNodeTableState = { search: '', page: 1, pageSize: 50 };
+    const debugTableState = { search: '', page: 1, pageSize: 50, sortKey: 'name', sortDir: 'asc' };
+    const REGION_NAME_PATTERNS = [
+      ['resident', /(家宽|家庭宽带|住宅|原生|residential|resident|(?:^|[^a-z])isp(?:$|[^a-z])|(?:^|[^a-z])home(?:$|[^a-z]))/i],
+      ['hk', /(香港|hong\s*kong|hongkong|\u{1F1ED}\u{1F1F0}|(?:^|[^a-z])hk(?:$|[^a-z]))/iu],
+      ['jp', /(日本|东京|大阪|埼玉|japan|\u{1F1EF}\u{1F1F5}|(?:^|[^a-z])jp(?:$|[^a-z]))/iu],
+      ['kr', /(韩国|南韩|首尔|仁川|south\s*korea|korea|\u{1F1F0}\u{1F1F7}|(?:^|[^a-z])kr(?:$|[^a-z]))/iu],
+      ['us', /(美国|圣何塞|洛杉矶|阿什本|united\s*states|\u{1F1FA}\u{1F1F8}|(?:^|[^a-z])usa?(?:$|[^a-z]))/iu],
+      ['tw', /(台湾|台灣|新北|彰化|taiwan|\u{1F1F9}\u{1F1FC}|(?:^|[^a-z])tw(?:$|[^a-z]))/iu],
+      ['sg', /(新加坡|狮城|獅城|singapore|\u{1F1F8}\u{1F1EC}|(?:^|[^a-z])sg(?:$|[^a-z]))/iu]
+    ];
 
     const TRANSLATIONS = {
       '监控看板': 'Dashboard',
@@ -971,6 +1098,14 @@
       '过滤:': 'Filter:',
       '全部': 'All',
       '其他': 'Other',
+      '每页': 'Per page',
+      '搜索名称、标签、地域或端口': 'Search name, tag, region, or port',
+      '搜索节点名称、URI、端口或来源': 'Search node name, URI, port, or source',
+      '搜索诊断节点': 'Search diagnostic nodes',
+      '上一页': 'Previous page',
+      '下一页': 'Next page',
+      '显示敏感信息': 'Show sensitive value',
+      '隐藏敏感信息': 'Hide sensitive value',
       '节点监控列表': 'Node monitor',
       '状态': 'Status',
       '地域': 'Region',
@@ -1138,10 +1273,10 @@
         const translated = currentLanguage === 'en' ? (TRANSLATIONS[node.__i18nSource] || node.__i18nSource) : node.__i18nSource;
         node.nodeValue = node.nodeValue.replace(trimmed, translated);
       }
-      root.querySelectorAll('[placeholder], [title]').forEach(element => {
-        ['placeholder', 'title'].forEach(attribute => {
+      root.querySelectorAll('[placeholder], [title], [aria-label]').forEach(element => {
+        ['placeholder', 'title', 'aria-label'].forEach(attribute => {
           if (!element.hasAttribute(attribute)) return;
-          const dataKey = `i18n${attribute[0].toUpperCase()}${attribute.slice(1)}`;
+          const dataKey = `i18n${attribute.replace(/(^|-)([a-z])/g, (_, __, letter) => letter.toUpperCase())}`;
           if (!element.dataset[dataKey]) element.dataset[dataKey] = element.getAttribute(attribute);
           const source = element.dataset[dataKey];
           element.setAttribute(attribute, currentLanguage === 'en' ? (TRANSLATIONS[source] || source) : source);
@@ -1151,6 +1286,92 @@
 
     function iconMarkup(name) {
       return `<svg class="icon" aria-hidden="true"><use href="#i-${name}"></use></svg>`;
+    }
+
+    function normalizeNodeName(value) {
+      let text = String(value || '');
+      if (/%[0-9a-f]{2}/i.test(text)) {
+        try { text = decodeURIComponent(text); } catch (_) {}
+      }
+      return typeof text.normalize === 'function' ? text.normalize('NFC') : text;
+    }
+
+    function getNodeDisplayName(node) {
+      return normalizeNodeName((node && (node.name || node.tag)) || '');
+    }
+
+    function getNodeRegion(node) {
+      const reported = String((node && node.region) || '').toLowerCase();
+      if (reported && reported !== 'other' && reported !== 'unknown') return reported;
+      const searchable = [node && node.name, node && node.tag, node && node.country].map(normalizeNodeName).join(' ');
+      for (const [region, pattern] of REGION_NAME_PATTERNS) {
+        if (pattern.test(searchable)) return region;
+      }
+      return 'other';
+    }
+
+    function getNodeStatusRank(node) {
+      if (node.blacklisted) return 3;
+      if ((node.last_latency_ms || -1) < 0) return 2;
+      if ((node.failure_count || 0) > 0) return 1;
+      return 0;
+    }
+
+    function compareValues(left, right) {
+      const leftMissing = left === null || left === undefined || Number.isNaN(left);
+      const rightMissing = right === null || right === undefined || Number.isNaN(right);
+      if (leftMissing || rightMissing) return leftMissing === rightMissing ? 0 : (leftMissing ? 1 : -1);
+      if (typeof left === 'number' && typeof right === 'number') return left - right;
+      return String(left).localeCompare(String(right), currentLanguage === 'en' ? 'en' : 'zh-CN', { numeric: true, sensitivity: 'base' });
+    }
+
+    function sortRows(rows, state, valueForKey) {
+      const direction = state.sortDir === 'desc' ? -1 : 1;
+      return rows.map((row, index) => ({ row, index })).sort((a, b) => {
+        const result = compareValues(valueForKey(a.row, state.sortKey), valueForKey(b.row, state.sortKey));
+        return result === 0 ? a.index - b.index : result * direction;
+      }).map(item => item.row);
+    }
+
+    function updateSortIndicators(tableName, state) {
+      document.querySelectorAll(`.sort-button[data-sort-table="${tableName}"]`).forEach(button => {
+        const active = button.dataset.sortKey === state.sortKey;
+        const header = button.closest('th');
+        if (header) header.setAttribute('aria-sort', active ? (state.sortDir === 'asc' ? 'ascending' : 'descending') : 'none');
+        const use = button.querySelector('use');
+        if (use) use.setAttribute('href', active ? (state.sortDir === 'asc' ? '#i-chevron-up' : '#i-chevron-down') : '#i-sort');
+      });
+    }
+
+    function pageSlice(rows, state) {
+      const pageCount = Math.max(1, Math.ceil(rows.length / state.pageSize));
+      state.page = Math.min(Math.max(1, state.page), pageCount);
+      const start = (state.page - 1) * state.pageSize;
+      return { rows: rows.slice(start, start + state.pageSize), start, pageCount };
+    }
+
+    function updatePagination(prefix, total, state, start, pageCount) {
+      const info = document.getElementById(`${prefix}PageInfo`);
+      const prev = document.getElementById(`${prefix}PrevPage`);
+      const next = document.getElementById(`${prefix}NextPage`);
+      const visibleStart = total ? start + 1 : 0;
+      const visibleEnd = Math.min(total, start + state.pageSize);
+      if (info) info.textContent = `${visibleStart}–${visibleEnd} / ${total} · ${state.page}/${pageCount}`;
+      if (prev) prev.disabled = state.page <= 1;
+      if (next) next.disabled = state.page >= pageCount;
+    }
+
+    function toggleSensitiveField(fieldId, button) {
+      const field = document.getElementById(fieldId);
+      if (!field) return;
+      const reveal = button.getAttribute('aria-pressed') !== 'true';
+      if (field.tagName === 'TEXTAREA') field.classList.toggle('masked', !reveal);
+      else field.type = reveal ? 'text' : 'password';
+      button.setAttribute('aria-pressed', String(reveal));
+      button.setAttribute('aria-label', tr(reveal ? '隐藏敏感信息' : '显示敏感信息'));
+      button.setAttribute('title', tr(reveal ? '隐藏敏感信息' : '显示敏感信息'));
+      const use = button.querySelector('use');
+      if (use) use.setAttribute('href', reveal ? '#i-eye-off' : '#i-eye');
     }
 
     function syncAutoRefreshButton() {
@@ -1283,6 +1504,10 @@
       const div = document.createElement('div'); div.textContent = text; return div.innerHTML;
     }
 
+    function inlineStringArg(value) {
+      return JSON.stringify(String(value || '')).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
     async function refresh() {
       try {
         const res = await fetch('/api/nodes');
@@ -1310,12 +1535,26 @@
     function initEchart(id) {
       const el = document.getElementById(id);
       if(!el) return null;
-      let chart = echarts.getInstanceByDom(el);
-      if(!chart) chart = echarts.init(el, null, { renderer: 'canvas' });
-      return chart;
+      try {
+        let chart = echarts.getInstanceByDom(el);
+        if(!chart) chart = echarts.init(el, null, { renderer: 'canvas' });
+        return chart;
+      } catch (error) {
+        console.error(`Failed to initialize chart ${id}:`, error && error.stack ? error.stack : error);
+        return null;
+      }
     }
 
     function getCssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+    function setChartOption(chart, option, chartId) {
+      if (!chart) return;
+      try {
+        chart.setOption(option);
+      } catch (error) {
+        console.error(`Failed to update chart ${chartId}:`, error && error.stack ? error.stack : error);
+      }
+    }
 
     function updateDashboardCharts() {
       if(!regionChartInst) regionChartInst = initEchart('regionChart');
@@ -1326,7 +1565,7 @@
       // 1. Region Chart Data
       const regionStats = {};
       allNodesCache.forEach(n => {
-        const r = (n.region || 'other').toUpperCase();
+        const r = getNodeRegion(n).toUpperCase();
         if(!regionStats[r]) regionStats[r] = { total: 0, healthy: 0 };
         regionStats[r].total++;
         if(!n.blacklisted && n.initial_check_done && n.available) {
@@ -1340,8 +1579,9 @@
         itemStyle: { color: regionStats[k].healthy === 0 ? getCssVar('--error') : (regionStats[k].healthy < regionStats[k].total ? getCssVar('--chart-secondary') : getCssVar('--chart-primary')) }
       }));
 
-      regionChartInst && regionChartInst.setOption({
+      setChartOption(regionChartInst, {
         backgroundColor: 'transparent',
+        textStyle: { fontFamily: CHART_FONT_FAMILY },
         tooltip: { trigger: 'item',
           backgroundColor: getCssVar('--bg-panel'), borderColor: getCssVar('--border'), textStyle: { color: getCssVar('--text-main') },
           formatter: (params) => {
@@ -1357,21 +1597,22 @@
           emphasis: { label: { show: true, fontSize: '20', fontWeight: 'bold', color: getCssVar('--text-main') } },
           data: regionData
         }]
-      });
+      }, 'regionChart');
 
       // 2. Latency Chart Data
       const sorted = allNodesCache.filter(n => n.last_latency_ms > 0 && !n.blacklisted).sort((a,b) => a.last_latency_ms - b.last_latency_ms).slice(0, 10);
-      const latencyX = sorted.map(n => n.name || n.tag);
+      const latencyX = sorted.map(getNodeDisplayName);
       const latencyY = sorted.map(n => n.last_latency_ms);
 
-      latencyChartInst && latencyChartInst.setOption({
+      setChartOption(latencyChartInst, {
         backgroundColor: 'transparent',
+        textStyle: { fontFamily: CHART_FONT_FAMILY },
         tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' }, backgroundColor: getCssVar('--bg-panel'), borderColor: getCssVar('--border'), textStyle: { color: getCssVar('--text-main') } },
         grid: { left: '3%', right: '4%', bottom: '5%', top: '25%', containLabel: true },
         xAxis: { type: 'value', splitLine: { lineStyle: { color: getCssVar('--border'), type: 'dashed' } }, axisLabel: { color: getCssVar('--text-muted'), formatter: '{value} ms' } },
-        yAxis: { type: 'category', data: latencyX.reverse(), axisLabel: { color: getCssVar('--text-muted'), width: 90, overflow: 'truncate' } },
+        yAxis: { type: 'category', data: latencyX.slice().reverse(), axisLabel: { color: getCssVar('--text-muted'), width: 110, overflow: 'truncate', fontFamily: CHART_FONT_FAMILY } },
         series: [{
-          name: tr('延迟'), type: 'bar', data: latencyY.reverse(),
+          name: tr('延迟'), type: 'bar', data: latencyY.slice().reverse(),
           itemStyle: {
             color: new echarts.graphic.LinearGradient(1, 0, 0, 0, [
               { offset: 0, color: getCssVar('--chart-secondary') },
@@ -1380,13 +1621,14 @@
             borderRadius: [0, 4, 4, 0]
           }
         }]
-      });
+      }, 'latencyChart');
 
       // 3. Traffic Chart
       if(!trafficChartInst) {
         trafficChartInst = initEchart('trafficChart');
         trafficChartInst.setOption({
           backgroundColor: 'transparent',
+          textStyle: { fontFamily: CHART_FONT_FAMILY },
           tooltip: { trigger: 'axis', backgroundColor: getCssVar('--bg-panel'), borderColor: getCssVar('--border'), textStyle: { color: getCssVar('--text-main') },
             formatter: function(p) {
               return p[0].axisValue + '<br/>' + p.map(s => s.marker + s.seriesName + ': ' + formatBytes(s.value) + '/s').join('<br/>');
@@ -1449,17 +1691,64 @@
     }
 
     function filterByRegion(region) {
+      if (currentRegionFilter !== region) nodeTableState.page = 1;
       currentRegionFilter = region;
       document.querySelectorAll('.region-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.region === region));
-      const flt = region === 'all' ? allNodesCache : allNodesCache.filter(n => (n.region||'other') === region);
-      renderNodes(flt);
+      renderNodes();
     }
 
-    function renderNodes(nodes) {
+    function setNodeSearch(value) {
+      nodeTableState.search = normalizeNodeName(value).trim().toLocaleLowerCase();
+      nodeTableState.page = 1;
+      renderNodes();
+    }
+
+    function setNodePageSize(value) {
+      nodeTableState.pageSize = Math.max(1, parseInt(value, 10) || 50);
+      nodeTableState.page = 1;
+      renderNodes();
+    }
+
+    function changeNodePage(delta) {
+      nodeTableState.page += delta;
+      renderNodes();
+    }
+
+    function sortNodeTable(key) {
+      if (nodeTableState.sortKey === key) nodeTableState.sortDir = nodeTableState.sortDir === 'asc' ? 'desc' : 'asc';
+      else { nodeTableState.sortKey = key; nodeTableState.sortDir = key === 'name' || key === 'region' ? 'asc' : 'desc'; }
+      nodeTableState.page = 1;
+      renderNodes();
+    }
+
+    function nodeSortValue(node, key) {
+      switch (key) {
+        case 'status': return getNodeStatusRank(node);
+        case 'region': return getNodeRegion(node);
+        case 'name': return getNodeDisplayName(node);
+        case 'port': return Number(node.port) || null;
+        case 'latency': return Number(node.last_latency_ms) > 0 ? Number(node.last_latency_ms) : null;
+        case 'connections': return Number(node.active_connections) || 0;
+        case 'failures': return Number(node.failure_count) || 0;
+        default: return getNodeDisplayName(node);
+      }
+    }
+
+    function renderNodes() {
       const tbody = document.getElementById('nodesTableBody');
-      if (!nodes.length) { tbody.innerHTML = ''; document.getElementById('emptyState').style.display='block'; return;}
+      const query = nodeTableState.search;
+      let nodes = allNodesCache.filter(node => currentRegionFilter === 'all' || getNodeRegion(node) === currentRegionFilter);
+      if (query) {
+        nodes = nodes.filter(node => [getNodeDisplayName(node), node.tag, getNodeRegion(node), node.country, node.port]
+          .map(normalizeNodeName).join(' ').toLocaleLowerCase().includes(query));
+      }
+      nodes = sortRows(nodes, nodeTableState, nodeSortValue);
+      const page = pageSlice(nodes, nodeTableState);
+      updatePagination('node', nodes.length, nodeTableState, page.start, page.pageCount);
+      updateSortIndicators('nodes', nodeTableState);
+      if (!page.rows.length) { tbody.innerHTML = ''; document.getElementById('emptyState').style.display='block'; return;}
       document.getElementById('emptyState').style.display='none';
-      tbody.innerHTML = nodes.map(n => {
+      tbody.innerHTML = page.rows.map(n => {
         const ms = n.last_latency_ms || -1;
         let badge = '', statusText = '';
         if (n.blacklisted) { badge = 'badge-error'; statusText = tr('拉黑 Blocked'); }
@@ -1469,9 +1758,9 @@
 
         return `<tr>
           <td><span class="badge ${badge}">${statusText}</span></td>
-          <td><span style="display:inline-flex;align-items:center;gap:6px">${iconMarkup('map')} ${(n.region||'other').toUpperCase()}</span></td>
+          <td><span style="display:inline-flex;align-items:center;gap:6px">${iconMarkup('map')} ${getNodeRegion(n).toUpperCase()}</span></td>
           <td>
-            <div style="font-weight: 500">${escapeHtml(n.name || n.tag)}</div>
+            <div style="font-weight: 500">${escapeHtml(getNodeDisplayName(n))}</div>
             <div style="font-size: 11px; color: var(--text-muted)">${escapeHtml(n.tag)}</div>
           </td>
           <td class="tt-mono">${n.port || '-'}</td>
@@ -1484,8 +1773,8 @@
           <td class="tt-mono">${n.active_connections||0}</td>
           <td class="tt-mono" style="color: ${n.failure_count>0 ? 'var(--error)' : 'inherit'}">${n.failure_count||0}</td>
           <td>
-            <button type="button" class="btn btn-sm" onclick="probeNode('${escapeHtml(n.tag)}')">${iconMarkup('search')}<span>${tr('探测')}</span></button>
-            ${n.blacklisted ? `<button type="button" class="btn btn-sm btn-primary" onclick="releaseNode('${escapeHtml(n.tag)}')">${iconMarkup('unlock')}<span>${tr('解封')}</span></button>` : `<button type="button" class="btn btn-sm btn-danger" onclick="blacklistNode('${escapeHtml(n.tag)}')">${iconMarkup('ban')}<span>${tr('拉黑')}</span></button>`}
+            <button type="button" class="btn btn-sm" onclick="probeNode(${inlineStringArg(n.tag)})">${iconMarkup('search')}<span>${tr('探测')}</span></button>
+            ${n.blacklisted ? `<button type="button" class="btn btn-sm btn-primary" onclick="releaseNode(${inlineStringArg(n.tag)})">${iconMarkup('unlock')}<span>${tr('解封')}</span></button>` : `<button type="button" class="btn btn-sm btn-danger" onclick="blacklistNode(${inlineStringArg(n.tag)})">${iconMarkup('ban')}<span>${tr('拉黑')}</span></button>`}
           </td>
         </tr>`;
       }).join('');
@@ -1597,24 +1886,53 @@
     }
 
     // Manage Nodes
+    function setConfigNodeSearch(value) {
+      configNodeTableState.search = normalizeNodeName(value).trim().toLocaleLowerCase();
+      configNodeTableState.page = 1;
+      renderConfigNodes();
+    }
+
+    function setConfigNodePageSize(value) {
+      configNodeTableState.pageSize = Math.max(1, parseInt(value, 10) || 50);
+      configNodeTableState.page = 1;
+      renderConfigNodes();
+    }
+
+    function changeConfigNodePage(delta) {
+      configNodeTableState.page += delta;
+      renderConfigNodes();
+    }
+
+    function renderConfigNodes() {
+      const query = configNodeTableState.search;
+      let nodes = configNodes;
+      if (query) {
+        nodes = nodes.filter(node => [node.name, node.uri, node.port, node.source]
+          .map(normalizeNodeName).join(' ').toLocaleLowerCase().includes(query));
+      }
+      const page = pageSlice(nodes, configNodeTableState);
+      updatePagination('configNode', nodes.length, configNodeTableState, page.start, page.pageCount);
+      const tbody = document.getElementById('configNodesTableBody');
+      tbody.innerHTML = page.rows.length ? page.rows.map(n => `
+        <tr>
+          <td><strong>${escapeHtml(normalizeNodeName(n.name))}</strong></td>
+          <td class="tt-mono" style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(n.uri)}</td>
+          <td class="tt-mono">${n.port || '-'}</td>
+          <td><span class="badge ${n.source==='subscription'?'badge-warning':'badge-healthy'}">${n.source||'manual'}</span></td>
+          <td>
+            <button type="button" class="btn btn-sm" onclick="showEditNodeModal(${inlineStringArg(n.name)})">${iconMarkup('edit')}<span>${tr('编辑')}</span></button>
+            <button type="button" class="btn btn-sm btn-danger" onclick="deleteNode(${inlineStringArg(n.name)})">${iconMarkup('trash')}<span>${tr('删除')}</span></button>
+          </td>
+        </tr>
+      `).join('') : `<tr><td colspan="5" style="text-align:center;color:var(--text-muted)">${tr('暂无数据')}</td></tr>`;
+    }
+
     async function loadConfigNodes() {
       try {
         const res = await fetch('/api/nodes/config');
         const data = await res.json();
         configNodes = data.nodes || [];
-        const tbody = document.getElementById('configNodesTableBody');
-        tbody.innerHTML = configNodes.map((n, i) => `
-          <tr>
-            <td><strong>${escapeHtml(n.name)}</strong></td>
-            <td class="tt-mono" style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(n.uri)}</td>
-            <td class="tt-mono">${n.port || '-'}</td>
-            <td><span class="badge ${n.source==='subscription'?'badge-warning':'badge-healthy'}">${n.source||'manual'}</span></td>
-            <td>
-              <button type="button" class="btn btn-sm" onclick="showEditNodeModal('${escapeHtml(n.name)}')">${iconMarkup('edit')}<span>${tr('编辑')}</span></button>
-              <button type="button" class="btn btn-sm btn-danger" onclick="deleteNode('${escapeHtml(n.name)}')">${iconMarkup('trash')}<span>${tr('删除')}</span></button>
-            </td>
-          </tr>
-        `).join('');
+        renderConfigNodes();
         document.getElementById('subscriptionWarning').style.display = configNodes.some(n=>n.source==='subscription') ? 'block' : 'none';
       } catch(e){}
     }
@@ -1650,6 +1968,66 @@
     }
 
     // Debug
+    function setDebugNodeSearch(value) {
+      debugTableState.search = normalizeNodeName(value).trim().toLocaleLowerCase();
+      debugTableState.page = 1;
+      renderDebugNodes();
+    }
+
+    function setDebugNodePageSize(value) {
+      debugTableState.pageSize = Math.max(1, parseInt(value, 10) || 50);
+      debugTableState.page = 1;
+      renderDebugNodes();
+    }
+
+    function changeDebugNodePage(delta) {
+      debugTableState.page += delta;
+      renderDebugNodes();
+    }
+
+    function sortDebugTable(key) {
+      if (debugTableState.sortKey === key) debugTableState.sortDir = debugTableState.sortDir === 'asc' ? 'desc' : 'asc';
+      else { debugTableState.sortKey = key; debugTableState.sortDir = key === 'name' ? 'asc' : 'desc'; }
+      debugTableState.page = 1;
+      renderDebugNodes();
+    }
+
+    function debugNodeSuccessRate(node) {
+      const calls = (node.success_count || 0) + (node.failure_count || 0);
+      return calls ? (node.success_count || 0) / calls * 100 : 0;
+    }
+
+    function debugSortValue(node, key) {
+      switch (key) {
+        case 'successRate': return debugNodeSuccessRate(node);
+        case 'calls': return (node.success_count || 0) + (node.failure_count || 0);
+        case 'connections': return Number(node.active_connections) || 0;
+        default: return getNodeDisplayName(node);
+      }
+    }
+
+    function renderDebugNodes() {
+      const query = debugTableState.search;
+      let nodes = window._debugNodes || [];
+      if (query) nodes = nodes.filter(node => [getNodeDisplayName(node), node.tag].map(normalizeNodeName).join(' ').toLocaleLowerCase().includes(query));
+      nodes = sortRows(nodes, debugTableState, debugSortValue);
+      const page = pageSlice(nodes, debugTableState);
+      updatePagination('debugNode', nodes.length, debugTableState, page.start, page.pageCount);
+      updateSortIndicators('debug', debugTableState);
+      const tb = document.getElementById('debugNodesTableBody');
+      tb.innerHTML = page.rows.length ? page.rows.map(n => {
+        const sr = debugNodeSuccessRate(n).toFixed(1);
+        const tl = (n.timeline||[]).map(t => `<div class="tl-dot ${t.success?'success':'error'}" title="${t.latency_ms}ms"></div>`).join('');
+        return `<tr>
+          <td><strong>${escapeHtml(getNodeDisplayName(n))}</strong><br><span style="font-size:11px;color:var(--text-muted)">${escapeHtml(n.tag)}</span></td>
+          <td class="tt-mono ${sr>80?'':'badge-error'}">${sr}%</td>
+          <td class="tt-mono"><span style="color:var(--success)">${n.success_count||0}</span> / <span style="color:var(--error)">${n.failure_count||0}</span></td>
+          <td class="tt-mono">${n.active_connections||0}</td>
+          <td><div class="timeline">${tl||'-'}</div></td>
+        </tr>`;
+      }).join('') : `<tr><td colspan="5" style="text-align:center;color:var(--text-muted)">${tr('暂无数据')}</td></tr>`;
+    }
+
     async function loadDebugData() {
       try {
         const res = await fetch('/api/debug');
@@ -1657,21 +2035,8 @@
         document.getElementById('debugTotalCalls').textContent = d.total_calls||0;
         document.getElementById('debugTotalSuccess').textContent = d.total_success||0;
         document.getElementById('debugSuccessRate').textContent = (d.success_rate||0).toFixed(1)+'%';
-        const tb = document.getElementById('debugNodesTableBody');
-        tb.innerHTML = (d.nodes||[]).map(n => {
-          const calls = (n.success_count||0)+(n.failure_count||0);
-          const sr = calls>0 ? ((n.success_count||0)/calls*100).toFixed(1) : 0;
-          const tl = (n.timeline||[]).map(t => `<div class="tl-dot ${t.success?'success':'error'}" title="${t.latency_ms}ms"></div>`).join('');
-          return `<tr>
-            <td><strong>${escapeHtml(n.name)}</strong><br><span style="font-size:11px;color:var(--text-muted)">${escapeHtml(n.tag)}</span></td>
-            <td class="tt-mono ${sr>80?'':'badge-error'}">${sr}%</td>
-            <td class="tt-mono"><span style="color:var(--success)">${n.success_count||0}</span> / <span style="color:var(--error)">${n.failure_count||0}</span></td>
-            <td class="tt-mono">${n.active_connections||0}</td>
-            <td><div class="timeline">${tl||'-'}</div></td>
-          </tr>`
-        }).join('');
-        
         window._debugNodes = d.nodes || [];
+        renderDebugNodes();
         updateDebugCharts(d.success_rate || 0);
 
       } catch(e){}
@@ -1695,6 +2060,7 @@
 
       successRateChartInst && successRateChartInst.setOption({
         backgroundColor: 'transparent',
+        textStyle: { fontFamily: CHART_FONT_FAMILY },
         series: [{
           type: 'gauge',
           startAngle: 180, endAngle: 0,
@@ -1714,14 +2080,15 @@
       // Top failures
       if (!window._debugNodes) return;
       const failSorted = window._debugNodes.filter(n => (n.failure_count||0) > 0).sort((a,b) => (b.failure_count||0) - (a.failure_count||0)).slice(0, 10);
-      const failX = failSorted.map(n => n.name || n.tag);
+      const failX = failSorted.map(getNodeDisplayName);
       const failY = failSorted.map(n => n.failure_count);
 
       failureChartInst && failureChartInst.setOption({
         backgroundColor: 'transparent',
+        textStyle: { fontFamily: CHART_FONT_FAMILY },
         tooltip: { trigger: 'axis', backgroundColor: getCssVar('--bg-panel'), borderColor: getCssVar('--border'), textStyle: { color: getCssVar('--text-main') } },
         grid: { left: '3%', right: '4%', bottom: '5%', top: '25%', containLabel: true },
-        xAxis: { type: 'category', data: failX, axisLabel: { color: getCssVar('--text-muted'), width: 60, overflow: 'truncate' } },
+        xAxis: { type: 'category', data: failX, axisLabel: { color: getCssVar('--text-muted'), width: 80, overflow: 'truncate', fontFamily: CHART_FONT_FAMILY } },
         yAxis: { type: 'value', splitLine: { lineStyle: { color: getCssVar('--border'), type: 'dashed' } }, axisLabel: { color: getCssVar('--text-muted') } },
         series: [{
           name: tr('调用失败'), type: 'bar', data: failY,
@@ -1947,21 +2314,43 @@
     function stopLogPolling() {
       if (logPollInterval) { clearInterval(logPollInterval); logPollInterval = null; }
     }
+
+    function classifyLogLine(line) {
+      const match = line.match(/\b(TRACE|DEBUG|INFO|WARN(?:ING)?|ERROR|FATAL|PANIC)\b/i);
+      if (!match) return 'info';
+      const level = match[1].toLowerCase();
+      return level === 'warning' ? 'warn' : level;
+    }
+
+    function renderConsoleLogs(payload) {
+      if (payload === _lastLogsPayload) return;
+      _lastLogsPayload = payload;
+      const viewer = document.getElementById('consoleLogs');
+      const autoScroll = document.getElementById('autoScrollLogs').checked;
+      const previousTop = viewer.scrollTop;
+      const fragment = document.createDocumentFragment();
+      String(payload || '').replace(/\u001b\[[0-?]*[ -\/]*[@-~]/g, '').split('\n').forEach(line => {
+        const level = classifyLogLine(line);
+        const row = document.createElement('span');
+        row.className = `log-line log-${level}`;
+        row.dataset.level = level;
+        const badge = document.createElement('span');
+        badge.className = 'log-level';
+        badge.textContent = level.toUpperCase();
+        const message = document.createElement('span');
+        message.textContent = line;
+        row.append(badge, message);
+        fragment.appendChild(row);
+      });
+      viewer.replaceChildren(fragment);
+      viewer.scrollTop = autoScroll ? viewer.scrollHeight : previousTop;
+    }
+
     async function pollLogs() {
       try {
         const r = await fetch('/api/logs');
         const d = await r.json();
-        if (d.logs) {
-          const ta = document.getElementById('consoleLogs');
-          const autoScroll = document.getElementById('autoScrollLogs').checked;
-          const prevTop = ta.scrollTop;
-          ta.value = d.logs;
-          if (autoScroll) {
-             ta.scrollTop = ta.scrollHeight;
-          } else {
-             ta.scrollTop = prevTop;
-          }
-        }
+        renderConsoleLogs(d.logs || '');
       } catch(e){}
     }
 
