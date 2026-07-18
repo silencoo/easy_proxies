@@ -432,7 +432,10 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 
 func (p *poolOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	maxAttempts := p.maxAttempts(ctx)
-	tried := make(map[string]struct{}, maxAttempts)
+	var tried map[string]struct{}
+	if maxAttempts > 1 {
+		tried = make(map[string]struct{}, maxAttempts)
+	}
 	stickyKey := p.stickyKeyFromContext(ctx)
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -454,7 +457,9 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 			return nil, ctx.Err()
 		}
 		p.recordFailure(member, err)
-		tried[member.tag] = struct{}{}
+		if attempt < maxAttempts {
+			tried[member.tag] = struct{}{}
+		}
 		if stickyKey != "" {
 			p.sticky.delete(stickyKey)
 		}
@@ -465,7 +470,10 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 
 func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	maxAttempts := p.maxAttempts(ctx)
-	tried := make(map[string]struct{}, maxAttempts)
+	var tried map[string]struct{}
+	if maxAttempts > 1 {
+		tried = make(map[string]struct{}, maxAttempts)
+	}
 	stickyKey := p.stickyKeyFromContext(ctx)
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -487,7 +495,9 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 			return nil, ctx.Err()
 		}
 		p.recordFailure(member, err)
-		tried[member.tag] = struct{}{}
+		if attempt < maxAttempts {
+			tried[member.tag] = struct{}{}
+		}
 		if stickyKey != "" {
 			p.sticky.delete(stickyKey)
 		}
@@ -650,7 +660,7 @@ func (p *poolOutbound) releaseIfAllBlacklisted() bool {
 	}
 	now := time.Now()
 	for _, member := range p.members {
-		if member.shared == nil || !member.shared.isBlacklisted(now) {
+		if member.shared == nil || !member.shared.isBlocked(now) {
 			return false
 		}
 	}
