@@ -93,6 +93,7 @@ management:
   enabled: true
   listen: 0.0.0.0:9091
   probe_target: http://cp.cloudflare.com/generate_204
+  probe_concurrency: 32  # process-wide batch probe workers (1-1024)
   password: ""
 
 dns:

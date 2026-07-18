@@ -18,7 +18,7 @@ Easy Proxies 是一个基于 sing-box 的代理池管理工具。
 - Web 管理面板 + API：
   - 节点状态/探测/导出
   - **手动拉黑/解封节点**
-  - 动态设置（`external_ip`、`probe_target`、`skip_cert_verify`、`geoip`）
+  - 动态设置（`external_ip`、`probe_target`、`probe_concurrency`、`skip_cert_verify`、`geoip`）
   - 节点配置增删改查 + 重载
   - 订阅状态查询 + 手动刷新 + **保存即时生效**
   - **实时日志控制台**（最近 1000 行，WebSocket 流式传输）
@@ -75,6 +75,7 @@ management:
   enabled: true
   listen: 0.0.0.0:9091
   probe_target: http://cp.cloudflare.com/generate_204
+  probe_concurrency: 32  # 全局批量探测并发数（1-1024）
   password: ""
 
 dns:

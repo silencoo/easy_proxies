@@ -3,6 +3,7 @@ package pool
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"math/rand"
@@ -264,10 +265,6 @@ func (p *poolOutbound) Start(stage adapter.StartStage) error {
 	// pre-validate reloads while the old instance is still serving traffic; it
 	// must not replace live monitor callbacks or GeoIP dialers.
 	registerDialer(p.Tag(), p)
-	// 在初始化完成后，立即在后台触发健康检查
-	if p.monitor != nil && !p.options.SkipStartupProbe {
-		go p.probeAllMembersOnStartup()
-	}
 	return nil
 }
 
@@ -331,103 +328,6 @@ func (p *poolOutbound) initializeMembersLocked() error {
 	p.logger.Info("pool initialized with ", len(members), " members")
 
 	return nil
-}
-
-// probeAllMembersOnStartup performs initial health checks on all members
-func (p *poolOutbound) probeAllMembersOnStartup() {
-	destination, ok := p.monitor.DestinationForProbe()
-	if !ok {
-		p.logger.Warn("probe target not configured, skipping initial health check")
-		// 没有配置探测目标时，标记所有节点为可用
-		p.mu.Lock()
-		for _, member := range p.members {
-			if member.entry != nil {
-				member.entry.MarkInitialCheckDone(true)
-			}
-			if member.shared != nil {
-				member.shared.persist()
-			}
-		}
-		p.mu.Unlock()
-		return
-	}
-
-	p.logger.Info("starting initial health check for all nodes")
-
-	p.mu.Lock()
-	members := make([]*memberState, len(p.members))
-	copy(members, p.members)
-	p.mu.Unlock()
-
-	// Concurrent probing with bounded workers
-	const maxWorkers = 20
-	type probeResult struct {
-		member  *memberState
-		success bool
-		latency time.Duration
-		err     error
-	}
-
-	results := make(chan probeResult, len(members))
-	sem := make(chan struct{}, maxWorkers)
-
-	for _, member := range members {
-		sem <- struct{}{} // acquire worker slot
-		go func(m *memberState) {
-			defer func() { <-sem }() // release worker slot
-
-			ctx, cancel := context.WithTimeout(p.ctx, 15*time.Second)
-			defer cancel()
-
-			start := time.Now()
-			conn, err := m.outbound.DialContext(ctx, N.NetworkTCP, destination)
-			if err != nil {
-				results <- probeResult{member: m, err: err}
-				return
-			}
-
-			_, err = httpProbe(conn, destination.AddrString())
-			conn.Close()
-			if err != nil {
-				results <- probeResult{member: m, err: err}
-				return
-			}
-
-			results <- probeResult{member: m, success: true, latency: time.Since(start)}
-		}(member)
-	}
-
-	// Collect results
-	availableCount := 0
-	failedCount := 0
-	for i := 0; i < len(members); i++ {
-		res := <-results
-		if res.err != nil {
-			p.logger.Warn("initial probe failed for ", res.member.tag, ": ", res.err)
-			failedCount++
-			if res.member.entry != nil {
-				res.member.entry.MarkInitialCheckDone(false)
-			}
-			if res.member.shared != nil {
-				res.member.shared.recordFailure(res.err, 1, p.options.BlacklistDuration, p.options.TransientCooldown)
-			} else if res.member.entry != nil {
-				res.member.entry.RecordFailure(res.err)
-			}
-		} else {
-			latencyMs := res.latency.Milliseconds()
-			p.logger.Info("initial probe success for ", res.member.tag, ", latency: ", latencyMs, "ms")
-			availableCount++
-			if res.member.entry != nil {
-				res.member.entry.RecordSuccessWithLatency(res.latency)
-				res.member.entry.MarkInitialCheckDone(true)
-			}
-			if res.member.shared != nil {
-				res.member.shared.forceRelease()
-			}
-		}
-	}
-
-	p.logger.Info("initial health check completed: ", availableCount, " available, ", failedCount, " failed")
 }
 
 func (p *poolOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
@@ -854,6 +754,9 @@ func (p *poolOutbound) recordFailure(member *memberState, cause error) {
 }
 
 func (p *poolOutbound) recordProbeFailure(member *memberState, cause error) {
+	if member.entry != nil {
+		member.entry.MarkInitialCheckDone(false)
+	}
 	if member.shared != nil {
 		// An explicit active probe is authoritative; exclude the node from the
 		// shared pool immediately instead of waiting for traffic failures.
@@ -889,14 +792,31 @@ func (p *poolOutbound) makeReleaseFunc(member *memberState) func() {
 	}
 }
 
+func upgradeProbeConn(ctx context.Context, conn net.Conn, target monitor.ProbeTarget) (net.Conn, error) {
+	if !target.TLS {
+		return conn, nil
+	}
+	tlsConn := tls.Client(conn, &tls.Config{
+		ServerName:         target.Host,
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: target.SkipCertVerify, // Explicit user setting for HTTPS probes.
+	})
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		return conn, fmt.Errorf("TLS handshake: %w", err)
+	}
+	return tlsConn, nil
+}
+
 // httpProbe performs an HTTP probe through the connection and measures TTFB.
-// It sends a minimal HTTP request and waits for the first byte of response.
-func httpProbe(conn net.Conn, host string) (time.Duration, error) {
+func httpProbe(ctx context.Context, conn net.Conn, host string) (time.Duration, error) {
 	// Build HTTP request
 	req := fmt.Sprintf("GET /generate_204 HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: Mozilla/5.0\r\n\r\n", host)
 
-	// Try to set write deadline (ignore errors for connections that don't support it)
-	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	deadline := time.Now().Add(10 * time.Second)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	_ = conn.SetDeadline(deadline)
 
 	// Record time just before sending request
 	start := time.Now()
@@ -905,9 +825,6 @@ func httpProbe(conn net.Conn, host string) (time.Duration, error) {
 	if _, err := conn.Write([]byte(req)); err != nil {
 		return 0, fmt.Errorf("write request: %w", err)
 	}
-
-	// Try to set read deadline (ignore errors for connections that don't support it)
-	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 
 	// Read first byte (TTFB - Time To First Byte)
 	reader := bufio.NewReader(conn)
@@ -921,49 +838,69 @@ func httpProbe(conn net.Conn, host string) (time.Duration, error) {
 	return ttfb, nil
 }
 
+// probeMember force-closes the raw connection when the deadline fires. Some
+// sing-box wrappers ignore SetDeadline; closing the underlying connection is
+// what releases blocked reads/handshakes and their file descriptors.
+func (p *poolOutbound) probeMember(ctx context.Context, member *memberState, target monitor.ProbeTarget) (time.Duration, error) {
+	start := time.Now()
+	rawConn, err := member.outbound.DialContext(ctx, N.NetworkTCP, target.Destination)
+	if err != nil {
+		p.recordProbeFailure(member, err)
+		return 0, err
+	}
+	stopWatch := watchProbeConnection(ctx, rawConn)
+	defer stopWatch()
+	defer rawConn.Close()
+
+	conn, err := upgradeProbeConn(ctx, rawConn, target)
+	if err != nil {
+		p.recordProbeFailure(member, err)
+		return 0, err
+	}
+	host := target.Host
+	if target.Destination.Port != 80 && target.Destination.Port != 443 {
+		host = target.Destination.AddrString()
+	}
+	if _, err = httpProbe(ctx, conn, host); err != nil {
+		p.recordProbeFailure(member, err)
+		return 0, err
+	}
+
+	duration := time.Since(start)
+	if member.entry != nil {
+		member.entry.RecordSuccessWithLatency(duration)
+		member.entry.MarkInitialCheckDone(true)
+	}
+	if member.shared != nil {
+		// A successful active probe is authoritative and is persisted through
+		// shared state, making the node routable immediately.
+		member.shared.forceRelease()
+	}
+	return duration, nil
+}
+
+func watchProbeConnection(ctx context.Context, conn net.Conn) func() {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
+	return func() { close(done) }
+}
+
 func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Context) (time.Duration, error) {
 	if p.monitor == nil {
 		return nil
 	}
-	destination, ok := p.monitor.DestinationForProbe()
-	if !ok {
-		return nil
-	}
 	return func(ctx context.Context) (time.Duration, error) {
-		start := time.Now()
-		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
-		if err != nil {
-			if member.entry != nil {
-				member.entry.MarkInitialCheckDone(false)
-			}
-			p.recordProbeFailure(member, err)
-			return 0, err
+		target, ok := p.monitor.DestinationForProbe()
+		if !ok {
+			return 0, fmt.Errorf("probe target is not configured")
 		}
-		defer conn.Close()
-
-		// Perform HTTP probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, destination.AddrString())
-		if err != nil {
-			if member.entry != nil {
-				member.entry.MarkInitialCheckDone(false)
-			}
-			p.recordProbeFailure(member, err)
-			return 0, err
-		}
-
-		// Total duration = dial time + HTTP probe
-		duration := time.Since(start)
-		if member.entry != nil {
-			member.entry.RecordSuccessWithLatency(duration)
-			member.entry.MarkInitialCheckDone(true)
-		}
-		// Clear pool blacklist on successful probe — a node that passes
-		// health check should be available for selection immediately,
-		// not remain blacklisted for the full duration (fixes #8, #9).
-		if member.shared != nil {
-			member.shared.forceRelease()
-		}
-		return duration, nil
+		return p.probeMember(ctx, member, target)
 	}
 }
 

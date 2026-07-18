@@ -13,14 +13,12 @@ import (
 	mathrand "math/rand"
 	"net/http"
 	"net/url"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
 
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/geoip"
-	"golang.org/x/sync/semaphore"
 )
 
 //go:embed assets/index.html
@@ -82,9 +80,6 @@ type Server struct {
 	sessions   map[string]*Session
 	sessionTTL time.Duration
 
-	// Concurrency control
-	probeSem *semaphore.Weighted
-
 	subRefresher SubscriptionRefresher
 	nodeMgr      NodeManager
 }
@@ -98,19 +93,12 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 		logger = log.Default()
 	}
 
-	// Calculate max concurrent probes
-	maxConcurrentProbes := int64(runtime.NumCPU() * 4)
-	if maxConcurrentProbes < 10 {
-		maxConcurrentProbes = 10
-	}
-
 	s := &Server{
 		cfg:        cfg,
 		mgr:        mgr,
 		logger:     logger,
 		sessions:   make(map[string]*Session),
 		sessionTTL: 24 * time.Hour,
-		probeSem:   semaphore.NewWeighted(maxConcurrentProbes),
 	}
 
 	// Start session cleanup goroutine
@@ -172,6 +160,9 @@ func (s *Server) SetConfig(cfg *config.Config) {
 		s.cfg.ExternalIP = cfg.ExternalIP
 		s.cfg.ProbeTarget = cfg.Management.ProbeTarget
 		s.cfg.SkipCertVerify = cfg.SkipCertVerify
+		s.cfg.ProbeConcurrency = cfg.ProbeConcurrencyOrDefault()
+		s.mgr.SetProbeTarget(cfg.Management.ProbeTarget, cfg.SkipCertVerify)
+		s.mgr.SetProbeConcurrency(cfg.ProbeConcurrencyOrDefault())
 		// Sync proxy credentials based on mode
 		if cfg.Mode == "multi-port" || cfg.Mode == "hybrid" {
 			s.cfg.ProxyUsername = cfg.MultiPort.Username
@@ -195,13 +186,14 @@ func (s *Server) getSettings() (externalIP, probeTarget string, skipCertVerify b
 }
 
 // updateSettings updates dynamic settings and persists to config file.
-func (s *Server) updateSettings(externalIP, probeTarget string, skipCertVerify bool, logCfg *config.LogConfig, geoipEnabled bool) error {
+func (s *Server) updateSettings(externalIP, probeTarget string, skipCertVerify bool, probeConcurrency int, logCfg *config.LogConfig, geoipEnabled bool) error {
 	s.cfgMu.Lock()
 	defer s.cfgMu.Unlock()
 
 	s.cfg.ExternalIP = externalIP
 	s.cfg.ProbeTarget = probeTarget
 	s.cfg.SkipCertVerify = skipCertVerify
+	s.cfg.ProbeConcurrency = clampProbeConcurrency(probeConcurrency)
 
 	if s.cfgSrc == nil {
 		return errors.New("配置存储未初始化")
@@ -209,7 +201,10 @@ func (s *Server) updateSettings(externalIP, probeTarget string, skipCertVerify b
 
 	s.cfgSrc.ExternalIP = externalIP
 	s.cfgSrc.Management.ProbeTarget = probeTarget
+	s.cfgSrc.Management.ProbeConcurrency = clampProbeConcurrency(probeConcurrency)
 	s.cfgSrc.SkipCertVerify = skipCertVerify
+	s.mgr.SetProbeTarget(probeTarget, skipCertVerify)
+	s.mgr.SetProbeConcurrency(probeConcurrency)
 
 	// GeoIP settings
 	s.cfgSrc.GeoIP.Enabled = geoipEnabled
@@ -303,11 +298,19 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	sweepActive, sweepDone, sweepTotal, sweepOK, sweepFail := s.mgr.ProbeSweepProgress()
 	payload := map[string]any{
 		"nodes":          filtered,
 		"total_nodes":    totalNodes,
 		"region_stats":   regionStats,
 		"region_healthy": regionHealthy,
+		"probe_sweep": map[string]any{
+			"active":    sweepActive,
+			"done":      sweepDone,
+			"total":     sweepTotal,
+			"available": sweepOK,
+			"failed":    sweepFail,
+		},
 	}
 	writeJSON(w, payload)
 }
@@ -422,7 +425,9 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleProbeAll probes all nodes in batches and returns results via SSE
+// handleProbeAll joins the same process-wide single-flight sweep used by boot,
+// periodic checks and reload validation. It streams aggregate progress rather
+// than launching a second independent set of node probes.
 func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -440,9 +445,7 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get all nodes
-	snapshots := s.mgr.Snapshot()
-	total := len(snapshots)
+	total := len(s.mgr.Snapshot())
 	if total == 0 {
 		emptyData, _ := json.Marshal(map[string]any{"type": "complete", "total": 0, "success": 0, "failed": 0})
 		fmt.Fprintf(w, "data: %s\n\n", emptyData)
@@ -455,104 +458,60 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "data: %s\n\n", startData)
 	flusher.Flush()
 
-	// Create context with timeout
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
-	defer cancel()
-
-	// Probe all nodes with semaphore control
-	type probeResult struct {
-		tag     string
-		name    string
-		latency int64
-		err     string
-	}
-	results := make(chan probeResult, total)
-	var wg sync.WaitGroup
-
-	// Launch probes with semaphore control
-	for _, snap := range snapshots {
-		wg.Add(1)
-		go func(snap Snapshot) {
-			defer wg.Done()
-
-			// Acquire semaphore permit
-			if err := s.probeSem.Acquire(ctx, 1); err != nil {
-				results <- probeResult{
-					tag:  snap.Tag,
-					name: snap.Name,
-					err:  "probe cancelled: " + err.Error(),
-				}
-				return
-			}
-			defer s.probeSem.Release(1)
-
-			// Execute probe
-			probeCtx, probeCancel := context.WithTimeout(ctx, 10*time.Second)
-			defer probeCancel()
-
-			latency, err := s.mgr.Probe(probeCtx, snap.Tag)
-			if err != nil {
-				results <- probeResult{
-					tag:     snap.Tag,
-					name:    snap.Name,
-					latency: -1,
-					err:     err.Error(),
-				}
-			} else {
-				results <- probeResult{
-					tag:     snap.Tag,
-					name:    snap.Name,
-					latency: latency.Milliseconds(),
-					err:     "",
-				}
-			}
-		}(snap)
-	}
-
-	// Wait for all probes to complete
+	done := make(chan struct{})
 	go func() {
-		wg.Wait()
-		close(results)
+		s.mgr.ProbeAllNow(defaultProbeTimeout)
+		close(done)
 	}()
 
-	// Collect results
-	successCount := 0
-	failedCount := 0
-	count := 0
-
-	for result := range results {
-		count++
-		if result.err != "" {
-			failedCount++
-		} else {
-			successCount++
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	lastDone, lastTotal := -1, -1
+	lastOK, lastFail := -1, -1
+	sendProgress := func() (int, int, int, int) {
+		_, current, currentTotal, okCount, failCount := s.mgr.ProbeSweepProgress()
+		if current == lastDone && currentTotal == lastTotal && okCount == lastOK && failCount == lastFail {
+			return current, currentTotal, okCount, failCount
 		}
-
-		status := "success"
-		if result.err != "" {
-			status = "error"
+		lastDone, lastTotal, lastOK, lastFail = current, currentTotal, okCount, failCount
+		percent := float64(0)
+		if currentTotal > 0 {
+			percent = float64(current) / float64(currentTotal) * 100
 		}
-
-		eventPayload := map[string]any{
-			"type":     "progress",
-			"tag":      result.tag,
-			"name":     result.name,
-			"latency":  result.latency,
-			"status":   status,
-			"error":    result.err,
-			"current":  count,
-			"total":    total,
-			"progress": float64(count) / float64(total) * 100,
-		}
-		eventData, _ := json.Marshal(eventPayload)
-		fmt.Fprintf(w, "data: %s\n\n", eventData)
+		data, _ := json.Marshal(map[string]any{
+			"type": "progress", "current": current, "total": currentTotal,
+			"success": okCount, "failed": failCount, "progress": percent,
+		})
+		fmt.Fprintf(w, "data: %s\n\n", data)
 		flusher.Flush()
+		return current, currentTotal, okCount, failCount
 	}
 
-	// Send complete event
-	completeData, _ := json.Marshal(map[string]any{"type": "complete", "total": total, "success": successCount, "failed": failedCount})
-	fmt.Fprintf(w, "data: %s\n\n", completeData)
-	flusher.Flush()
+	for {
+		select {
+		case <-r.Context().Done():
+			// The global health sweep deliberately continues after an SSE client
+			// disconnects; periodic/reload callers may be waiting on the same run.
+			return
+		case <-ticker.C:
+			sendProgress()
+		case <-done:
+			current, currentTotal, successCount, failedCount := sendProgress()
+			if currentTotal == 0 {
+				currentTotal = total
+			}
+			if current < currentTotal {
+				current = currentTotal
+			}
+			completeData, _ := json.Marshal(map[string]any{
+				"type": "complete", "total": currentTotal,
+				"success": successCount, "failed": failedCount,
+			})
+			fmt.Fprintf(w, "data: %s\n\n", completeData)
+			flusher.Flush()
+			return
+		}
+	}
 }
 
 func writeJSON(w http.ResponseWriter, payload any) {
@@ -833,9 +792,10 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		s.cfgMu.RUnlock()
 
 		resp := map[string]any{
-			"external_ip":      extIP,
-			"probe_target":     probeTarget,
-			"skip_cert_verify": skipCertVerify,
+			"external_ip":       extIP,
+			"probe_target":      probeTarget,
+			"skip_cert_verify":  skipCertVerify,
+			"probe_concurrency": s.mgr.ProbeConcurrency(),
 			"log": map[string]any{
 				"output":      logCfg.Output,
 				"file":        logCfg.File,
@@ -889,8 +849,9 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				},
 			}
 			resp["management"] = map[string]any{
-				"listen":   cfg.Management.Listen,
-				"password": cfg.Management.Password,
+				"listen":            cfg.Management.Listen,
+				"password":          cfg.Management.Password,
+				"probe_concurrency": cfg.ProbeConcurrencyOrDefault(),
 			}
 			resp["geoip"] = map[string]any{
 				"enabled":              cfg.GeoIP.Enabled,
@@ -907,11 +868,12 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, resp)
 	case http.MethodPut:
 		var req struct {
-			ExternalIP     string `json:"external_ip"`
-			ProbeTarget    string `json:"probe_target"`
-			SkipCertVerify bool   `json:"skip_cert_verify"`
-			Mode           string `json:"mode,omitempty"`
-			Listener       *struct {
+			ExternalIP       string `json:"external_ip"`
+			ProbeTarget      string `json:"probe_target"`
+			SkipCertVerify   bool   `json:"skip_cert_verify"`
+			ProbeConcurrency int    `json:"probe_concurrency"`
+			Mode             string `json:"mode,omitempty"`
+			Listener         *struct {
 				Address  string `json:"address"`
 				Port     uint16 `json:"port"`
 				Username string `json:"username"`
@@ -942,8 +904,9 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				} `json:"sticky"`
 			} `json:"pool,omitempty"`
 			Management *struct {
-				Listen   string `json:"listen"`
-				Password string `json:"password"`
+				Listen           string `json:"listen"`
+				Password         string `json:"password"`
+				ProbeConcurrency int    `json:"probe_concurrency"`
 			} `json:"management,omitempty"`
 			Log *struct {
 				Output     string `json:"output"`
@@ -1036,7 +999,14 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		if err := s.updateSettings(extIP, probeTarget, req.SkipCertVerify, logCfg, req.GeoIP != nil && req.GeoIP.Enabled); err != nil {
+		probeConcurrency := req.ProbeConcurrency
+		if req.Management != nil && req.Management.ProbeConcurrency > 0 {
+			probeConcurrency = req.Management.ProbeConcurrency
+		}
+		if probeConcurrency <= 0 {
+			probeConcurrency = s.mgr.ProbeConcurrency()
+		}
+		if err := s.updateSettings(extIP, probeTarget, req.SkipCertVerify, probeConcurrency, logCfg, req.GeoIP != nil && req.GeoIP.Enabled); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			writeJSON(w, map[string]any{"error": err.Error()})
 			return

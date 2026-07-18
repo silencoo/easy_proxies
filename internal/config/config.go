@@ -115,10 +115,11 @@ type MultiPortConfig struct {
 
 // ManagementConfig controls the monitoring HTTP endpoint.
 type ManagementConfig struct {
-	Enabled     *bool  `yaml:"enabled"`
-	Listen      string `yaml:"listen"`
-	ProbeTarget string `yaml:"probe_target"`
-	Password    string `yaml:"password"` // WebUI 访问密码，为空则不需要密码
+	Enabled          *bool  `yaml:"enabled"`
+	Listen           string `yaml:"listen"`
+	ProbeTarget      string `yaml:"probe_target"`
+	ProbeConcurrency int    `yaml:"probe_concurrency"` // 全局批量探测并发数（1-1024，默认 32）
+	Password         string `yaml:"password"`          // WebUI 访问密码，为空则不需要密码
 }
 
 // SubscriptionRefreshConfig controls subscription auto-refresh and reload settings.
@@ -1024,6 +1025,19 @@ func (c *Config) ManagementEnabled() bool {
 		return true
 	}
 	return *c.Management.Enabled
+}
+
+// ProbeConcurrencyOrDefault returns the process-wide health probe worker
+// count. Explicit values are bounded so a typo cannot exhaust file descriptors
+// or create an unbounded number of goroutines.
+func (c *Config) ProbeConcurrencyOrDefault() int {
+	if c == nil || c.Management.ProbeConcurrency <= 0 {
+		return 32
+	}
+	if c.Management.ProbeConcurrency > 1024 {
+		return 1024
+	}
+	return c.Management.ProbeConcurrency
 }
 
 // loadNodesFromFile reads a nodes file where each line is a proxy URI

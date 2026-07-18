@@ -840,6 +840,10 @@
                   <label>探测目标 (Probe Target)</label>
                   <input type="text" id="settingProbeTarget" class="setting-input" placeholder="www.apple.com:80" />
                 </div>
+                <div class="form-group">
+                  <label>探测并发数</label>
+                  <input type="number" id="settingProbeConcurrency" class="setting-input" min="1" max="1024" placeholder="32" />
+                </div>
                 <div class="form-group" style="justify-content:flex-end;">
                   <label>&nbsp;</label>
                   <div class="checkbox-row"><input type="checkbox" id="settingSkipCertVerify" /><label for="settingSkipCertVerify">跳过 SSL 证书验证</label></div>
@@ -1055,6 +1059,7 @@
     let isAutoRefresh = true;
     let autoRefreshInterval = null;
     let allNodesCache = [];
+    let sweepWasActive = false;
     let currentRegionFilter = 'all';
     let isEditMode = false;
     let configNodes = [];
@@ -1165,6 +1170,7 @@
       'hybrid - 混合模式': 'hybrid - pool and per-node ports',
       '外部 IP (External IP)': 'External IP',
       '探测目标 (Probe Target)': 'Probe target',
+      '探测并发数': 'Probe concurrency',
       '跳过 SSL 证书验证': 'Skip SSL certificate verification',
       '监听配置 (Listener)': 'Pool listener',
       '监听地址': 'Listen address',
@@ -1543,11 +1549,29 @@
         if (res.status === 401) { document.getElementById('loginOverlay').classList.add('show'); stopAutoRefresh(); return; }
         const data = await res.json();
         allNodesCache = data.nodes || [];
+        updateSweepProgress(data.probe_sweep);
         updateDashboardStats(data);
         filterByRegion(currentRegionFilter);
         document.getElementById('lastUpdate').textContent = `Sync: ${new Date().toLocaleTimeString()}`;
         fetchSubscriptionStatus();
       } catch(e) {}
+    }
+
+    function updateSweepProgress(sweep) {
+      if (isProbing) return;
+      const wrap = document.getElementById('probeProgress');
+      if (sweep && sweep.active && sweep.total > 0) {
+        document.getElementById('probeStats').textContent = `${sweep.done}/${sweep.total}`;
+        document.getElementById('probeSuccess').textContent = sweep.available;
+        document.getElementById('probeFail').textContent = sweep.failed;
+        document.getElementById('probeProgressFill').style.width = `${sweep.done / sweep.total * 100}%`;
+        wrap.classList.add('show');
+        sweepWasActive = true;
+      } else if (sweepWasActive) {
+        document.getElementById('probeProgressFill').style.width = '100%';
+        sweepWasActive = false;
+        setTimeout(() => { if (!isProbing) wrap.classList.remove('show'); }, 1500);
+      }
     }
 
     function updateDashboardStats(data) {
@@ -1860,7 +1884,10 @@
                  if(d.type === 'start') { total = d.total; }
                  else if(d.type === 'progress') {
                    current = d.current;
-                   if(d.error) fail++; else suc++;
+                   if(Number.isFinite(d.total)) total = d.total;
+                   if(Number.isFinite(d.success)) suc = d.success;
+                   else if(d.error) fail++; else suc++;
+                   if(Number.isFinite(d.failed)) fail = d.failed;
                    document.getElementById('probeProgressFill').style.width = `${d.progress}%`;
                    document.getElementById('probeStats').textContent = `${current}/${total}`;
                    document.getElementById('probeSuccess').textContent = suc;
@@ -2143,6 +2170,7 @@
         document.getElementById('settingExternalIP').value = d.external_ip||'';
         document.getElementById('settingProbeTarget').value = d.probe_target||'';
         document.getElementById('settingSkipCertVerify').checked = d.skip_cert_verify||false;
+        document.getElementById('settingProbeConcurrency').value = d.probe_concurrency || 32;
         // Listener
         const ls = d.listener || {};
         document.getElementById('settingListenerAddr').value = ls.address || '';
@@ -2213,6 +2241,7 @@
         external_ip: document.getElementById('settingExternalIP').value,
         probe_target: document.getElementById('settingProbeTarget').value,
         skip_cert_verify: document.getElementById('settingSkipCertVerify').checked,
+        probe_concurrency: document.getElementById('settingProbeConcurrency').value,
         listener_addr: document.getElementById('settingListenerAddr').value,
         listener_port: document.getElementById('settingListenerPort').value,
         listener_user: document.getElementById('settingListenerUser').value,
@@ -2291,6 +2320,7 @@
           external_ip: document.getElementById('settingExternalIP').value,
           probe_target: document.getElementById('settingProbeTarget').value,
           skip_cert_verify: document.getElementById('settingSkipCertVerify').checked,
+          probe_concurrency: parseInt(document.getElementById('settingProbeConcurrency').value) || 32,
           mode: document.getElementById('settingMode').value,
           listener: {
             address: document.getElementById('settingListenerAddr').value,
@@ -2323,6 +2353,7 @@
           management: {
             listen: document.getElementById('settingMgmtListen').value,
             password: document.getElementById('settingMgmtPassword').value,
+            probe_concurrency: parseInt(document.getElementById('settingProbeConcurrency').value) || 32,
           },
           log: {
             output: document.getElementById('settingLogOutput').value,

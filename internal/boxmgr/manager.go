@@ -3,6 +3,7 @@ package boxmgr
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
@@ -27,7 +28,6 @@ import (
 	"github.com/sagernet/sing-box/include"
 	singlog "github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
-	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
 )
@@ -269,6 +269,7 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	}
 
 	m.applyConfigSettings(newCfg)
+	m.applyLiveProbeSettings(newCfg)
 
 	m.mu.Lock()
 	m.currentBox = built.box
@@ -511,6 +512,7 @@ func (m *Manager) reloadNodesInPlace(
 	}
 
 	m.applyConfigSettings(newCfg)
+	m.applyLiveProbeSettings(newCfg)
 	m.mu.Lock()
 	m.cfg = newCfg
 	m.runtimeOptions = desiredOptions
@@ -618,7 +620,7 @@ func (m *Manager) preflightCandidateSet(ctx context.Context, instance *box.Box, 
 	if len(tags) < minimum {
 		return fmt.Errorf("health check rejected candidate: %d nodes built (need >= %d)", len(tags), minimum)
 	}
-	destination, configured := m.monitorMgr.DestinationForProbe()
+	target, configured := m.monitorMgr.DestinationForProbe()
 	if !configured {
 		return nil
 	}
@@ -648,7 +650,7 @@ func (m *Manager) preflightCandidateSet(ctx context.Context, instance *box.Box, 
 					continue
 				}
 				probeCtx, cancel := context.WithTimeout(ctx, timeout)
-				err := probeOutbound(probeCtx, outbound, destination)
+				err := probeOutbound(probeCtx, outbound, target)
 				cancel()
 				results <- err == nil
 			}
@@ -675,17 +677,54 @@ func (m *Manager) preflightCandidateSet(ctx context.Context, instance *box.Box, 
 	return nil
 }
 
-func probeOutbound(ctx context.Context, outbound adapter.Outbound, destination M.Socksaddr) error {
-	connection, err := outbound.DialContext(ctx, N.NetworkTCP, destination)
+func probeOutbound(ctx context.Context, outbound adapter.Outbound, target monitor.ProbeTarget) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- probeOutboundConnection(ctx, outbound, target)
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func probeOutboundConnection(ctx context.Context, outbound adapter.Outbound, target monitor.ProbeTarget) error {
+	connection, err := outbound.DialContext(ctx, N.NetworkTCP, target.Destination)
 	if err != nil {
 		return err
 	}
+	watchDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = connection.Close()
+		case <-watchDone:
+		}
+	}()
+	defer close(watchDone)
 	defer connection.Close()
 	deadline, hasDeadline := ctx.Deadline()
 	if hasDeadline {
 		_ = connection.SetDeadline(deadline)
 	}
-	request := fmt.Sprintf("GET /generate_204 HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", destination.AddrString())
+	if target.TLS {
+		tlsConn := tls.Client(connection, &tls.Config{
+			ServerName:         target.Host,
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: target.SkipCertVerify, // Explicit global setting.
+		})
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			return fmt.Errorf("TLS handshake: %w", err)
+		}
+		connection = tlsConn
+	}
+	host := target.Host
+	if target.Destination.Port != 80 && target.Destination.Port != 443 {
+		host = target.Destination.AddrString()
+	}
+	request := fmt.Sprintf("GET /generate_204 HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", host)
 	if _, err := connection.Write([]byte(request)); err != nil {
 		return err
 	}
@@ -726,6 +765,7 @@ func (m *Manager) rollbackToOldConfig(ctx context.Context, oldCfg *config.Config
 		return err
 	}
 	m.applyConfigSettings(oldCfg)
+	m.applyLiveProbeSettings(oldCfg)
 	m.mu.Lock()
 	m.currentBox = built.box
 	m.runtimeCtx = built.ctx
@@ -1187,6 +1227,14 @@ func (m *Manager) applyConfigSettings(cfg *config.Config) {
 		m.drainTimeout = defaultDrainTimeout
 	}
 	m.minAvailableNodes = cfg.SubscriptionRefresh.MinAvailableNodes
+}
+
+func (m *Manager) applyLiveProbeSettings(cfg *config.Config) {
+	if cfg == nil || m.monitorMgr == nil {
+		return
+	}
+	m.monitorMgr.SetProbeTarget(cfg.Management.ProbeTarget, cfg.SkipCertVerify)
+	m.monitorMgr.SetProbeConcurrency(cfg.ProbeConcurrencyOrDefault())
 }
 
 // defaultLogger is the fallback logger using standard log.
