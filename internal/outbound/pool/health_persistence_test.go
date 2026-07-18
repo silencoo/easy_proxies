@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -160,4 +162,323 @@ func TestTransientCooldownPersistsAcrossRestart(t *testing.T) {
 	if !restored.isCoolingDown(time.Now()) || restored.isBlacklisted(time.Now()) {
 		t.Fatal("transient cooldown was not restored independently")
 	}
+}
+
+func TestConcurrentFlushCannotOverwriteNewerSnapshot(t *testing.T) {
+	ResetSharedStateStore()
+	resetHealthPersistenceForTest()
+	t.Cleanup(func() {
+		ResetSharedStateStore()
+		resetHealthPersistenceForTest()
+	})
+
+	path := filepath.Join(t.TempDir(), "health-state.yaml")
+	if err := ConfigureHealthPersistence(path); err != nil {
+		t.Fatal(err)
+	}
+	originalWriter := writeHealthStateFile
+	defer func() { writeHealthStateFile = originalWriter }()
+	firstWriteStarted := make(chan struct{})
+	secondWriteStarted := make(chan struct{})
+	releaseFirstWrite := make(chan struct{})
+	var calls atomic.Int32
+	writeHealthStateFile = func(path string, data []byte, mode os.FileMode) error {
+		switch calls.Add(1) {
+		case 1:
+			close(firstWriteStarted)
+			<-releaseFirstWrite
+		case 2:
+			close(secondWriteStarted)
+		}
+		return originalWriter(path, data, mode)
+	}
+
+	healthPersistence.mu.Lock()
+	healthPersistence.records["node"] = persistedMemberHealth{Failures: 1}
+	healthPersistence.dirty = true
+	healthPersistence.mu.Unlock()
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- FlushHealthState() }()
+	<-firstWriteStarted
+
+	// The first flush has already captured its old snapshot. Publish a newer
+	// record while its physical write is deliberately stalled.
+	healthPersistence.mu.Lock()
+	healthPersistence.records["node"] = persistedMemberHealth{Failures: 2}
+	healthPersistence.dirty = true
+	healthPersistence.mu.Unlock()
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- FlushHealthState() }()
+
+	secondEnteredEarly := false
+	select {
+	case <-secondWriteStarted:
+		secondEnteredEarly = true
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseFirstWrite)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first flush: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second flush: %v", err)
+	}
+	if secondEnteredEarly {
+		t.Fatal("newer disk write overtook an older in-flight flush")
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted persistedHealthFile
+	if err := yaml.Unmarshal(data, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if got := persisted.Nodes["node"].Failures; got != 2 {
+		t.Fatalf("older flush overwrote newer snapshot: failures=%d", got)
+	}
+}
+
+func TestConfigureHealthPersistenceKeepsStoreDuringPathSwitch(t *testing.T) {
+	ResetSharedStateStore()
+	resetHealthPersistenceForTest()
+	originalReader := readHealthStateFile
+	originalWriter := writeHealthStateFile
+	t.Cleanup(func() {
+		readHealthStateFile = originalReader
+		writeHealthStateFile = originalWriter
+		ResetSharedStateStore()
+		resetHealthPersistenceForTest()
+	})
+
+	dir := t.TempDir()
+	oldPath := filepath.Join(dir, "old-health.yaml")
+	newPath := filepath.Join(dir, "new-health.yaml")
+	if err := ConfigureHealthPersistence(oldPath); err != nil {
+		t.Fatal(err)
+	}
+	newData, err := yaml.Marshal(persistedHealthFile{
+		Version: healthStateVersion,
+		Nodes: map[string]persistedMemberHealth{
+			"node": {Failures: 10},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(newPath, newData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	healthPersistence.mu.Lock()
+	healthPersistence.records["node"] = persistedMemberHealth{Failures: 1}
+	healthPersistence.dirty = true
+	healthPersistence.mu.Unlock()
+
+	var oldWriteComplete atomic.Bool
+	writeHealthStateFile = func(path string, data []byte, mode os.FileMode) error {
+		err := originalWriter(path, data, mode)
+		if path == oldPath && err == nil {
+			oldWriteComplete.Store(true)
+		}
+		return err
+	}
+	readStarted := make(chan struct{})
+	releaseRead := make(chan struct{})
+	var readOnce sync.Once
+	readHealthStateFile = func(path string) ([]byte, error) {
+		if path == newPath {
+			readOnce.Do(func() { close(readStarted) })
+			<-releaseRead
+		}
+		return originalReader(path)
+	}
+
+	configureDone := make(chan error, 1)
+	go func() { configureDone <- ConfigureHealthPersistence(newPath) }()
+	<-readStarted
+	if !oldWriteComplete.Load() {
+		t.Fatal("new path was read before pending old-path state reached disk")
+	}
+	storeDone := make(chan struct{})
+	go func() {
+		storeMemberHealth("node", persistedMemberHealth{Failures: 22})
+		close(storeDone)
+	}()
+	close(releaseRead)
+	if err := <-configureDone; err != nil {
+		t.Fatalf("switch persistence path: %v", err)
+	}
+	<-storeDone
+
+	if err := FlushHealthState(); err != nil {
+		t.Fatal(err)
+	}
+	readHealthStateFile = originalReader
+	writeHealthStateFile = originalWriter
+	if got := readPersistedFailures(t, oldPath, "node"); got != 1 {
+		t.Fatalf("old path did not receive its pending snapshot: failures=%d", got)
+	}
+	if got := readPersistedFailures(t, newPath, "node"); got != 22 {
+		t.Fatalf("store during path switch was lost: failures=%d", got)
+	}
+}
+
+func TestConfigureHealthPersistenceFailureKeepsOldStateAndConcurrentStore(t *testing.T) {
+	ResetSharedStateStore()
+	resetHealthPersistenceForTest()
+	originalReader := readHealthStateFile
+	originalWriter := writeHealthStateFile
+	t.Cleanup(func() {
+		readHealthStateFile = originalReader
+		writeHealthStateFile = originalWriter
+		ResetSharedStateStore()
+		resetHealthPersistenceForTest()
+	})
+
+	dir := t.TempDir()
+	oldPath := filepath.Join(dir, "old-health.yaml")
+	newPath := filepath.Join(dir, "unreadable-health.yaml")
+	if err := ConfigureHealthPersistence(oldPath); err != nil {
+		t.Fatal(err)
+	}
+	healthPersistence.mu.Lock()
+	healthPersistence.records["node"] = persistedMemberHealth{Failures: 3}
+	healthPersistence.dirty = true
+	healthPersistence.mu.Unlock()
+
+	var oldWriteComplete atomic.Bool
+	writeHealthStateFile = func(path string, data []byte, mode os.FileMode) error {
+		err := originalWriter(path, data, mode)
+		if path == oldPath && err == nil {
+			oldWriteComplete.Store(true)
+		}
+		return err
+	}
+	readStarted := make(chan struct{})
+	releaseRead := make(chan struct{})
+	wantErr := errors.New("injected new-path read failure")
+	readHealthStateFile = func(path string) ([]byte, error) {
+		if path != newPath {
+			return originalReader(path)
+		}
+		close(readStarted)
+		<-releaseRead
+		return nil, wantErr
+	}
+
+	configureDone := make(chan error, 1)
+	go func() { configureDone <- ConfigureHealthPersistence(newPath) }()
+	<-readStarted
+	if !oldWriteComplete.Load() {
+		t.Fatal("new path was read before pending old-path state reached disk")
+	}
+	storeDone := make(chan struct{})
+	go func() {
+		storeMemberHealth("node", persistedMemberHealth{Failures: 4})
+		close(storeDone)
+	}()
+	close(releaseRead)
+	if err := <-configureDone; !errors.Is(err, wantErr) {
+		t.Fatalf("switch error = %v, want %v", err, wantErr)
+	}
+	<-storeDone
+
+	healthPersistence.mu.Lock()
+	gotPath := healthPersistence.path
+	healthPersistence.mu.Unlock()
+	if gotPath != oldPath {
+		t.Fatalf("failed switch changed active path: got %q want %q", gotPath, oldPath)
+	}
+	if record, ok := restoredMemberHealth("node"); !ok || record.Failures != 4 {
+		t.Fatalf("failed switch did not preserve usable old state: record=%#v ok=%v", record, ok)
+	}
+
+	if err := FlushHealthState(); err != nil {
+		t.Fatal(err)
+	}
+	readHealthStateFile = originalReader
+	writeHealthStateFile = originalWriter
+	if got := readPersistedFailures(t, oldPath, "node"); got != 4 {
+		t.Fatalf("concurrent store was not flushed to the old path: failures=%d", got)
+	}
+}
+
+func TestConfigureHealthPersistenceOldFlushFailureDoesNotSwitch(t *testing.T) {
+	ResetSharedStateStore()
+	resetHealthPersistenceForTest()
+	originalReader := readHealthStateFile
+	originalWriter := writeHealthStateFile
+	t.Cleanup(func() {
+		readHealthStateFile = originalReader
+		writeHealthStateFile = originalWriter
+		ResetSharedStateStore()
+		resetHealthPersistenceForTest()
+	})
+
+	dir := t.TempDir()
+	oldPath := filepath.Join(dir, "old-health.yaml")
+	newPath := filepath.Join(dir, "new-health.yaml")
+	if err := ConfigureHealthPersistence(oldPath); err != nil {
+		t.Fatal(err)
+	}
+	healthPersistence.mu.Lock()
+	healthPersistence.records["node"] = persistedMemberHealth{Failures: 7}
+	healthPersistence.dirty = true
+	healthPersistence.mu.Unlock()
+
+	wantErr := errors.New("injected old-path write failure")
+	var newPathRead atomic.Bool
+	writeHealthStateFile = func(path string, _ []byte, _ os.FileMode) error {
+		if path == oldPath {
+			return wantErr
+		}
+		return nil
+	}
+	readHealthStateFile = func(path string) ([]byte, error) {
+		if path == newPath {
+			newPathRead.Store(true)
+		}
+		return originalReader(path)
+	}
+
+	if err := ConfigureHealthPersistence(newPath); !errors.Is(err, wantErr) {
+		t.Fatalf("switch error = %v, want %v", err, wantErr)
+	}
+	if newPathRead.Load() {
+		t.Fatal("new path was read after the required old-path flush failed")
+	}
+	healthPersistence.mu.Lock()
+	gotPath := healthPersistence.path
+	dirty := healthPersistence.dirty
+	healthPersistence.mu.Unlock()
+	if gotPath != oldPath || !dirty {
+		t.Fatalf("old state was not retained for retry: path=%q dirty=%v", gotPath, dirty)
+	}
+	if record, ok := restoredMemberHealth("node"); !ok || record.Failures != 7 {
+		t.Fatalf("old in-memory record was lost: record=%#v ok=%v", record, ok)
+	}
+
+	readHealthStateFile = originalReader
+	writeHealthStateFile = originalWriter
+	if err := FlushHealthState(); err != nil {
+		t.Fatalf("retry old-path flush: %v", err)
+	}
+	if got := readPersistedFailures(t, oldPath, "node"); got != 7 {
+		t.Fatalf("retained old state was not retryable: failures=%d", got)
+	}
+}
+
+func readPersistedFailures(t *testing.T, path, tag string) int {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state persistedHealthFile
+	if err := yaml.Unmarshal(data, &state); err != nil {
+		t.Fatal(err)
+	}
+	return state.Nodes[tag].Failures
 }

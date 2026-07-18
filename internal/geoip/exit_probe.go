@@ -3,6 +3,7 @@ package geoip
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -34,7 +35,7 @@ func DiscoverExitIP(ctx context.Context, dialer OutboundDialer, endpoint string)
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return "", fmt.Errorf("create exit IP request: %w", err)
+		return "", errors.New("create exit IP request: invalid endpoint")
 	}
 	transport := &http.Transport{
 		DisableKeepAlives: true,
@@ -45,7 +46,7 @@ func DiscoverExitIP(ctx context.Context, dialer OutboundDialer, endpoint string)
 	defer transport.CloseIdleConnections()
 	response, err := transport.RoundTrip(request)
 	if err != nil {
-		return "", fmt.Errorf("request exit IP: %w", err)
+		return "", safeExitIPRequestError(ctx, err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
@@ -53,7 +54,7 @@ func DiscoverExitIP(ctx context.Context, dialer OutboundDialer, endpoint string)
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxExitIPResponseSize+1))
 	if err != nil {
-		return "", fmt.Errorf("read exit IP response: %w", err)
+		return "", errors.New("read exit IP response failed")
 	}
 	if len(body) > maxExitIPResponseSize {
 		return "", fmt.Errorf("exit IP response exceeds %d bytes", maxExitIPResponseSize)
@@ -63,6 +64,19 @@ func DiscoverExitIP(ctx context.Context, dialer OutboundDialer, endpoint string)
 		return "", err
 	}
 	return ip.String(), nil
+}
+
+func safeExitIPRequestError(ctx context.Context, err error) error {
+	if ctx != nil && ctx.Err() != nil {
+		return fmt.Errorf("request exit IP: %w", ctx.Err())
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) && networkError.Timeout() {
+		return errors.New("request exit IP: network timeout")
+	}
+	// Transport errors may embed the complete endpoint URL, including userinfo,
+	// signed paths, and query tokens. Keep the user-visible category only.
+	return errors.New("request exit IP: network request failed")
 }
 
 func parseExitIP(body []byte) (netip.Addr, error) {

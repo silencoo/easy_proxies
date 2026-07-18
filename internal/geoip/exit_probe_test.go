@@ -2,15 +2,23 @@ package geoip
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	M "github.com/sagernet/sing/common/metadata"
 )
 
 type directTestDialer struct{}
+
+type exitProbeDialerFunc func(context.Context, string, M.Socksaddr) (net.Conn, error)
+
+func (function exitProbeDialerFunc) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	return function(ctx, network, destination)
+}
 
 func (directTestDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	return (&net.Dialer{}).DialContext(ctx, network, destination.String())
@@ -49,6 +57,26 @@ func TestDiscoverExitIPRejectsInvalidResponse(t *testing.T) {
 	defer server.Close()
 	if _, err := DiscoverExitIP(context.Background(), directTestDialer{}, server.URL); err == nil {
 		t.Fatal("expected invalid response to fail")
+	}
+}
+
+func TestDiscoverExitIPErrorsNeverExposeEndpointSecrets(t *testing.T) {
+	const secret = "TOPSECRET"
+	dialer := exitProbeDialerFunc(func(context.Context, string, M.Socksaddr) (net.Conn, error) {
+		return nil, errors.New("dial failed for /signed?token=" + secret)
+	})
+	_, err := DiscoverExitIP(
+		context.Background(),
+		dialer,
+		"https://user:password@example.invalid/private/signed?token="+secret,
+	)
+	if err == nil {
+		t.Fatal("expected request failure")
+	}
+	for _, sensitive := range []string{secret, "user:password", "/private/signed", "token="} {
+		if strings.Contains(err.Error(), sensitive) {
+			t.Fatalf("exit probe error leaked %q: %s", sensitive, err)
+		}
 	}
 }
 

@@ -52,7 +52,7 @@ func (m *Manager) refreshExitGeoIP(ctx context.Context, cfg *config.Config) erro
 			dialers[tag] = outbound
 		}
 	}
-	results := discoverExitRegions(
+	results := discoverExitRegionsWithProbe(
 		ctx,
 		dialers,
 		lookup,
@@ -60,6 +60,7 @@ func (m *Manager) refreshExitGeoIP(ctx context.Context, cfg *config.Config) erro
 		cfg.GeoIP.ExitIPTimeout,
 		cfg.GeoIP.ExitIPConcurrency,
 		previousIPs,
+		m.discoverExitIPBounded,
 	)
 	regionCounts := make(map[string]int)
 	observed := 0
@@ -155,8 +156,52 @@ func (m *Manager) stopGeoLookup() {
 // newly loaded MMDB. It deliberately does not probe the network again: the
 // database changed, while the proxy exit observations did not.
 func (m *Manager) handleGeoDatabaseUpdate(source *geoip.Lookup) {
-	m.reloadMu.Lock()
-	defer m.reloadMu.Unlock()
+	// Lookup.Close waits for its synchronous update callback. Start/Reload also
+	// hold reloadMu while replacing or disabling a lookup, so blocking here on
+	// that same mutex would form a lock cycle:
+	//
+	//   reloadMu -> Lookup.Close -> callback -> reloadMu
+	//
+	// Run immediately when the lifecycle lock is free. Otherwise detach the
+	// callback from the lookup's lifecycle and coalesce one deferred
+	// reclassification per lookup. A retired source becomes a cheap no-op after
+	// the active reload publishes its replacement.
+	if m.reloadMu.TryLock() {
+		defer m.reloadMu.Unlock()
+		m.handleGeoDatabaseUpdateLocked(source)
+		return
+	}
+	m.queueGeoDatabaseUpdate(source)
+}
+
+func (m *Manager) queueGeoDatabaseUpdate(source *geoip.Lookup) {
+	if source == nil {
+		return
+	}
+	m.geoUpdateMu.Lock()
+	if m.geoUpdateQueued == nil {
+		m.geoUpdateQueued = make(map[*geoip.Lookup]struct{})
+	}
+	if _, queued := m.geoUpdateQueued[source]; queued {
+		m.geoUpdateMu.Unlock()
+		return
+	}
+	m.geoUpdateQueued[source] = struct{}{}
+	m.geoUpdateMu.Unlock()
+
+	go func() {
+		m.reloadMu.Lock()
+		defer m.reloadMu.Unlock()
+		m.geoUpdateMu.Lock()
+		delete(m.geoUpdateQueued, source)
+		m.geoUpdateMu.Unlock()
+		m.handleGeoDatabaseUpdateLocked(source)
+	}()
+}
+
+// handleGeoDatabaseUpdateLocked requires reloadMu. It revalidates source after
+// any queued wait so a replaced/closed lookup cannot mutate the live runtime.
+func (m *Manager) handleGeoDatabaseUpdateLocked(source *geoip.Lookup) {
 
 	m.mu.RLock()
 	if m.geoLookup != source || m.currentBox == nil || m.runtimeCtx == nil || m.cfg == nil {
@@ -218,19 +263,7 @@ func (m *Manager) syncGeoRouterDialers() {
 	m.mu.RLock()
 	router := m.geoRouter
 	m.mu.RUnlock()
-	if router == nil {
-		return
-	}
-	for _, region := range geoip.AllRegions() {
-		if dialer, ok := pool.GetDialer("pool-" + region); ok {
-			router.SetPool(region, dialer)
-		} else {
-			router.RemovePool(region)
-		}
-	}
-	if dialer, ok := pool.GetDialer(pool.Tag); ok {
-		router.SetGlobalPool(dialer)
-	}
+	configureGeoIPRouterDialers(router)
 }
 
 func discoverExitRegions(
@@ -241,6 +274,128 @@ func discoverExitRegions(
 	timeout time.Duration,
 	concurrency int,
 	previousIPs map[string]string,
+) map[string]exitRegionResult {
+	return discoverExitRegionsWithProbe(
+		ctx,
+		dialers,
+		lookup,
+		endpoint,
+		timeout,
+		concurrency,
+		previousIPs,
+		func(ctx context.Context, _ string, dialer geoip.OutboundDialer, endpoint string) (string, error) {
+			return geoip.DiscoverExitIP(ctx, dialer, endpoint)
+		},
+	)
+}
+
+type exitIPProbeFunc func(context.Context, string, geoip.OutboundDialer, string) (string, error)
+
+// discoverExitIPBounded keeps an uncooperative outbound implementation from
+// blocking Start/Reload forever. A call that ignores cancellation may retain
+// one slot, but the process-wide work owned by this Manager remains bounded.
+func (m *Manager) discoverExitIPBounded(
+	ctx context.Context,
+	tag string,
+	dialer geoip.OutboundDialer,
+	endpoint string,
+) (string, error) {
+	if m == nil || m.exitProbeSlots == nil {
+		return "", fmt.Errorf("exit IP probe scheduler is unavailable")
+	}
+	probe := m.probeExitIP
+	if probe == nil {
+		probe = geoip.DiscoverExitIP
+	}
+	key := exitIPProbeFlightKey(tag, endpoint, dialer)
+	return m.runExitIPProbe(ctx, key, func() (string, error) {
+		return probe(ctx, dialer, endpoint)
+	})
+}
+
+func exitIPProbeFlightKey(tag, endpoint string, dialer geoip.OutboundDialer) string {
+	return fmt.Sprintf("%s\x00%s\x00%T:%p", tag, endpoint, dialer, dialer)
+}
+
+func (m *Manager) runExitIPProbe(
+	ctx context.Context,
+	key string,
+	probe func() (string, error),
+) (string, error) {
+	if m == nil || m.exitProbeSlots == nil {
+		return "", fmt.Errorf("exit IP probe scheduler is unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if probe == nil {
+		return "", fmt.Errorf("exit IP probe is not configured")
+	}
+	wait := func(call *exitIPProbeCall) (string, error) {
+		select {
+		case <-call.done:
+			return call.ip, call.err
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+
+	m.exitProbeMu.Lock()
+	if call := m.exitProbeCalls[key]; call != nil {
+		m.exitProbeMu.Unlock()
+		return wait(call)
+	}
+	m.exitProbeMu.Unlock()
+
+	select {
+	case m.exitProbeSlots <- struct{}{}:
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+
+	m.exitProbeMu.Lock()
+	if call := m.exitProbeCalls[key]; call != nil {
+		m.exitProbeMu.Unlock()
+		<-m.exitProbeSlots
+		return wait(call)
+	}
+	call := &exitIPProbeCall{done: make(chan struct{})}
+	m.exitProbeCalls[key] = call
+	m.exitProbeMu.Unlock()
+
+	m.auxProbeWG.Add(1)
+	go func() {
+		defer m.auxProbeWG.Done()
+		defer func() { <-m.exitProbeSlots }()
+		var ip string
+		var err error
+		func() {
+			defer func() {
+				if recover() != nil {
+					err = fmt.Errorf("exit IP probe panicked")
+				}
+			}()
+			ip, err = probe()
+		}()
+		m.exitProbeMu.Lock()
+		call.ip = ip
+		call.err = err
+		delete(m.exitProbeCalls, key)
+		close(call.done)
+		m.exitProbeMu.Unlock()
+	}()
+	return wait(call)
+}
+
+func discoverExitRegionsWithProbe(
+	ctx context.Context,
+	dialers map[string]geoip.OutboundDialer,
+	lookup ipRegionLookup,
+	endpoint string,
+	timeout time.Duration,
+	concurrency int,
+	previousIPs map[string]string,
+	probe exitIPProbeFunc,
 ) map[string]exitRegionResult {
 	if timeout <= 0 {
 		timeout = 10 * time.Second
@@ -272,7 +427,7 @@ func discoverExitRegions(
 			defer workers.Done()
 			for work := range jobs {
 				probeCtx, cancel := context.WithTimeout(ctx, timeout)
-				exitIP, err := geoip.DiscoverExitIP(probeCtx, work.dialer, endpoint)
+				exitIP, err := probe(probeCtx, work.tag, work.dialer, endpoint)
 				cancel()
 				if err != nil {
 					exitIP = previousIPs[work.tag]
@@ -378,38 +533,15 @@ func (m *Manager) installGeoPools(
 		}
 	}
 
-	type change struct {
-		tag      string
-		previous option.Outbound
-		existed  bool
-	}
-	changes := make([]change, 0, len(desiredPools))
-	rollback := func() {
-		for idx := len(changes) - 1; idx >= 0; idx-- {
-			item := changes[idx]
-			if item.existed {
-				_ = createRuntimeOutbound(runtimeCtx, instance, item.previous)
-			} else {
-				_ = instance.Outbound().Remove(item.tag)
-			}
-		}
-	}
-	tags := sortedMapKeys(desiredPools)
-	sort.SliceStable(tags, func(i, j int) bool { return tags[i] == pool.Tag && tags[j] != pool.Tag })
-	for _, tag := range tags {
-		desired := desiredPools[tag]
-		previous, existed := oldPools[tag]
-		if err := createRuntimeOutbound(runtimeCtx, instance, desired); err != nil {
-			rollback()
-			return option.Options{}, fmt.Errorf("install GeoIP pool %s: %w", tag, err)
-		}
-		changes = append(changes, change{tag: tag, previous: previous, existed: existed})
-	}
-	for _, tag := range mapDifferenceKeys(oldPools, desiredPools) {
-		if err := instance.Outbound().Remove(tag); err != nil {
-			rollback()
-			return option.Options{}, fmt.Errorf("remove stale GeoIP pool %s: %w", tag, err)
-		}
+	if err := applyGeoPoolChanges(
+		desiredPools,
+		oldPools,
+		func(outbound option.Outbound) error {
+			return createRuntimeOutbound(runtimeCtx, instance, outbound)
+		},
+		instance.Outbound().Remove,
+	); err != nil {
+		return option.Options{}, err
 	}
 
 	updated := runtimeOptions
@@ -423,4 +555,50 @@ func (m *Manager) installGeoPools(
 		updated.Outbounds = append(updated.Outbounds, desiredPools[tag])
 	}
 	return updated, nil
+}
+
+func applyGeoPoolChanges(
+	desiredPools map[string]option.Outbound,
+	oldPools map[string]option.Outbound,
+	create func(option.Outbound) error,
+	remove func(string) error,
+) error {
+	type change struct {
+		tag      string
+		previous option.Outbound
+		existed  bool
+	}
+	changes := make([]change, 0, len(desiredPools)+len(oldPools))
+	rollback := func() {
+		for idx := len(changes) - 1; idx >= 0; idx-- {
+			item := changes[idx]
+			if item.existed {
+				_ = create(item.previous)
+			} else {
+				_ = remove(item.tag)
+			}
+		}
+	}
+	tags := sortedMapKeys(desiredPools)
+	sort.SliceStable(tags, func(i, j int) bool { return tags[i] == pool.Tag && tags[j] != pool.Tag })
+	for _, tag := range tags {
+		desired := desiredPools[tag]
+		previous, existed := oldPools[tag]
+		if err := create(desired); err != nil {
+			rollback()
+			return fmt.Errorf("install GeoIP pool %s: %w", tag, err)
+		}
+		changes = append(changes, change{tag: tag, previous: previous, existed: existed})
+	}
+	for _, tag := range mapDifferenceKeys(oldPools, desiredPools) {
+		previous := oldPools[tag]
+		// Record the inverse before removal: sing-box may return an error after it
+		// has detached an outbound, so even the failing removal can need repair.
+		changes = append(changes, change{tag: tag, previous: previous, existed: true})
+		if err := remove(tag); err != nil {
+			rollback()
+			return fmt.Errorf("remove stale GeoIP pool %s: %w", tag, err)
+		}
+	}
+	return nil
 }

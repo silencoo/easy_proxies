@@ -62,6 +62,10 @@ func TestBuildMultiPortUsesPerNodeCredentialsAndDedicatedDispatch(t *testing.T) 
 			if poolOptions.DedicatedMembers[opts.Inbounds[0].Tag] != poolOptions.Members[0] {
 				t.Fatal("dedicated inbound was not mapped to its exact member")
 			}
+			metadata := poolOptions.Metadata[poolOptions.Members[0]]
+			if metadata.Username != "node-user" || metadata.Password != "node-password" {
+				t.Fatalf("monitor metadata lost effective per-node credentials: %#v", metadata)
+			}
 		}
 	}
 	if !foundDispatcher {

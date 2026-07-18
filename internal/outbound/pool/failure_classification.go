@@ -6,9 +6,12 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"regexp"
 	"strings"
 	"syscall"
 )
+
+var transientHTTPStatusPattern = regexp.MustCompile(`(?i)\b(?:http(?:/\d(?:\.\d)?)?\s+|status(?:\s+code)?\s*[:=]?\s*)(?:429|503)\b`)
 
 // isTransientError classifies typed network failures first. A narrow text
 // fallback remains necessary because several proxy protocols wrap remote HTTP
@@ -32,9 +35,12 @@ func isTransientError(err error) bool {
 		return true
 	}
 	message := strings.ToLower(err.Error())
+	if transientHTTPStatusPattern.MatchString(message) {
+		return true
+	}
 	for _, marker := range []string{
-		"429", "too many requests", "service unavailable", "http status 503",
-		"status 503", "connection reset", "reset by peer", "temporarily unavailable",
+		"too many requests", "service unavailable", "connection reset",
+		"reset by peer", "temporarily unavailable",
 	} {
 		if strings.Contains(message, marker) {
 			return true

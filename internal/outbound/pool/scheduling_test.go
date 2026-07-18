@@ -1,9 +1,12 @@
 package pool
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
 	"net"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -56,6 +59,170 @@ func TestPermanentFailuresStillReachBlacklistThreshold(t *testing.T) {
 	}
 	if !second.Blacklisted || second.Cooldown || !state.isBlacklisted(time.Now()) {
 		t.Fatalf("permanent failure did not trigger blacklist: %#v", second)
+	}
+}
+
+func TestSuccessfulProbePreservesManualBlacklist(t *testing.T) {
+	ResetSharedStateStore()
+	t.Cleanup(ResetSharedStateStore)
+	state := acquireSharedState("manual-probe")
+	blacklistSharedMember("manual-probe", time.Hour)
+
+	state.releaseAfterProbe()
+
+	if !state.isBlacklisted(time.Now()) || !state.blacklistedFast.Load() {
+		t.Fatal("successful probe cleared an administrator blacklist")
+	}
+	state.mu.Lock()
+	manual := state.manualBlacklist
+	state.mu.Unlock()
+	if !manual {
+		t.Fatal("manual blacklist origin was lost")
+	}
+}
+
+func TestSuccessfulProbeReleasesAutomaticBlacklist(t *testing.T) {
+	ResetSharedStateStore()
+	t.Cleanup(ResetSharedStateStore)
+	state := acquireSharedState("automatic-probe")
+	state.recordFailure(errors.New("protocol failure"), 1, time.Hour, time.Minute)
+
+	state.releaseAfterProbe()
+
+	if state.isBlacklisted(time.Now()) || state.blacklistedFast.Load() {
+		t.Fatal("successful probe did not recover an automatic blacklist")
+	}
+}
+
+func TestSharedStateTransitionsPublishInStateOrder(t *testing.T) {
+	ResetSharedStateStore()
+	t.Cleanup(ResetSharedStateStore)
+	state := acquireSharedState("linearized")
+
+	trueEntered := make(chan struct{}, 1)
+	releaseTrue := make(chan struct{})
+	falseEntered := make(chan struct{}, 1)
+	var observeTransitions atomic.Bool
+	var appliedBlocked atomic.Bool
+	unwatch := state.subscribeBlacklist(func(blocked bool) {
+		if !observeTransitions.Load() {
+			appliedBlocked.Store(blocked)
+			return
+		}
+		if blocked {
+			trueEntered <- struct{}{}
+			<-releaseTrue
+			appliedBlocked.Store(true)
+			return
+		}
+		appliedBlocked.Store(false)
+		falseEntered <- struct{}{}
+	})
+	t.Cleanup(unwatch)
+	observeTransitions.Store(true)
+
+	failureDone := make(chan struct{})
+	go func() {
+		state.recordFailure(context.DeadlineExceeded, 3, time.Hour, time.Minute)
+		close(failureDone)
+	}()
+	<-trueEntered
+
+	successDone := make(chan struct{})
+	go func() {
+		state.recordSuccess()
+		close(successDone)
+	}()
+
+	falsePublishedEarly := false
+	select {
+	case <-falseEntered:
+		falsePublishedEarly = true
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseTrue)
+	<-failureDone
+	<-successDone
+	if falsePublishedEarly {
+		t.Fatal("success notification overtook an in-flight failure notification")
+	}
+	select {
+	case <-falseEntered:
+	case <-time.After(time.Second):
+		t.Fatal("final success notification was not published")
+	}
+	if appliedBlocked.Load() || state.blacklistedFast.Load() || state.isBlocked(time.Now()) {
+		t.Fatal("notification order left a healthy node excluded")
+	}
+}
+
+func TestStaleTimerScheduleCannotReplaceExtendedDeadline(t *testing.T) {
+	ResetSharedStateStore()
+	t.Cleanup(ResetSharedStateStore)
+	state := acquireSharedState("extended")
+	later := time.Now().Add(time.Hour)
+	earlier := time.Now().Add(time.Minute)
+
+	state.transitionMu.Lock()
+	state.mu.Lock()
+	state.cooldownUntil = later
+	state.blacklistedFast.Store(true)
+	state.mu.Unlock()
+	state.scheduleCooldownExpiry(later)
+	state.mu.Lock()
+	cooldownTimer := state.cooldownTimer
+	state.mu.Unlock()
+	state.scheduleCooldownExpiry(earlier)
+	state.mu.Lock()
+	if state.cooldownTimer != cooldownTimer {
+		state.mu.Unlock()
+		state.transitionMu.Unlock()
+		t.Fatal("stale cooldown schedule replaced the timer for the extended deadline")
+	}
+	state.blacklisted = true
+	state.blacklistedUntil = later
+	state.mu.Unlock()
+	state.scheduleBlacklistExpiry(later)
+	state.mu.Lock()
+	blacklistTimer := state.blacklistTimer
+	state.mu.Unlock()
+	state.scheduleBlacklistExpiry(earlier)
+	state.mu.Lock()
+	blacklistChanged := state.blacklistTimer != blacklistTimer
+	state.mu.Unlock()
+	state.transitionMu.Unlock()
+	if blacklistChanged {
+		t.Fatal("stale blacklist schedule replaced the timer for the extended deadline")
+	}
+}
+
+func TestRecordFailureLogsSanitizedSingleLineError(t *testing.T) {
+	ResetSharedStateStore()
+	t.Cleanup(ResetSharedStateStore)
+	var output bytes.Buffer
+	previousWriter := log.Writer()
+	previousFlags := log.Flags()
+	previousPrefix := log.Prefix()
+	log.SetOutput(&output)
+	log.SetFlags(0)
+	log.SetPrefix("")
+	t.Cleanup(func() {
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+		log.SetPrefix(previousPrefix)
+	})
+
+	proxyPool := &poolOutbound{options: normalizeOptions(Options{FailureThreshold: 3})}
+	member := &memberState{tag: "safe-tag", shared: acquireSharedState("safe-tag")}
+	proxyPool.recordFailure(member, errors.New("dial vless://user:super-secret@example.com:443/path?token=hidden\r\nforged-line"))
+	logged := output.String()
+	for _, secret := range []string{"super-secret", "token=hidden"} {
+		if strings.Contains(logged, secret) {
+			t.Fatalf("pool log leaked unsafe content %q: %q", secret, logged)
+		}
+	}
+	if strings.Count(strings.TrimSuffix(logged, "\n"), "\n") != 0 {
+		t.Fatalf("pool failure produced a multi-line log entry: %q", logged)
 	}
 }
 

@@ -44,3 +44,20 @@ func TestRecoverBoxInitializationPassesThroughResults(t *testing.T) {
 		t.Fatalf("error = %v, want sentinel", err)
 	}
 }
+
+func TestSanitizeBoxInitializationErrorDropsCredentialPayload(t *testing.T) {
+	const secret = "proxy-password-must-not-leak"
+	indexed := sanitizeBoxInitializationError(errors.New("initialize outbound[12]: trojan://" + secret + "@example.com"))
+	if indexed == nil || indexed.Error() != "sing-box failed to initialize outbound[12]" {
+		t.Fatalf("indexed error = %v", indexed)
+	}
+	unindexed := sanitizeBoxInitializationError(errors.New("dial trojan://" + secret + "@example.com"))
+	if unindexed == nil || unindexed.Error() != "sing-box initialization failed" {
+		t.Fatalf("unindexed error = %v", unindexed)
+	}
+	for _, err := range []error{indexed, unindexed} {
+		if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "trojan://") {
+			t.Fatalf("sanitized error leaked credentials: %q", err)
+		}
+	}
+}

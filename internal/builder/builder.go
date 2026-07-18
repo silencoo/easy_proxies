@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/netip"
 	"net/url"
 	"strconv"
@@ -68,9 +69,17 @@ func Build(cfg *config.Config) (option.Options, error) {
 		if cfg.Mode == "multi-port" || cfg.Mode == "hybrid" {
 			meta.ListenAddress = cfg.MultiPort.Address
 			meta.Port = node.Port
+			meta.Username = node.Username
+			meta.Password = node.Password
+			if meta.Username == "" {
+				meta.Username = cfg.MultiPort.Username
+				meta.Password = cfg.MultiPort.Password
+			}
 		} else {
 			meta.ListenAddress = cfg.Listener.Address
 			meta.Port = cfg.Listener.Port
+			meta.Username = cfg.Listener.Username
+			meta.Password = cfg.Listener.Password
 		}
 
 		// Exit IP and region are discovered only after the outbound is started.
@@ -201,9 +210,9 @@ func Build(cfg *config.Config) (option.Options, error) {
 			geoipListen = cfg.Listener.Address
 		}
 		log.Println("🌐 GeoIP Region Routing Enabled:")
-		log.Printf("   Access via: http://%s:%d/{region}", geoipListen, geoipPort)
-		log.Println("   Available regions: /jp, /kr, /us, /hk, /tw, /sg, /other")
-		log.Println("   Default (no path): all nodes pool")
+		log.Printf("   Access via: http://%s:%d", geoipListen, geoipPort)
+		log.Println("   Region selector: proxy username <region> or <username>@<region>")
+		log.Println("   Available regions: jp, kr, us, hk, tw, sg, other; normal credentials use all nodes")
 	}
 
 	opts := option.Options{
@@ -437,15 +446,22 @@ func buildVLESSOptions(u *url.URL, skipCertVerify bool) (option.VLESSOutboundOpt
 }
 
 func buildHysteria2Options(u *url.URL, skipCertVerify bool) (option.Hysteria2OutboundOptions, error) {
-	password := u.User.String()
+	password := u.User.Username()
+	if passwordPart, ok := u.User.Password(); ok {
+		password += ":" + passwordPart
+	}
 	server, port, hopPorts, err := hysteria2HostPort(u, 443)
 	if err != nil {
 		return option.Hysteria2OutboundOptions{}, err
 	}
 	query := u.Query()
-	hopPorts = appendUniqueStrings(hopPorts, parseHysteria2Ports(query.Get("ports"))...)
-	hopPorts = appendUniqueStrings(hopPorts, parseHysteria2Ports(query.Get("server_ports"))...)
-	hopPorts = appendUniqueStrings(hopPorts, parseHysteria2Ports(query.Get("mport"))...)
+	for _, key := range []string{"ports", "server_ports", "mport"} {
+		parsedPorts, parseErr := parseHysteria2Ports(query.Get(key))
+		if parseErr != nil {
+			return option.Hysteria2OutboundOptions{}, fmt.Errorf("invalid Hysteria2 %s: %w", key, parseErr)
+		}
+		hopPorts = appendUniqueStrings(hopPorts, parsedPorts...)
+	}
 	opts := option.Hysteria2OutboundOptions{
 		ServerOptions: option.ServerOptions{Server: server, ServerPort: uint16(port)},
 		Password:      password,
@@ -619,9 +635,13 @@ func buildShadowsocksOptions(rawURI string) (option.ShadowsocksOutboundOptions, 
 	if err != nil {
 		return option.ShadowsocksOutboundOptions{}, err
 	}
+	port, err := checkedPort(parsed.Port)
+	if err != nil {
+		return option.ShadowsocksOutboundOptions{}, fmt.Errorf("invalid Shadowsocks endpoint: %w", err)
+	}
 
 	opts := option.ShadowsocksOutboundOptions{
-		ServerOptions: option.ServerOptions{Server: parsed.Server, ServerPort: uint16(parsed.Port)},
+		ServerOptions: option.ServerOptions{Server: parsed.Server, ServerPort: port},
 		Method:        normalizeShadowsocksMethod(parsed.Method),
 		Password:      parsed.Password,
 	}
@@ -645,8 +665,12 @@ func buildShadowsocksROptions(rawURI string) (option.ShadowsocksROutboundOptions
 	if err != nil {
 		return option.ShadowsocksROutboundOptions{}, err
 	}
+	port, err := checkedPort(parsed.Port)
+	if err != nil {
+		return option.ShadowsocksROutboundOptions{}, fmt.Errorf("invalid ShadowsocksR endpoint: %w", err)
+	}
 	return option.ShadowsocksROutboundOptions{
-		ServerOptions: option.ServerOptions{Server: parsed.Server, ServerPort: uint16(parsed.Port)},
+		ServerOptions: option.ServerOptions{Server: parsed.Server, ServerPort: port},
 		Method:        parsed.Method,
 		Password:      parsed.Password,
 		Protocol:      parsed.Protocol,
@@ -898,17 +922,31 @@ type vmessJSON struct {
 	FP   string      `json:"fp"`   // Fingerprint
 }
 
-func (v *vmessJSON) GetPort() int {
+func (v *vmessJSON) GetPort() (int, error) {
+	var port int
 	switch p := v.Port.(type) {
+	case nil:
+		return 443, nil
 	case float64:
-		return int(p)
+		if math.IsNaN(p) || math.IsInf(p, 0) || p != math.Trunc(p) || p < 1 || p > 65535 {
+			return 0, errors.New("invalid vmess port")
+		}
+		port = int(p)
 	case int:
-		return p
+		port = p
 	case string:
-		port, _ := strconv.Atoi(p)
-		return port
+		var err error
+		port, err = strconv.Atoi(strings.TrimSpace(p))
+		if err != nil {
+			return 0, errors.New("invalid vmess port")
+		}
+	default:
+		return 0, errors.New("invalid vmess port")
 	}
-	return 443
+	if _, err := checkedPort(port); err != nil {
+		return 0, fmt.Errorf("invalid vmess port: %w", err)
+	}
+	return port, nil
 }
 
 func (v *vmessJSON) GetAlterId() int {
@@ -951,9 +989,9 @@ func buildVMessOptions(rawURI string, skipCertVerify bool) (option.VMessOutbound
 		return option.VMessOutboundOptions{}, errors.New("vmess missing uuid")
 	}
 
-	port := vmess.GetPort()
-	if port == 0 {
-		port = 443
+	port, err := vmess.GetPort()
+	if err != nil {
+		return option.VMessOutboundOptions{}, err
 	}
 
 	opts := option.VMessOutboundOptions{
@@ -1124,7 +1162,17 @@ func hostPort(u *url.URL, defaultPort int) (string, int, error) {
 	if err != nil {
 		return "", 0, fmt.Errorf("invalid port %q", portStr)
 	}
+	if _, err := checkedPort(port); err != nil {
+		return "", 0, fmt.Errorf("invalid port %q: %w", portStr, err)
+	}
 	return host, port, nil
+}
+
+func checkedPort(port int) (uint16, error) {
+	if port < 1 || port > 65535 {
+		return 0, errors.New("port must be between 1 and 65535")
+	}
+	return uint16(port), nil
 }
 
 func normalizeHysteria2PortHoppingURI(rawURI string) (string, bool) {
@@ -1173,7 +1221,8 @@ func normalizeHysteria2PortHoppingURI(rawURI string) (string, bool) {
 	if _, err := strconv.Atoi(rawPort); err == nil {
 		return "", false
 	}
-	if !looksLikeHysteria2PortSet(rawPort) {
+	parsedPorts, err := parseHysteria2Ports(rawPort)
+	if err != nil || len(parsedPorts) == 0 {
 		return "", false
 	}
 
@@ -1182,7 +1231,7 @@ func normalizeHysteria2PortHoppingURI(rawURI string) (string, bool) {
 		values = url.Values{}
 	}
 	if strings.TrimSpace(values.Get("ports")) == "" && strings.TrimSpace(values.Get("server_ports")) == "" && strings.TrimSpace(values.Get("mport")) == "" {
-		values.Set("ports", rawPort)
+		values.Set("ports", strings.Join(parsedPorts, ","))
 	}
 
 	normalizedURI := fmt.Sprintf("%s://%s@%s:%d", scheme, userInfo, host, 443)
@@ -1194,23 +1243,13 @@ func normalizeHysteria2PortHoppingURI(rawURI string) (string, bool) {
 	return normalizedURI, true
 }
 
-func looksLikeHysteria2PortSet(v string) bool {
-	if v == "" {
-		return false
-	}
-	for _, r := range v {
-		if (r >= '0' && r <= '9') || r == '-' || r == ',' {
-			continue
-		}
-		return false
-	}
-	return true
-}
-
 func hysteria2HostPort(u *url.URL, defaultPort int) (string, int, []string, error) {
 	host := u.Hostname()
 	if host == "" {
 		return "", 0, nil, errors.New("missing host")
+	}
+	if _, err := checkedPort(defaultPort); err != nil {
+		return "", 0, nil, fmt.Errorf("invalid default port: %w", err)
 	}
 
 	port := defaultPort
@@ -1221,37 +1260,79 @@ func hysteria2HostPort(u *url.URL, defaultPort int) (string, int, []string, erro
 	}
 
 	if numericPort, err := strconv.Atoi(rawPort); err == nil {
+		if _, rangeErr := checkedPort(numericPort); rangeErr != nil {
+			return "", 0, nil, fmt.Errorf("invalid Hysteria2 port %q: %w", rawPort, rangeErr)
+		}
 		return host, numericPort, hopPorts, nil
 	}
 
-	hopPorts = append(hopPorts, rawPort)
+	parsedPorts, err := parseHysteria2Ports(rawPort)
+	if err != nil {
+		return "", 0, nil, fmt.Errorf("invalid Hysteria2 port set %q: %w", rawPort, err)
+	}
+	hopPorts = append(hopPorts, parsedPorts...)
 	return host, port, hopPorts, nil
 }
 
-func parseHysteria2Ports(value string) []string {
+func parseHysteria2Ports(value string) ([]string, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return nil
+		return nil, nil
 	}
 	parts := strings.Split(value, ",")
 	ports := make([]string, 0, len(parts))
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
-		if part != "" {
-			ports = append(ports, normalizeHysteria2PortRange(part))
+		if part == "" {
+			return nil, errors.New("empty port in list")
 		}
+		normalized, err := normalizeHysteria2PortRange(part)
+		if err != nil {
+			return nil, err
+		}
+		ports = append(ports, normalized)
 	}
-	return ports
+	return ports, nil
 }
 
-func normalizeHysteria2PortRange(portRange string) string {
-	if strings.Contains(portRange, ":") {
-		return portRange
+func normalizeHysteria2PortRange(portRange string) (string, error) {
+	portRange = strings.TrimSpace(portRange)
+	separator := ""
+	if strings.Count(portRange, ":") == 1 && !strings.Contains(portRange, "-") {
+		separator = ":"
+	} else if strings.Count(portRange, "-") == 1 && !strings.Contains(portRange, ":") {
+		separator = "-"
+	} else if strings.ContainsAny(portRange, ":-") {
+		return "", fmt.Errorf("invalid port range %q", portRange)
 	}
-	if strings.Count(portRange, "-") == 1 {
-		return strings.Replace(portRange, "-", ":", 1)
+
+	if separator == "" {
+		port, err := strconv.Atoi(portRange)
+		if err != nil {
+			return "", fmt.Errorf("invalid port %q", portRange)
+		}
+		if _, err := checkedPort(port); err != nil {
+			return "", fmt.Errorf("invalid port %q: %w", portRange, err)
+		}
+		return strconv.Itoa(port), nil
 	}
-	return portRange
+
+	startText, endText, _ := strings.Cut(portRange, separator)
+	start, startErr := strconv.Atoi(strings.TrimSpace(startText))
+	end, endErr := strconv.Atoi(strings.TrimSpace(endText))
+	if startErr != nil || endErr != nil {
+		return "", fmt.Errorf("invalid port range %q", portRange)
+	}
+	if _, err := checkedPort(start); err != nil {
+		return "", fmt.Errorf("invalid range start %q: %w", startText, err)
+	}
+	if _, err := checkedPort(end); err != nil {
+		return "", fmt.Errorf("invalid range end %q: %w", endText, err)
+	}
+	if start > end {
+		return "", fmt.Errorf("invalid descending port range %q", portRange)
+	}
+	return strconv.Itoa(start) + ":" + strconv.Itoa(end), nil
 }
 
 func appendUniqueStrings(base []string, values ...string) []string {
@@ -1309,7 +1390,11 @@ func buildSOCKSOptions(u *url.URL) (option.SOCKSOutboundOptions, error) {
 }
 
 func buildHTTPProxyOptions(u *url.URL, skipCertVerify bool) (option.HTTPOutboundOptions, error) {
-	server, port, err := hostPort(u, 8080)
+	defaultPort := 8080
+	if strings.EqualFold(u.Scheme, "https") {
+		defaultPort = 443
+	}
+	server, port, err := hostPort(u, defaultPort)
 	if err != nil {
 		return option.HTTPOutboundOptions{}, err
 	}
@@ -1383,15 +1468,12 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 
 	if showPoolEntry {
 		// Pool mode: single entry point for all nodes
-		var auth string
-		if cfg.Listener.Username != "" {
-			auth = fmt.Sprintf("%s:%s@", cfg.Listener.Username, cfg.Listener.Password)
-		}
-		httpProxyURL := fmt.Sprintf("http://%s%s:%d", auth, cfg.Listener.Address, cfg.Listener.Port)
-		socksProxyURL := fmt.Sprintf("socks5://%s%s:%d", auth, cfg.Listener.Address, cfg.Listener.Port)
+		httpProxyURL := fmt.Sprintf("http://%s:%d", cfg.Listener.Address, cfg.Listener.Port)
+		socksProxyURL := fmt.Sprintf("socks5://%s:%d", cfg.Listener.Address, cfg.Listener.Port)
 		log.Printf("🌐 Pool Entry Point:")
 		log.Printf("   HTTP:   %s", httpProxyURL)
 		log.Printf("   SOCKS5: %s", socksProxyURL)
+		log.Printf("   Authentication: %s", authenticationLogStatus(cfg.Listener.Username != ""))
 		log.Println("")
 		log.Printf("   Nodes in pool (%d):", len(metadata))
 		for _, meta := range metadata {
@@ -1407,24 +1489,23 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 		log.Printf("🔌 Multi-Port Entry Points (%d nodes):", len(cfg.Nodes))
 		log.Println("")
 		for _, node := range cfg.Nodes {
-			var auth string
-			username := node.Username
-			password := node.Password
-			if username == "" {
-				username = cfg.MultiPort.Username
-				password = cfg.MultiPort.Password
-			}
-			if username != "" {
-				auth = fmt.Sprintf("%s:%s@", username, password)
-			}
-			httpProxyURL := fmt.Sprintf("http://%s%s:%d", auth, cfg.MultiPort.Address, node.Port)
-			socksProxyURL := fmt.Sprintf("socks5://%s%s:%d", auth, cfg.MultiPort.Address, node.Port)
+			authConfigured := node.Username != "" || cfg.MultiPort.Username != ""
+			httpProxyURL := fmt.Sprintf("http://%s:%d", cfg.MultiPort.Address, node.Port)
+			socksProxyURL := fmt.Sprintf("socks5://%s:%d", cfg.MultiPort.Address, node.Port)
 			log.Printf("   [%d] %s", node.Port, node.Name)
 			log.Printf("       HTTP:   %s", httpProxyURL)
 			log.Printf("       SOCKS5: %s", socksProxyURL)
+			log.Printf("       Authentication: %s", authenticationLogStatus(authConfigured))
 		}
 	}
 
 	log.Println("═══════════════════════════════════════════════════════════════")
 	log.Println("")
+}
+
+func authenticationLogStatus(configured bool) string {
+	if configured {
+		return "configured (credentials omitted)"
+	}
+	return "not configured"
 }

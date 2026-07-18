@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -36,6 +37,8 @@ const (
 	modeBalance    = "balance"
 	modeLatency    = "latency"
 )
+
+var errPoolClosed = errors.New("proxy pool is closed")
 
 // Options controls pool outbound behaviour.
 type Options struct {
@@ -82,6 +85,8 @@ type MemberMeta struct {
 	Mode          string
 	ListenAddress string
 	Port          uint16
+	Username      string
+	Password      string
 	Region        string // GeoIP region code: "jp", "kr", "us", "hk", "tw", "other"
 	Country       string // Full country name from GeoIP
 	ExitIP        string // Public egress IP observed through this node
@@ -143,6 +148,7 @@ type poolOutbound struct {
 	members     []*memberState
 	memberByTag map[string]*memberState
 	mu          sync.Mutex
+	healthMu    sync.RWMutex
 	eligibleMu  sync.RWMutex
 	eligibleTCP memberSet
 	eligibleUDP memberSet
@@ -193,7 +199,9 @@ func newPool(ctx context.Context, _ adapter.Router, logger singlog.ContextLogger
 // handed out by this pool keep their member/outbound references and can drain
 // naturally after the runtime manager swaps in a replacement pool.
 func (p *poolOutbound) Close() error {
+	p.healthMu.Lock()
 	p.closed.Store(true)
+	p.healthMu.Unlock()
 	p.mu.Lock()
 	members := append([]*memberState(nil), p.members...)
 	p.mu.Unlock()
@@ -275,26 +283,60 @@ func (p *poolOutbound) initializeMembersLocked() error {
 		return nil // Already initialized
 	}
 
-	members := make([]*memberState, 0, len(p.options.Members))
+	// Resolve every dependency before installing watchers or monitor callbacks.
+	// A missing later member must not leave resources from an earlier member
+	// attached to the live shared state.
+	type resolvedMember struct {
+		tag      string
+		outbound adapter.Outbound
+	}
+	resolved := make([]resolvedMember, 0, len(p.options.Members))
 	for _, tag := range p.options.Members {
 		detour, loaded := p.manager.Outbound(tag)
 		if !loaded {
 			return E.New("pool member not found: ", tag)
 		}
+		resolved = append(resolved, resolvedMember{tag: tag, outbound: detour})
+	}
 
+	members := make([]*memberState, 0, len(resolved))
+	for _, candidate := range resolved {
 		// Acquire shared state (creates if not exists, reuses if already created)
-		state := acquireSharedState(tag)
+		state := acquireSharedState(candidate.tag)
 
 		member := &memberState{
-			outbound: detour,
-			tag:      tag,
+			outbound: candidate.outbound,
+			tag:      candidate.tag,
 			shared:   state,
 			entry:    state.entryHandle(),
 		}
+		members = append(members, member)
+	}
+
+	installed := make([]*memberState, 0, len(members))
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		for idx := len(installed) - 1; idx >= 0; idx-- {
+			member := installed[idx]
+			if member.unwatch != nil {
+				member.unwatch()
+				member.unwatch = nil
+			}
+			delete(p.memberByTag, member.tag)
+		}
+	}()
+
+	for _, member := range members {
+		tag := member.tag
+		state := member.shared
 		p.memberByTag[tag] = member
 		member.unwatch = state.subscribeBlacklist(func(blacklisted bool) {
 			p.setMemberEligible(member, p.options.Dedicated || !blacklisted)
 		})
+		installed = append(installed, member)
 
 		// Connect to existing monitor entry if available
 		if p.monitor != nil {
@@ -306,6 +348,8 @@ func (p *poolOutbound) initializeMembersLocked() error {
 				Mode:          meta.Mode,
 				ListenAddress: meta.ListenAddress,
 				Port:          meta.Port,
+				Username:      meta.Username,
+				Password:      meta.Password,
 				Region:        meta.Region,
 				Country:       meta.Country,
 				ExitIP:        meta.ExitIP,
@@ -321,16 +365,19 @@ func (p *poolOutbound) initializeMembersLocked() error {
 				}
 			}
 		}
-		members = append(members, member)
 	}
 	p.members = members
 	p.initialized.Store(true)
+	committed = true
 	p.logger.Info("pool initialized with ", len(members), " members")
 
 	return nil
 }
 
 func (p *poolOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	if p.closed.Load() {
+		return nil, errPoolClosed
+	}
 	maxAttempts := p.maxAttempts(ctx)
 	var tried map[string]struct{}
 	if maxAttempts > 1 {
@@ -346,13 +393,23 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 			}
 			return nil, err
 		}
-		p.incActive(member)
+		if !p.admitDial(member) {
+			return nil, errPoolClosed
+		}
 		conn, err := member.outbound.DialContext(ctx, network, destination)
 		if err == nil {
+			if p.closed.Load() {
+				_ = conn.Close()
+				p.decActive(member)
+				return nil, errPoolClosed
+			}
 			p.recordSuccess(member)
 			return p.wrapConn(conn, member), nil
 		}
 		p.decActive(member)
+		if p.closed.Load() {
+			return nil, errPoolClosed
+		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -369,6 +426,9 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 }
 
 func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	if p.closed.Load() {
+		return nil, errPoolClosed
+	}
 	maxAttempts := p.maxAttempts(ctx)
 	var tried map[string]struct{}
 	if maxAttempts > 1 {
@@ -384,13 +444,23 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 			}
 			return nil, err
 		}
-		p.incActive(member)
+		if !p.admitDial(member) {
+			return nil, errPoolClosed
+		}
 		conn, err := member.outbound.ListenPacket(ctx, destination)
 		if err == nil {
+			if p.closed.Load() {
+				_ = conn.Close()
+				p.decActive(member)
+				return nil, errPoolClosed
+			}
 			p.recordSuccess(member)
 			return p.wrapPacketConn(conn, member), nil
 		}
 		p.decActive(member)
+		if p.closed.Load() {
+			return nil, errPoolClosed
+		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -730,30 +800,41 @@ func activeConnections(member *memberState) int32 {
 }
 
 func (p *poolOutbound) recordFailure(member *memberState, cause error) {
+	p.healthMu.RLock()
+	defer p.healthMu.RUnlock()
+	if p.closed.Load() {
+		return
+	}
+	safeCause := monitor.SanitizeProbeError(cause)
 	if member.shared == nil {
-		p.logger.Warn("proxy ", member.tag, " failure (no shared state): ", cause)
+		p.logger.Warn("proxy ", member.tag, " failure (no shared state): ", safeCause)
 		return
 	}
 	decision := member.shared.recordFailure(cause, p.options.FailureThreshold, p.options.BlacklistDuration, p.options.TransientCooldown)
 	if decision.Cooldown {
 		if p.logger != nil {
-			p.logger.Warn("proxy ", member.tag, " cooling down for ", p.options.TransientCooldown, ": ", cause)
+			p.logger.Warn("proxy ", member.tag, " cooling down for ", p.options.TransientCooldown, ": ", safeCause)
 		}
-		log.Printf("[pool] %s cooling down for %s: %v", member.tag, p.options.TransientCooldown, cause)
+		log.Printf("[pool] %s cooling down for %s: %s", member.tag, p.options.TransientCooldown, safeCause)
 	} else if decision.Blacklisted {
 		if p.logger != nil {
-			p.logger.Warn("proxy ", member.tag, " blacklisted for ", p.options.BlacklistDuration, ": ", cause)
+			p.logger.Warn("proxy ", member.tag, " blacklisted for ", p.options.BlacklistDuration, ": ", safeCause)
 		}
-		log.Printf("[pool] %s blacklisted for %s: %v", member.tag, p.options.BlacklistDuration, cause)
+		log.Printf("[pool] %s blacklisted for %s: %s", member.tag, p.options.BlacklistDuration, safeCause)
 	} else {
 		if p.logger != nil {
-			p.logger.Warn("proxy ", member.tag, " failure ", decision.Failures, "/", p.options.FailureThreshold, ": ", cause)
+			p.logger.Warn("proxy ", member.tag, " failure ", decision.Failures, "/", p.options.FailureThreshold, ": ", safeCause)
 		}
-		log.Printf("[pool] %s failure %d/%d: %v", member.tag, decision.Failures, p.options.FailureThreshold, cause)
+		log.Printf("[pool] %s failure %d/%d: %s", member.tag, decision.Failures, p.options.FailureThreshold, safeCause)
 	}
 }
 
 func (p *poolOutbound) recordProbeFailure(member *memberState, cause error) {
+	p.healthMu.RLock()
+	defer p.healthMu.RUnlock()
+	if p.closed.Load() {
+		return
+	}
 	if member.entry != nil {
 		member.entry.MarkInitialCheckDone(false)
 	}
@@ -767,6 +848,11 @@ func (p *poolOutbound) recordProbeFailure(member *memberState, cause error) {
 }
 
 func (p *poolOutbound) recordSuccess(member *memberState) {
+	p.healthMu.RLock()
+	defer p.healthMu.RUnlock()
+	if p.closed.Load() {
+		return
+	}
 	if member.shared != nil {
 		member.shared.recordSuccess()
 	}
@@ -843,10 +929,20 @@ func httpProbe(ctx context.Context, conn net.Conn, host string) (time.Duration, 
 // what releases blocked reads/handshakes and their file descriptors.
 func (p *poolOutbound) probeMember(ctx context.Context, member *memberState, target monitor.ProbeTarget) (time.Duration, error) {
 	start := time.Now()
+	if !p.admitProbe() {
+		return 0, errPoolClosed
+	}
 	rawConn, err := member.outbound.DialContext(ctx, N.NetworkTCP, target.Destination)
 	if err != nil {
+		if p.closed.Load() {
+			return 0, errPoolClosed
+		}
 		p.recordProbeFailure(member, err)
 		return 0, err
+	}
+	if p.closed.Load() {
+		_ = rawConn.Close()
+		return 0, errPoolClosed
 	}
 	stopWatch := watchProbeConnection(ctx, rawConn)
 	defer stopWatch()
@@ -867,16 +963,29 @@ func (p *poolOutbound) probeMember(ctx context.Context, member *memberState, tar
 	}
 
 	duration := time.Since(start)
+	p.healthMu.RLock()
+	defer p.healthMu.RUnlock()
+	if p.closed.Load() {
+		return 0, errPoolClosed
+	}
 	if member.entry != nil {
 		member.entry.RecordSuccessWithLatency(duration)
-		member.entry.MarkInitialCheckDone(true)
 	}
 	if member.shared != nil {
-		// A successful active probe is authoritative and is persisted through
-		// shared state, making the node routable immediately.
-		member.shared.forceRelease()
+		// Recover automatic failures without overriding an administrator's
+		// explicit blacklist.
+		member.shared.releaseAfterProbe()
 	}
 	return duration, nil
+}
+
+// admitProbe linearizes probe admission against Close. The read lock is
+// intentionally released before calling the member: legacy outbounds may
+// ignore context cancellation forever, and must never retain Close's lock.
+func (p *poolOutbound) admitProbe() bool {
+	p.healthMu.RLock()
+	defer p.healthMu.RUnlock()
+	return !p.closed.Load()
 }
 
 func watchProbeConnection(ctx context.Context, conn net.Conn) func() {
@@ -939,6 +1048,20 @@ func (p *poolOutbound) incActive(member *memberState) {
 	if member.shared != nil {
 		member.shared.incActive()
 	}
+}
+
+// admitDial linearizes new outbound work against Close without holding a lock
+// while invoking an arbitrary member implementation. A member dial that was
+// admitted before Close may finish later, but its result is discarded by the
+// post-dial closed check above.
+func (p *poolOutbound) admitDial(member *memberState) bool {
+	p.healthMu.RLock()
+	defer p.healthMu.RUnlock()
+	if p.closed.Load() {
+		return false
+	}
+	p.incActive(member)
+	return true
 }
 
 func (p *poolOutbound) decActive(member *memberState) {

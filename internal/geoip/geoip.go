@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -37,8 +38,16 @@ const (
 
 // Default GeoIP database download URL
 const (
-	DefaultGeoIPURL = "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb"
+	DefaultGeoIPURL            = "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb"
+	maxGeoIPDatabaseSize int64 = 32 << 20
+	geoIPDownloadTimeout       = 60 * time.Second
 )
+
+var geoIPDatabaseURL = DefaultGeoIPURL
+
+var geoIPDownloadClient = &http.Client{Timeout: geoIPDownloadTimeout}
+
+var ErrLookupClosed = errors.New("geoip lookup is closed")
 
 // RegionInfo contains region details
 type RegionInfo struct {
@@ -53,12 +62,24 @@ type Lookup struct {
 	mu             sync.RWMutex
 	path           string
 	updateInterval time.Duration
-	stopChan       chan struct{}
-	updateOnce     sync.Once
 	dnsCache       map[string]RegionInfo
 	cacheMu        sync.RWMutex
 	callbackMu     sync.RWMutex
 	onUpdate       func()
+
+	lifecycleMu     sync.Mutex
+	lifecycleCtx    context.Context
+	lifecycleCancel context.CancelFunc
+	lifecycleWG     sync.WaitGroup
+	updateMu        sync.Mutex
+	closed          bool
+	autoStarted     bool
+	closeDone       chan struct{}
+	closeErr        error
+
+	// updateFn is a lifecycle test seam. Production lookups leave it nil and
+	// execute updateDatabase.
+	updateFn func(context.Context) error
 }
 
 // EnsureDatabase checks if the GeoIP database exists, and downloads it if not
@@ -90,14 +111,14 @@ func EnsureDatabase(dbPath string) error {
 		}
 	}
 
-	// Download with timeout
-	client := &http.Client{Timeout: 60 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, DefaultGeoIPURL, nil)
+	downloadCtx, cancelDownload := context.WithTimeout(context.Background(), geoIPDownloadTimeout)
+	defer cancelDownload()
+	req, err := http.NewRequestWithContext(downloadCtx, http.MethodGet, geoIPDatabaseURL, nil)
 	if err != nil {
 		return fmt.Errorf("create download request: %w", err)
 	}
 
-	resp, err := client.Do(req)
+	resp, err := geoIPDownloadClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("download failed: %w", err)
 	}
@@ -105,6 +126,9 @@ func EnsureDatabase(dbPath string) error {
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("download failed: unexpected status %s", resp.Status)
+	}
+	if err := validateGeoIPContentLength(resp.ContentLength, maxGeoIPDatabaseSize); err != nil {
+		return fmt.Errorf("download failed: %w", err)
 	}
 
 	// Download to temporary file
@@ -123,17 +147,11 @@ func EnsureDatabase(dbPath string) error {
 		}
 	}()
 
-	// Copy with progress tracking
-	progress := &progressWriter{total: resp.ContentLength}
-	reader := io.TeeReader(resp.Body, progress)
-	written, err := io.Copy(tempFile, reader)
-	if err != nil {
+	if _, err := copyGeoIPDatabase(tempFile, resp, maxGeoIPDatabaseSize); err != nil {
 		return fmt.Errorf("download failed: %w", err)
 	}
-
-	// Verify download completeness
-	if resp.ContentLength > 0 && written < resp.ContentLength {
-		return fmt.Errorf("incomplete download (%d/%d bytes)", written, resp.ContentLength)
+	if err := downloadCtx.Err(); err != nil {
+		return fmt.Errorf("download failed: %w", err)
 	}
 
 	// Sync and close temp file
@@ -158,6 +176,9 @@ func EnsureDatabase(dbPath string) error {
 	}
 	if err := candidate.Close(); err != nil {
 		return fmt.Errorf("close downloaded database: %w", err)
+	}
+	if err := downloadCtx.Err(); err != nil {
+		return fmt.Errorf("download failed: %w", err)
 	}
 
 	// Atomic rename
@@ -196,6 +217,46 @@ func (p *progressWriter) Write(b []byte) (int, error) {
 	}
 
 	return n, nil
+}
+
+// copyGeoIPDatabase enforces the same hard response limit for initial
+// downloads and periodic updates. Content-Length is only an early rejection;
+// the limited reader remains authoritative for chunked, compressed, or
+// dishonest responses.
+func copyGeoIPDatabase(destination io.Writer, response *http.Response, limit int64) (int64, error) {
+	if destination == nil || response == nil || response.Body == nil {
+		return 0, errors.New("invalid GeoIP download response")
+	}
+	if limit <= 0 {
+		return 0, errors.New("invalid GeoIP database size limit")
+	}
+	if err := validateGeoIPContentLength(response.ContentLength, limit); err != nil {
+		return 0, err
+	}
+
+	progress := &progressWriter{total: response.ContentLength}
+	reader := io.LimitReader(response.Body, limit+1)
+	written, err := io.Copy(destination, io.TeeReader(reader, progress))
+	if err != nil {
+		return written, err
+	}
+	if written > limit {
+		return written, fmt.Errorf("GeoIP database exceeds %d bytes", limit)
+	}
+	if response.ContentLength >= 0 && written != response.ContentLength {
+		return written, fmt.Errorf("incomplete download (%d/%d bytes)", written, response.ContentLength)
+	}
+	return written, nil
+}
+
+func validateGeoIPContentLength(contentLength, limit int64) error {
+	if limit <= 0 {
+		return errors.New("invalid GeoIP database size limit")
+	}
+	if contentLength > limit {
+		return fmt.Errorf("GeoIP database exceeds %d bytes", limit)
+	}
+	return nil
 }
 
 // validateMMDB performs basic validation of MMDB file format
@@ -242,7 +303,7 @@ func New(dbPath string) (*Lookup, error) {
 // NewWithAutoUpdate creates a new GeoIP lookup instance with auto-update support
 func NewWithAutoUpdate(dbPath string, updateInterval time.Duration) (*Lookup, error) {
 	if dbPath == "" {
-		return &Lookup{}, nil
+		return newLookup(nil, "", 0), nil
 	}
 
 	// Ensure database exists (download if needed)
@@ -255,35 +316,65 @@ func NewWithAutoUpdate(dbPath string, updateInterval time.Duration) (*Lookup, er
 		return nil, err
 	}
 
-	lookup := &Lookup{
-		db:             db,
-		path:           dbPath,
-		updateInterval: updateInterval,
-		stopChan:       make(chan struct{}),
-		dnsCache:       make(map[string]RegionInfo),
-	}
+	lookup := newLookup(db, dbPath, updateInterval)
 
 	// Start auto-update goroutine if interval is set
 	if updateInterval > 0 {
-		go lookup.autoUpdateLoop()
+		lookup.startAutoUpdate()
 		log.Printf("🔄 GeoIP auto-update enabled (interval: %v)", updateInterval)
 	}
 
 	return lookup, nil
 }
 
-// autoUpdateLoop periodically updates the GeoIP database
-func (l *Lookup) autoUpdateLoop() {
+func newLookup(db *geoip2.Reader, path string, updateInterval time.Duration) *Lookup {
+	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
+	return &Lookup{
+		db:              db,
+		path:            path,
+		updateInterval:  updateInterval,
+		dnsCache:        make(map[string]RegionInfo),
+		lifecycleCtx:    lifecycleCtx,
+		lifecycleCancel: lifecycleCancel,
+	}
+}
+
+func (l *Lookup) lifecycleContextLocked() context.Context {
+	if l.lifecycleCtx == nil {
+		l.lifecycleCtx, l.lifecycleCancel = context.WithCancel(context.Background())
+	}
+	return l.lifecycleCtx
+}
+
+func (l *Lookup) startAutoUpdate() {
+	if l == nil || l.updateInterval <= 0 {
+		return
+	}
+	l.lifecycleMu.Lock()
+	if l.closed || l.autoStarted {
+		l.lifecycleMu.Unlock()
+		return
+	}
+	l.autoStarted = true
+	ctx := l.lifecycleContextLocked()
+	l.lifecycleWG.Add(1)
+	l.lifecycleMu.Unlock()
+	go l.autoUpdateLoop(ctx)
+}
+
+// autoUpdateLoop periodically updates the GeoIP database.
+func (l *Lookup) autoUpdateLoop(ctx context.Context) {
+	defer l.lifecycleWG.Done()
 	ticker := time.NewTicker(l.updateInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			if err := l.Update(); err != nil {
+			if err := l.runUpdate(); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrLookupClosed) {
 				log.Printf("⚠️  GeoIP auto-update failed: %v", err)
 			}
-		case <-l.stopChan:
+		case <-ctx.Done():
 			return
 		}
 	}
@@ -291,14 +382,68 @@ func (l *Lookup) autoUpdateLoop() {
 
 // Update downloads and reloads the GeoIP database
 func (l *Lookup) Update() error {
+	return l.runUpdate()
+}
+
+func (l *Lookup) beginUpdate() (context.Context, func(), error) {
+	if l == nil {
+		return nil, nil, ErrLookupClosed
+	}
+	l.lifecycleMu.Lock()
+	if l.closed {
+		l.lifecycleMu.Unlock()
+		return nil, nil, ErrLookupClosed
+	}
+	ctx := l.lifecycleContextLocked()
+	l.lifecycleWG.Add(1)
+	l.lifecycleMu.Unlock()
+	return ctx, l.lifecycleWG.Done, nil
+}
+
+func (l *Lookup) runUpdate() error {
+	ctx, finish, err := l.beginUpdate()
+	if err != nil {
+		return err
+	}
+	defer finish()
+
+	updateErr := func() error {
+		l.updateMu.Lock()
+		defer l.updateMu.Unlock()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		update := l.updateFn
+		if update == nil {
+			update = l.updateDatabase
+		}
+		return update(ctx)
+	}()
+	if updateErr != nil {
+		return updateErr
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	l.notifyUpdate()
+	return nil
+}
+
+func (l *Lookup) updateDatabase(ctx context.Context) error {
 	log.Printf("🔄 Updating GeoIP database...")
+	if strings.TrimSpace(l.path) == "" {
+		return errors.New("GeoIP database path is empty")
+	}
 
 	// Download to temporary file
 	tempPath := l.path + ".update"
-	if err := downloadDatabase(tempPath); err != nil {
+	if err := downloadDatabaseContext(ctx, tempPath); err != nil {
 		return fmt.Errorf("download failed: %w", err)
 	}
 	defer os.Remove(tempPath) // Clean up temp file
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// Validate the downloaded database
 	if err := validateMMDB(tempPath); err != nil {
@@ -310,6 +455,9 @@ func (l *Lookup) Update() error {
 	}
 	if err := candidate.Close(); err != nil {
 		return fmt.Errorf("close downloaded database: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	// On Windows the active MMDB is memory-mapped and cannot be replaced while
@@ -345,22 +493,38 @@ func (l *Lookup) Update() error {
 	l.cacheMu.Unlock()
 
 	log.Printf("✅ GeoIP database updated successfully")
-	l.notifyUpdate()
 	return nil
 }
 
 // SetUpdateCallback installs a callback invoked after a successful database
 // swap. The latest callback replaces the previous one.
 func (l *Lookup) SetUpdateCallback(callback func()) {
+	if l == nil {
+		return
+	}
+	l.lifecycleMu.Lock()
+	defer l.lifecycleMu.Unlock()
+	if l.closed {
+		return
+	}
 	l.callbackMu.Lock()
 	l.onUpdate = callback
 	l.callbackMu.Unlock()
 }
 
 func (l *Lookup) notifyUpdate() {
+	if l == nil {
+		return
+	}
+	l.lifecycleMu.Lock()
+	if l.closed {
+		l.lifecycleMu.Unlock()
+		return
+	}
 	l.callbackMu.RLock()
 	callback := l.onUpdate
 	l.callbackMu.RUnlock()
+	l.lifecycleMu.Unlock()
 	if callback != nil {
 		func() {
 			defer func() {
@@ -375,6 +539,15 @@ func (l *Lookup) notifyUpdate() {
 
 // downloadDatabase downloads the GeoIP database to the specified path
 func downloadDatabase(dbPath string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), geoIPDownloadTimeout)
+	defer cancel()
+	return downloadDatabaseContext(ctx, dbPath)
+}
+
+func downloadDatabaseContext(ctx context.Context, dbPath string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// Create parent directory if needed
 	dir := filepath.Dir(dbPath)
 	if dir != "" && dir != "." {
@@ -383,14 +556,12 @@ func downloadDatabase(dbPath string) error {
 		}
 	}
 
-	// Download with timeout
-	client := &http.Client{Timeout: 60 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, DefaultGeoIPURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, geoIPDatabaseURL, nil)
 	if err != nil {
 		return fmt.Errorf("create download request: %w", err)
 	}
 
-	resp, err := client.Do(req)
+	resp, err := geoIPDownloadClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -398,6 +569,9 @@ func downloadDatabase(dbPath string) error {
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("unexpected status %s", resp.Status)
+	}
+	if err := validateGeoIPContentLength(resp.ContentLength, maxGeoIPDatabaseSize); err != nil {
+		return err
 	}
 
 	// Create temp file
@@ -416,17 +590,11 @@ func downloadDatabase(dbPath string) error {
 		}
 	}()
 
-	// Copy with progress tracking
-	progress := &progressWriter{total: resp.ContentLength}
-	reader := io.TeeReader(resp.Body, progress)
-	written, err := io.Copy(tempFile, reader)
-	if err != nil {
+	if _, err := copyGeoIPDatabase(tempFile, resp, maxGeoIPDatabaseSize); err != nil {
 		return err
 	}
-
-	// Verify download completeness
-	if resp.ContentLength > 0 && written < resp.ContentLength {
-		return fmt.Errorf("incomplete download (%d/%d bytes)", written, resp.ContentLength)
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	// Sync and close
@@ -437,6 +605,9 @@ func downloadDatabase(dbPath string) error {
 		return err
 	}
 	tempFile = nil
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// Rename to target path
 	if err := config.ReplaceFileAtomic(tempPath, dbPath); err != nil {
@@ -449,21 +620,50 @@ func downloadDatabase(dbPath string) error {
 
 // Close closes the GeoIP database and stops auto-update
 func (l *Lookup) Close() error {
-	// Stop auto-update goroutine
-	l.updateOnce.Do(func() {
-		if l.stopChan != nil {
-			close(l.stopChan)
+	if l == nil {
+		return nil
+	}
+	l.lifecycleMu.Lock()
+	if l.closed {
+		done := l.closeDone
+		l.lifecycleMu.Unlock()
+		if done != nil {
+			<-done
 		}
-	})
-
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.db != nil {
-		err := l.db.Close()
-		l.db = nil
+		l.lifecycleMu.Lock()
+		err := l.closeErr
+		l.lifecycleMu.Unlock()
 		return err
 	}
-	return nil
+	l.closed = true
+	l.closeDone = make(chan struct{})
+	closeDone := l.closeDone
+	if l.lifecycleCancel != nil {
+		l.lifecycleCancel()
+	}
+	l.callbackMu.Lock()
+	l.onUpdate = nil
+	l.callbackMu.Unlock()
+	l.lifecycleMu.Unlock()
+
+	// beginUpdate registers each update before Close can mark the lifecycle
+	// closed. Waiting here therefore covers the periodic loop, queued updates,
+	// the active download, database replacement, and its callback.
+	l.lifecycleWG.Wait()
+
+	l.mu.Lock()
+	var closeErr error
+	if l.db != nil {
+		closeErr = l.db.Close()
+		l.db = nil
+	}
+	l.mu.Unlock()
+
+	l.lifecycleMu.Lock()
+	l.closeErr = closeErr
+	close(closeDone)
+	l.lifecycleMu.Unlock()
+	return closeErr
 }
 
 // IsEnabled returns true if GeoIP lookup is available

@@ -3,6 +3,7 @@ package boxmgr
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -14,8 +15,104 @@ import (
 	"time"
 
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/geoip"
 	"easy_proxies/internal/monitor"
 )
+
+func TestNodeLevelReloadKeepsGeoCredentialsUntilCommit(t *testing.T) {
+	listenPort := findManagerTestPort(t)
+	geoPort := findManagerTestPort(t)
+	for geoPort == listenPort {
+		geoPort = findManagerTestPort(t)
+	}
+	cfg := &config.Config{
+		Mode: "multi-port",
+		MultiPort: config.MultiPortConfig{
+			Address:  "127.0.0.1",
+			BasePort: listenPort,
+			Username: "old-user",
+			Password: "old-password",
+		},
+		Nodes: []config.NodeConfig{{
+			Name: "credential-node",
+			URI:  "socks5://127.0.0.1:9#credential-node",
+			Port: listenPort,
+		}},
+	}
+	cfg.SetFilePath(filepath.Join(t.TempDir(), "config.yaml"))
+	if err := cfg.NormalizeWithPortMap(nil); err != nil {
+		t.Fatalf("normalize config: %v", err)
+	}
+	cfg.SubscriptionRefresh.MinAvailableNodes = 0
+
+	manager := New(cfg, monitor.Config{Enabled: false})
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatalf("start manager: %v", err)
+	}
+	defer manager.Close()
+
+	routerCfg := geoip.RouterConfig{
+		Listen:   "127.0.0.1",
+		Port:     geoPort,
+		Username: cfg.MultiPort.Username,
+		Password: cfg.MultiPort.Password,
+	}
+	router := geoip.NewRouter(routerCfg, nil)
+	if err := router.Start(context.Background()); err != nil {
+		t.Fatalf("start GeoIP router: %v", err)
+	}
+	manager.mu.Lock()
+	manager.geoRouter = router
+	manager.cfg.GeoIP = config.GeoIPConfig{Enabled: true, Listen: routerCfg.Listen, Port: routerCfg.Port}
+	instance := manager.currentBox
+	runtimeCtx := manager.runtimeCtx
+	oldOptions := manager.runtimeOptions
+	oldCfg := manager.cfg.Clone()
+	manager.mu.Unlock()
+
+	newCfg := oldCfg.Clone()
+	newCfg.MultiPort.Username = "new-user"
+	newCfg.MultiPort.Password = "new-password"
+	if !canReloadNodesInPlace(oldCfg, newCfg) {
+		t.Fatal("credential-only multi-port update unexpectedly requires full handoff")
+	}
+
+	reachedCommit := make(chan struct{})
+	releaseCommit := make(chan struct{})
+	manager.beforeRuntimeCommit = func() {
+		close(reachedCommit)
+		<-releaseCommit
+	}
+	defer func() { manager.beforeRuntimeCommit = nil }()
+	operationCtx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		manager.reloadMu.Lock()
+		result <- manager.reloadNodesInPlace(operationCtx, runtimeCtx, instance, oldCfg, oldOptions, newCfg)
+		manager.reloadMu.Unlock()
+	}()
+
+	select {
+	case <-reachedCommit:
+	case <-time.After(5 * time.Second):
+		cancel()
+		close(releaseCommit)
+		t.Fatal("node-level reload did not reach the final commit boundary")
+	}
+	if got := router.Config(); got.Username != routerCfg.Username || got.Password != routerCfg.Password {
+		cancel()
+		close(releaseCommit)
+		t.Fatalf("uncommitted GeoIP credentials were published: %#v", got)
+	}
+	cancel()
+	close(releaseCommit)
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("reload error = %v, want context cancellation", err)
+	}
+	if got := router.Config(); got.Username != routerCfg.Username || got.Password != routerCfg.Password {
+		t.Fatalf("failed reload changed GeoIP credentials: %#v", got)
+	}
+}
 
 func TestNodeLevelReloadRejectsUnhealthyCandidateBeforeCutover(t *testing.T) {
 	probeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -39,6 +136,10 @@ func TestNodeLevelReloadRejectsUnhealthyCandidateBeforeCutover(t *testing.T) {
 		SubscriptionRefresh: config.SubscriptionRefreshConfig{
 			MinAvailableNodes:  1,
 			HealthCheckTimeout: 2 * time.Second,
+		},
+		Management: config.ManagementConfig{
+			Listen:      "127.0.0.1:9091",
+			ProbeTarget: probeServer.URL,
 		},
 	}
 	cfg.SetFilePath(filepath.Join(t.TempDir(), "config.yaml"))
@@ -87,6 +188,87 @@ func TestNodeLevelReloadRejectsUnhealthyCandidateBeforeCutover(t *testing.T) {
 		t.Fatalf("unexpected SOCKS greeting response: %v", response)
 	}
 	assertListenerAccepts(t, listenPort)
+}
+
+func TestNodeLevelReloadSynchronouslyRecordsCandidateHealth(t *testing.T) {
+	probeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer probeServer.Close()
+	healthyUpstream := startTestSOCKS5Proxy(t)
+	firstPort := findManagerTestPort(t)
+	secondPort := findManagerTestPort(t)
+	for secondPort == firstPort {
+		secondPort = findManagerTestPort(t)
+	}
+
+	cfg := &config.Config{
+		Mode: "multi-port",
+		MultiPort: config.MultiPortConfig{
+			Address:  "127.0.0.1",
+			BasePort: firstPort,
+		},
+		Nodes: []config.NodeConfig{{
+			Name: "healthy",
+			URI:  "socks5://" + healthyUpstream + "#healthy",
+			Port: firstPort,
+		}},
+		SubscriptionRefresh: config.SubscriptionRefreshConfig{
+			MinAvailableNodes:  1,
+			HealthCheckTimeout: 2 * time.Second,
+		},
+		Management: config.ManagementConfig{
+			Listen:      "127.0.0.1:9091",
+			ProbeTarget: probeServer.URL,
+		},
+	}
+	cfg.SetFilePath(filepath.Join(t.TempDir(), "config.yaml"))
+	if err := cfg.NormalizeWithPortMap(nil); err != nil {
+		t.Fatalf("normalize config: %v", err)
+	}
+
+	manager := New(cfg, monitor.Config{Enabled: false, ProbeTarget: probeServer.URL})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := manager.Start(ctx); err != nil {
+		t.Fatalf("start manager: %v", err)
+	}
+	defer manager.Close()
+
+	closedProxyPort := findManagerTestPort(t)
+	replacement := *cfg
+	replacement.Nodes = append(cloneNodes(cfg.Nodes), config.NodeConfig{
+		Name: "unhealthy-added",
+		URI:  fmt.Sprintf("socks5://127.0.0.1:%d#unhealthy-added", closedProxyPort),
+		Port: secondPort,
+	})
+	replacement.SetFilePath(cfg.FilePath())
+	if err := replacement.NormalizeWithPortMap(manager.CurrentPortMap()); err != nil {
+		t.Fatalf("normalize replacement: %v", err)
+	}
+	if err := manager.Reload(&replacement); err != nil {
+		t.Fatalf("node-level reload: %v", err)
+	}
+
+	var healthy, unhealthy *monitor.Snapshot
+	for _, snapshot := range manager.MonitorManager().Snapshot() {
+		snapshot := snapshot
+		switch snapshot.Name {
+		case "healthy":
+			healthy = &snapshot
+		case "unhealthy-added":
+			unhealthy = &snapshot
+		}
+	}
+	if healthy == nil || unhealthy == nil {
+		t.Fatalf("missing monitor snapshots: healthy=%v unhealthy=%v", healthy != nil, unhealthy != nil)
+	}
+	if !healthy.InitialCheckDone || !healthy.Available {
+		t.Fatalf("healthy node was not synchronously marked available: %+v", *healthy)
+	}
+	if !unhealthy.InitialCheckDone || unhealthy.Available {
+		t.Fatalf("unhealthy node was not synchronously excluded: %+v", *unhealthy)
+	}
 }
 
 func TestNodeLevelReloadKeepsUnchangedConnectionAndAddsListener(t *testing.T) {
@@ -140,6 +322,9 @@ func TestNodeLevelReloadKeepsUnchangedConnectionAndAddsListener(t *testing.T) {
 	if err := replacement.NormalizeWithPortMap(manager.CurrentPortMap()); err != nil {
 		t.Fatalf("normalize replacement: %v", err)
 	}
+	// This test exercises connection-preserving listener changes, not health
+	// gating. Normalize applies the production default minimum of one.
+	replacement.SubscriptionRefresh.MinAvailableNodes = 0
 	if err := manager.Reload(&replacement); err != nil {
 		t.Fatalf("node-level reload: %v", err)
 	}
