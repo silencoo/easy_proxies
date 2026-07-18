@@ -39,6 +39,32 @@ func TestNodeKeyIgnoresVMessDisplayName(t *testing.T) {
 	}
 }
 
+func TestSSRNodeKeyIgnoresRemarksAndGroup(t *testing.T) {
+	base := clashProxy{
+		Type: "ssr", Server: "example.com", Port: 443,
+		Protocol: "auth_aes128_md5", Cipher: "aes-256-cfb", Obfs: "tls1.2_ticket_auth",
+		Password: "secret", ProtocolParam: "protocol-param", ObfsParam: "obfs-param",
+	}
+	firstConfig := base
+	firstConfig.Name = "first name"
+	firstURI := buildShadowsocksRURI(firstConfig)
+	secondConfig := base
+	secondConfig.Name = "renamed node"
+	secondURI := buildShadowsocksRURI(secondConfig)
+
+	first := NodeConfig{URI: firstURI}
+	second := NodeConfig{URI: secondURI}
+	if first.NodeKey() != second.NodeKey() {
+		t.Fatal("SSR remarks changed the stable node key")
+	}
+
+	changed := base
+	changed.Password = "different-secret"
+	if first.NodeKey() == (&NodeConfig{URI: buildShadowsocksRURI(changed)}).NodeKey() {
+		t.Fatal("SSR password change did not change the stable node key")
+	}
+}
+
 func TestDedicatedPortsPersistAcrossRestartAndReordering(t *testing.T) {
 	tempDir := t.TempDir()
 	basePort := findAvailablePortRange(t, 4)

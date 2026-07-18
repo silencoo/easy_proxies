@@ -10,6 +10,7 @@ func TestParseClashYAML_Hysteria2PortHoppingAndObfs(t *testing.T) {
   - name: "test-hy2"
     type: "hysteria2"
     server: example.com
+    port: 443
     ports: 10000-20000
     password: "secret"
     obfs: "salamander"

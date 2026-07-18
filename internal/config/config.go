@@ -15,8 +15,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
+	"easy_proxies/internal/probetarget"
 	"easy_proxies/internal/ssruri"
 
 	"gopkg.in/yaml.v3"
@@ -120,17 +122,20 @@ type ManagementConfig struct {
 	ProbeTarget      string `yaml:"probe_target"`
 	ProbeConcurrency int    `yaml:"probe_concurrency"` // 全局批量探测并发数（1-1024，默认 32）
 	Password         string `yaml:"password"`          // WebUI 访问密码，为空则不需要密码
+	TLSCertFile      string `yaml:"tls_cert_file,omitempty"`
+	TLSKeyFile       string `yaml:"tls_key_file,omitempty"`
 }
 
 // SubscriptionRefreshConfig controls subscription auto-refresh and reload settings.
 type SubscriptionRefreshConfig struct {
-	Enabled            bool          `yaml:"enabled"`              // 是否启用定时刷新
-	Interval           time.Duration `yaml:"interval"`             // 刷新间隔，默认 1 小时
-	Timeout            time.Duration `yaml:"timeout"`              // 获取订阅的超时时间
-	HealthCheckTimeout time.Duration `yaml:"health_check_timeout"` // 新节点健康检查超时
-	DrainTimeout       time.Duration `yaml:"drain_timeout"`        // 旧实例排空超时时间
-	MinAvailableNodes  int           `yaml:"min_available_nodes"`  // 最少可用节点数，低于此值不切换
-	FetchConcurrency   int           `yaml:"fetch_concurrency"`    // 订阅抓取并发数，默认 16，最大 32
+	Enabled              bool          `yaml:"enabled"`                // 是否启用定时刷新
+	Interval             time.Duration `yaml:"interval"`               // 刷新间隔，默认 1 小时
+	Timeout              time.Duration `yaml:"timeout"`                // 获取订阅的超时时间
+	HealthCheckTimeout   time.Duration `yaml:"health_check_timeout"`   // 新节点健康检查超时
+	DrainTimeout         time.Duration `yaml:"drain_timeout"`          // 旧实例排空超时时间
+	MinAvailableNodes    int           `yaml:"min_available_nodes"`    // 最少可用节点数，低于此值不切换
+	FetchConcurrency     int           `yaml:"fetch_concurrency"`      // 订阅抓取并发数，默认 16，最大 32
+	AllowPrivateNetworks bool          `yaml:"allow_private_networks"` // 显式允许订阅访问回环/私网/链路本地地址
 }
 
 // NodeSource indicates where a node configuration originated from.
@@ -166,8 +171,21 @@ func canonicalNodeURI(rawURI string) string {
 	if rawURI == "" {
 		return ""
 	}
+	lowerURI := strings.ToLower(rawURI)
+	if strings.HasPrefix(lowerURI, "ssr://") || strings.HasPrefix(lowerURI, "shadowsocksr://") {
+		if parsed, err := ssruri.Parse(rawURI); err == nil {
+			parameters := url.Values{}
+			parameters.Set("protocol", parsed.Protocol)
+			parameters.Set("method", parsed.Method)
+			parameters.Set("obfs", parsed.Obfs)
+			parameters.Set("password", parsed.Password)
+			parameters.Set("obfsparam", parsed.ObfsParam)
+			parameters.Set("protoparam", parsed.ProtocolParam)
+			return "ssr://" + net.JoinHostPort(strings.ToLower(parsed.Server), strconv.Itoa(parsed.Port)) + "?" + parameters.Encode()
+		}
+	}
 
-	if strings.HasPrefix(strings.ToLower(rawURI), "vmess://") {
+	if strings.HasPrefix(lowerURI, "vmess://") {
 		payload := rawURI[len("vmess://"):]
 		if idx := strings.IndexByte(payload, '#'); idx >= 0 {
 			payload = payload[:idx]
@@ -198,6 +216,9 @@ func canonicalNodeURI(rawURI string) string {
 
 	parsed, err := url.Parse(rawURI)
 	if err != nil {
+		if fragment := strings.IndexByte(rawURI, '#'); fragment >= 0 {
+			return rawURI[:fragment]
+		}
 		return rawURI
 	}
 	parsed.Scheme = strings.ToLower(parsed.Scheme)
@@ -325,9 +346,18 @@ func (c *Config) normalize() error {
 	if c.Management.ProbeTarget == "" {
 		c.Management.ProbeTarget = "www.apple.com:80"
 	}
+	if _, ready, err := probetarget.Parse(c.Management.ProbeTarget); err != nil || !ready {
+		if err == nil {
+			err = errors.New("probe target is empty")
+		}
+		return fmt.Errorf("invalid management probe_target: %w", err)
+	}
 	if c.Management.Enabled == nil {
 		defaultEnabled := true
 		c.Management.Enabled = &defaultEnabled
+	}
+	if err := ValidateManagementConfig(c.Management); err != nil {
+		return err
 	}
 	c.normalizeGeoIPConfig()
 
@@ -348,6 +378,11 @@ func (c *Config) normalize() error {
 		c.SubscriptionRefresh.MinAvailableNodes = 1
 	}
 	c.SubscriptionRefresh.FetchConcurrency = NormalizeSubscriptionFetchConcurrency(c.SubscriptionRefresh.FetchConcurrency)
+	validatedSubscriptions, err := ValidateSubscriptionURLs(c.Subscriptions)
+	if err != nil {
+		return err
+	}
+	c.Subscriptions = validatedSubscriptions
 
 	// Mark inline nodes with source
 	for idx := range c.Nodes {
@@ -379,25 +414,20 @@ func (c *Config) normalize() error {
 		cachedNodes, cacheErr := loadNodesFromFile(nodesFilePath)
 
 		subNodes, stats := FetchSubscriptionNodes(nil, c.Subscriptions, SubscriptionFetchOptions{
-			Timeout:     c.SubscriptionRefresh.Timeout,
-			Concurrency: c.SubscriptionRefresh.FetchConcurrency,
-			Loggerf:     log.Printf,
+			Timeout:              c.SubscriptionRefresh.Timeout,
+			Concurrency:          c.SubscriptionRefresh.FetchConcurrency,
+			AllowPrivateNetworks: c.SubscriptionRefresh.AllowPrivateNetworks,
+			Loggerf:              log.Printf,
 		})
 		if (stats.Failed > 0 || stats.Empty > 0 || len(subNodes) == 0) && cacheErr == nil && len(cachedNodes) > 0 {
 			log.Printf("⚠️ Keeping %d cached subscription nodes after an incomplete startup refresh", len(cachedNodes))
 			subNodes = cachedNodes
 		}
-		// Mark subscription nodes and write to nodes.txt
+		// Mark subscription nodes. The cache is committed only after BoxManager
+		// successfully starts, so a parseable-but-unbootable subscription cannot
+		// destroy the last known-good restart cache.
 		for idx := range subNodes {
 			subNodes[idx].Source = NodeSourceSubscription
-		}
-		if len(subNodes) > 0 {
-			// Write subscription nodes to nodes.txt
-			if err := writeNodesToFile(nodesFilePath, subNodes); err != nil {
-				log.Printf("⚠️ Failed to write nodes to %q: %v", nodesFilePath, err)
-			} else {
-				log.Printf("✅ Written %d subscription nodes to %s", len(subNodes), nodesFilePath)
-			}
 		}
 		c.Nodes = append(c.Nodes, subNodes...)
 	}
@@ -406,7 +436,7 @@ func (c *Config) normalize() error {
 		return errors.New("config.nodes cannot be empty (configure nodes in config or use nodes_file)")
 	}
 	for idx := range c.Nodes {
-		c.Nodes[idx].Name = strings.TrimSpace(c.Nodes[idx].Name)
+		c.Nodes[idx].Name = sanitizeNodeName(c.Nodes[idx].Name)
 		c.Nodes[idx].URI = strings.TrimSpace(c.Nodes[idx].URI)
 
 		if c.Nodes[idx].URI == "" {
@@ -415,7 +445,7 @@ func (c *Config) normalize() error {
 
 		// Auto-extract name from URI if not provided
 		if c.Nodes[idx].Name == "" {
-			c.Nodes[idx].Name = ExtractNodeName(c.Nodes[idx].URI)
+			c.Nodes[idx].Name = sanitizeNodeName(ExtractNodeName(c.Nodes[idx].URI))
 		}
 		// Fallback to default name if still empty
 		if c.Nodes[idx].Name == "" {
@@ -423,10 +453,19 @@ func (c *Config) normalize() error {
 		}
 
 	}
+	if err := validateUniqueNodeKeys(c.Nodes); err != nil {
+		return err
+	}
 	if err := c.ApplyNodeAuthOverrides(); err != nil {
 		return err
 	}
-	if err := c.assignNodePorts(nil, true); err != nil {
+	if err := c.validateInboundCredentials(); err != nil {
+		return err
+	}
+	// Port assignments are part of the candidate configuration until the
+	// runtime has started successfully.  Persisting here would let a failed
+	// startup replace the last-known-good port map on disk.
+	if err := c.assignNodePorts(nil, false); err != nil {
 		return err
 	}
 	if c.LogLevel == "" {
@@ -492,6 +531,18 @@ func (c *Config) nodeAuthPath() string {
 
 func (c *Config) loadNodeAuthState() (*nodeAuthState, error) {
 	path := c.nodeAuthPath()
+	var state *nodeAuthState
+	err := withFileLock(path, func() error {
+		var err error
+		state, err = loadNodeAuthStateLocked(path)
+		return err
+	})
+	return state, err
+}
+
+// loadNodeAuthStateLocked reads a state snapshot while the caller holds the
+// path's sidecar lock.
+func loadNodeAuthStateLocked(path string) (*nodeAuthState, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return newNodeAuthState(), nil
@@ -518,9 +569,9 @@ func (c *Config) loadNodeAuthState() (*nodeAuthState, error) {
 	return state, nil
 }
 
-func (c *Config) saveNodeAuthState(state *nodeAuthState) error {
+func encodeNodeAuthState(state *nodeAuthState) ([]byte, error) {
 	if state == nil {
-		return errors.New("node auth state is nil")
+		return nil, errors.New("node auth state is nil")
 	}
 	state.Version = nodeAuthVersion
 	if state.Overrides == nil {
@@ -528,12 +579,49 @@ func (c *Config) saveNodeAuthState(state *nodeAuthState) error {
 	}
 	data, err := yaml.Marshal(state)
 	if err != nil {
-		return fmt.Errorf("encode node auth overrides: %w", err)
+		return nil, fmt.Errorf("encode node auth overrides: %w", err)
 	}
-	if err := writeFileWithLock(c.nodeAuthPath(), data, 0o600); err != nil {
-		return fmt.Errorf("write node auth overrides: %w", err)
+	return data, nil
+}
+
+func (c *Config) updateNodeAuthState(update func(*nodeAuthState)) error {
+	_, err := c.updateNodeAuthStateSnapshot(update)
+	return err
+}
+
+func (c *Config) updateNodeAuthStateSnapshot(update func(*nodeAuthState)) (FileSnapshot, error) {
+	if update == nil {
+		return FileSnapshot{}, errors.New("node auth update is nil")
 	}
-	return nil
+	path := c.nodeAuthPath()
+	var snapshot FileSnapshot
+	err := withFileLock(path, func() error {
+		var err error
+		snapshot, err = c.updateNodeAuthStateLocked(update)
+		return err
+	})
+	return snapshot, err
+}
+
+func (c *Config) updateNodeAuthStateLocked(update func(*nodeAuthState)) (FileSnapshot, error) {
+	if update == nil {
+		return FileSnapshot{}, errors.New("node auth update is nil")
+	}
+	path := c.nodeAuthPath()
+	state, err := loadNodeAuthStateLocked(path)
+	if err != nil {
+		return FileSnapshot{}, err
+	}
+	update(state)
+	data, err := encodeNodeAuthState(state)
+	if err != nil {
+		return FileSnapshot{}, err
+	}
+	snapshot, err := writeFileLockedSnapshot(path, data, 0o600)
+	if err != nil {
+		return FileSnapshot{}, fmt.Errorf("write node auth overrides: %w", err)
+	}
+	return snapshot, nil
 }
 
 // ApplyNodeAuthOverrides restores per-node listener credentials for nodes
@@ -561,10 +649,15 @@ func (c *Config) ApplyNodeAuthOverrides() error {
 }
 
 func (c *Config) persistNodeAuthOverrides() error {
-	state, err := c.loadNodeAuthState()
-	if err != nil {
-		return err
-	}
+	_, err := c.updateNodeAuthStateSnapshot(c.applyNodeAuthOverridesToState)
+	return err
+}
+
+func (c *Config) persistNodeAuthOverridesLocked() (FileSnapshot, error) {
+	return c.updateNodeAuthStateLocked(c.applyNodeAuthOverridesToState)
+}
+
+func (c *Config) applyNodeAuthOverridesToState(state *nodeAuthState) {
 	for _, node := range c.Nodes {
 		key := node.NodeKey()
 		if node.Source == NodeSourceInline {
@@ -580,7 +673,6 @@ func (c *Config) persistNodeAuthOverrides() error {
 			Password: node.Password,
 		}
 	}
-	return c.saveNodeAuthState(state)
 }
 
 // RemoveNodeAuthOverride forgets an explicitly deleted external node without
@@ -590,12 +682,9 @@ func (c *Config) RemoveNodeAuthOverride(node NodeConfig) error {
 	if c == nil || node.Source == NodeSourceInline {
 		return nil
 	}
-	state, err := c.loadNodeAuthState()
-	if err != nil {
-		return err
-	}
-	delete(state.Overrides, node.NodeKey())
-	return c.saveNodeAuthState(state)
+	return c.updateNodeAuthState(func(state *nodeAuthState) {
+		delete(state.Overrides, node.NodeKey())
+	})
 }
 
 type portLease struct {
@@ -634,6 +723,18 @@ func (c *Config) loadPortMappingState() (*portMappingState, error) {
 	if path == "" {
 		return newPortMappingState(), nil
 	}
+	var state *portMappingState
+	err := withFileLock(path, func() error {
+		var err error
+		state, err = loadPortMappingStateLocked(path)
+		return err
+	})
+	return state, err
+}
+
+// loadPortMappingStateLocked reads a state snapshot while the caller holds
+// the path's sidecar lock.
+func loadPortMappingStateLocked(path string) (*portMappingState, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return newPortMappingState(), nil
@@ -661,12 +762,9 @@ func (c *Config) loadPortMappingState() (*portMappingState, error) {
 	return state, nil
 }
 
-func (c *Config) savePortMappingState(state *portMappingState) error {
-	if c.Mode != "multi-port" && c.Mode != "hybrid" {
-		return nil
-	}
+func encodePortMappingState(state *portMappingState) ([]byte, error) {
 	if state == nil {
-		return errors.New("port mapping state is nil")
+		return nil, errors.New("port mapping state is nil")
 	}
 	state.Version = portMappingVersion
 	if state.Leases == nil {
@@ -674,12 +772,55 @@ func (c *Config) savePortMappingState(state *portMappingState) error {
 	}
 	data, err := yaml.Marshal(state)
 	if err != nil {
-		return fmt.Errorf("encode port map: %w", err)
+		return nil, fmt.Errorf("encode port map: %w", err)
 	}
-	if err := writeFileWithLock(c.portMapPath(), data, 0o600); err != nil {
-		return fmt.Errorf("write port map: %w", err)
+	return data, nil
+}
+
+func (c *Config) updatePortMappingState(update func(*portMappingState)) error {
+	_, err := c.updatePortMappingStateSnapshot(update)
+	return err
+}
+
+func (c *Config) updatePortMappingStateSnapshot(update func(*portMappingState)) (FileSnapshot, error) {
+	if c.Mode != "multi-port" && c.Mode != "hybrid" {
+		return FileSnapshot{}, nil
 	}
-	return nil
+	if update == nil {
+		return FileSnapshot{}, errors.New("port mapping update is nil")
+	}
+	path := c.portMapPath()
+	var snapshot FileSnapshot
+	err := withFileLock(path, func() error {
+		var err error
+		snapshot, err = c.updatePortMappingStateLocked(update)
+		return err
+	})
+	return snapshot, err
+}
+
+func (c *Config) updatePortMappingStateLocked(update func(*portMappingState)) (FileSnapshot, error) {
+	if c.Mode != "multi-port" && c.Mode != "hybrid" {
+		return FileSnapshot{}, nil
+	}
+	if update == nil {
+		return FileSnapshot{}, errors.New("port mapping update is nil")
+	}
+	path := c.portMapPath()
+	state, err := loadPortMappingStateLocked(path)
+	if err != nil {
+		return FileSnapshot{}, err
+	}
+	update(state)
+	data, err := encodePortMappingState(state)
+	if err != nil {
+		return FileSnapshot{}, err
+	}
+	snapshot, err := writeFileLockedSnapshot(path, data, 0o600)
+	if err != nil {
+		return FileSnapshot{}, fmt.Errorf("write port map: %w", err)
+	}
+	return snapshot, nil
 }
 
 func (c *Config) pruneExpiredPortLeases(state *portMappingState, activeKeys map[string]struct{}, now time.Time) {
@@ -701,6 +842,35 @@ func (c *Config) pruneExpiredPortLeases(state *portMappingState, activeKeys map[
 			delete(state.Leases, key)
 		}
 	}
+}
+
+func (c *Config) recordNodePortLeases(state *portMappingState, now time.Time) {
+	activeKeys := make(map[string]struct{}, len(c.Nodes))
+	for idx := range c.Nodes {
+		node := c.Nodes[idx]
+		key := node.NodeKey()
+		activeKeys[key] = struct{}{}
+		for otherKey, lease := range state.Leases {
+			if otherKey != key && lease.Port == node.Port {
+				delete(state.Leases, otherKey)
+			}
+		}
+		state.Leases[key] = portLease{Port: node.Port}
+	}
+	c.pruneExpiredPortLeases(state, activeKeys, now)
+}
+
+func (c *Config) persistNodePortLeases(now time.Time) error {
+	_, err := c.updatePortMappingStateSnapshot(func(state *portMappingState) {
+		c.recordNodePortLeases(state, now)
+	})
+	return err
+}
+
+func (c *Config) persistNodePortLeasesLocked(now time.Time) (FileSnapshot, error) {
+	return c.updatePortMappingStateLocked(func(state *portMappingState) {
+		c.recordNodePortLeases(state, now)
+	})
 }
 
 func (c *Config) assignNodePorts(runtimeMap map[string]uint16, persist bool) error {
@@ -793,20 +963,12 @@ func (c *Config) assignNodePorts(runtimeMap map[string]uint16, persist bool) err
 		}
 	}
 
-	for idx := range c.Nodes {
-		node := &c.Nodes[idx]
-		key := node.NodeKey()
-		for otherKey, lease := range state.Leases {
-			if otherKey != key && lease.Port == node.Port {
-				delete(state.Leases, otherKey)
-			}
-		}
-		state.Leases[key] = portLease{Port: node.Port}
-	}
-	c.pruneExpiredPortLeases(state, activeKeys, now)
-
 	if persist {
-		return c.savePortMappingState(state)
+		// Availability probes intentionally run without the sidecar lock. The
+		// short commit below re-reads and merges the latest state while locked,
+		// so unrelated concurrent leases are retained without serializing OS
+		// port probes behind file I/O.
+		return c.persistNodePortLeases(now)
 	}
 	return nil
 }
@@ -817,25 +979,7 @@ func (c *Config) PersistPortMap() error {
 	if c == nil || (c.Mode != "multi-port" && c.Mode != "hybrid") {
 		return nil
 	}
-	state, err := c.loadPortMappingState()
-	if err != nil {
-		return err
-	}
-	now := time.Now().UTC()
-	activeKeys := make(map[string]struct{}, len(c.Nodes))
-	for idx := range c.Nodes {
-		node := &c.Nodes[idx]
-		key := node.NodeKey()
-		activeKeys[key] = struct{}{}
-		for otherKey, lease := range state.Leases {
-			if otherKey != key && lease.Port == node.Port {
-				delete(state.Leases, otherKey)
-			}
-		}
-		state.Leases[key] = portLease{Port: node.Port}
-	}
-	c.pruneExpiredPortLeases(state, activeKeys, now)
-	return c.savePortMappingState(state)
+	return c.persistNodePortLeases(time.Now().UTC())
 }
 
 // NormalizeWithPortMap applies defaults and validation, preserving port assignments
@@ -876,9 +1020,18 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	if c.Management.ProbeTarget == "" {
 		c.Management.ProbeTarget = "www.apple.com:80"
 	}
+	if _, ready, err := probetarget.Parse(c.Management.ProbeTarget); err != nil || !ready {
+		if err == nil {
+			err = errors.New("probe target is empty")
+		}
+		return fmt.Errorf("invalid management probe_target: %w", err)
+	}
 	if c.Management.Enabled == nil {
 		defaultEnabled := true
 		c.Management.Enabled = &defaultEnabled
+	}
+	if err := ValidateManagementConfig(c.Management); err != nil {
+		return err
 	}
 	c.normalizeGeoIPConfig()
 	if c.SubscriptionRefresh.Interval <= 0 {
@@ -897,13 +1050,18 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 		c.SubscriptionRefresh.MinAvailableNodes = 1
 	}
 	c.SubscriptionRefresh.FetchConcurrency = NormalizeSubscriptionFetchConcurrency(c.SubscriptionRefresh.FetchConcurrency)
+	validatedSubscriptions, err := ValidateSubscriptionURLs(c.Subscriptions)
+	if err != nil {
+		return err
+	}
+	c.Subscriptions = validatedSubscriptions
 
 	if len(c.Nodes) == 0 {
 		return errors.New("config.nodes cannot be empty")
 	}
 
 	for idx := range c.Nodes {
-		c.Nodes[idx].Name = strings.TrimSpace(c.Nodes[idx].Name)
+		c.Nodes[idx].Name = sanitizeNodeName(c.Nodes[idx].Name)
 		c.Nodes[idx].URI = strings.TrimSpace(c.Nodes[idx].URI)
 		if c.Nodes[idx].URI == "" {
 			return fmt.Errorf("node %d is missing uri", idx)
@@ -911,13 +1069,19 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 
 		// Auto-extract name from URI if not provided
 		if c.Nodes[idx].Name == "" {
-			c.Nodes[idx].Name = ExtractNodeName(c.Nodes[idx].URI)
+			c.Nodes[idx].Name = sanitizeNodeName(ExtractNodeName(c.Nodes[idx].URI))
 		}
 		if c.Nodes[idx].Name == "" {
 			c.Nodes[idx].Name = fmt.Sprintf("node-%d", idx)
 		}
 	}
+	if err := validateUniqueNodeKeys(c.Nodes); err != nil {
+		return err
+	}
 	if err := c.ApplyNodeAuthOverrides(); err != nil {
+		return err
+	}
+	if err := c.validateInboundCredentials(); err != nil {
 		return err
 	}
 	if err := c.assignNodePorts(portMap, false); err != nil {
@@ -930,6 +1094,58 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 
 	c.normalizeLogConfig()
 
+	return nil
+}
+
+func validateUniqueNodeKeys(nodes []NodeConfig) error {
+	seen := make(map[string]int, len(nodes))
+	for index := range nodes {
+		key := nodes[index].NodeKey()
+		if previous, exists := seen[key]; exists {
+			return fmt.Errorf("nodes %d and %d resolve to the same proxy identity", previous, index)
+		}
+		seen[key] = index
+	}
+	return nil
+}
+
+func sanitizeNodeName(name string) string {
+	name = strings.Map(func(character rune) rune {
+		if unicode.IsControl(character) {
+			return -1
+		}
+		return character
+	}, name)
+	return strings.TrimSpace(name)
+}
+
+func validateCredentialPair(label, username, password string) error {
+	if (username == "") != (password == "") {
+		return fmt.Errorf("%s username and password must either both be set or both be empty", label)
+	}
+	return nil
+}
+
+func (c *Config) validateInboundCredentials() error {
+	if c == nil {
+		return errors.New("config is nil")
+	}
+	if c.Mode == "pool" || c.Mode == "hybrid" {
+		if err := validateCredentialPair("listener", c.Listener.Username, c.Listener.Password); err != nil {
+			return err
+		}
+	}
+	if c.Mode != "multi-port" && c.Mode != "hybrid" {
+		return nil
+	}
+	if err := validateCredentialPair("multi_port", c.MultiPort.Username, c.MultiPort.Password); err != nil {
+		return err
+	}
+	for index, node := range c.Nodes {
+		if err := validateCredentialPair(fmt.Sprintf("node %d", index), node.Username, node.Password); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -1025,6 +1241,44 @@ func (c *Config) ManagementEnabled() bool {
 		return true
 	}
 	return *c.Management.Enabled
+}
+
+// ValidateManagementConfig prevents accidentally exposing an unauthenticated
+// administrative API beyond the local machine. Disabled management endpoints
+// are permitted so a future listen address can be prepared before enabling it.
+func ValidateManagementConfig(cfg ManagementConfig) error {
+	if cfg.Enabled != nil && !*cfg.Enabled {
+		return nil
+	}
+	listen := strings.TrimSpace(cfg.Listen)
+	host, portText, err := net.SplitHostPort(listen)
+	if err != nil {
+		return fmt.Errorf("invalid management listen address %q: %w", listen, err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("invalid management listen port %q", portText)
+	}
+	certFile := strings.TrimSpace(cfg.TLSCertFile)
+	keyFile := strings.TrimSpace(cfg.TLSKeyFile)
+	if (certFile == "") != (keyFile == "") {
+		return errors.New("management tls_cert_file and tls_key_file must be configured together")
+	}
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	loopback := strings.EqualFold(host, "localhost")
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		loopback = true
+	}
+	if loopback {
+		return nil
+	}
+	if strings.TrimSpace(cfg.Password) == "" {
+		return errors.New("management password is required when listen is not loopback")
+	}
+	if certFile == "" {
+		return errors.New("management TLS is required when listen is not loopback")
+	}
+	return nil
 }
 
 // ProbeConcurrencyOrDefault returns the process-wide health probe worker
@@ -1307,7 +1561,23 @@ func convertClashProxyToURI(p clashProxy) string {
 	}
 }
 
+func clashProxyEndpoint(p clashProxy) (string, string, bool) {
+	host := strings.TrimSpace(p.Server)
+	if len(host) >= 2 && strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = strings.TrimSpace(host[1 : len(host)-1])
+	}
+	port := int(p.Port)
+	if host == "" || strings.ContainsAny(host, "\r\n\x00") || port < 1 || port > 65535 {
+		return "", "", false
+	}
+	return host, net.JoinHostPort(host, strconv.Itoa(port)), true
+}
+
 func buildVMessURI(p clashProxy) string {
+	_, endpoint, ok := clashProxyEndpoint(p)
+	if !ok {
+		return ""
+	}
 	params := url.Values{}
 	if p.Network != "" && p.Network != "tcp" {
 		params.Set("type", p.Network)
@@ -1337,10 +1607,14 @@ func buildVMessURI(p clashProxy) string {
 		query = "?" + params.Encode()
 	}
 
-	return fmt.Sprintf("vmess://%s@%s:%d%s#%s", p.UUID, p.Server, int(p.Port), query, url.QueryEscape(p.Name))
+	return fmt.Sprintf("vmess://%s@%s%s#%s", url.User(p.UUID).String(), endpoint, query, url.QueryEscape(p.Name))
 }
 
 func buildVLESSURI(p clashProxy) string {
+	_, endpoint, ok := clashProxyEndpoint(p)
+	if !ok {
+		return ""
+	}
 	params := url.Values{}
 	params.Set("encryption", "none")
 
@@ -1385,10 +1659,14 @@ func buildVLESSURI(p clashProxy) string {
 		params.Set("fp", p.ClientFingerprint)
 	}
 
-	return fmt.Sprintf("vless://%s@%s:%d?%s#%s", p.UUID, p.Server, int(p.Port), params.Encode(), url.QueryEscape(p.Name))
+	return fmt.Sprintf("vless://%s@%s?%s#%s", url.User(p.UUID).String(), endpoint, params.Encode(), url.QueryEscape(p.Name))
 }
 
 func buildTrojanURI(p clashProxy) string {
+	_, endpoint, ok := clashProxyEndpoint(p)
+	if !ok {
+		return ""
+	}
 	params := url.Values{}
 	if p.ServerName != "" {
 		params.Set("sni", p.ServerName)
@@ -1418,10 +1696,14 @@ func buildTrojanURI(p clashProxy) string {
 		query = "?" + params.Encode()
 	}
 
-	return fmt.Sprintf("trojan://%s@%s:%d%s#%s", p.Password, p.Server, int(p.Port), query, url.QueryEscape(p.Name))
+	return fmt.Sprintf("trojan://%s@%s%s#%s", url.User(p.Password).String(), endpoint, query, url.QueryEscape(p.Name))
 }
 
 func buildAnyTLSURI(p clashProxy) string {
+	_, endpoint, ok := clashProxyEndpoint(p)
+	if !ok {
+		return ""
+	}
 	params := url.Values{}
 	if p.ServerName != "" {
 		params.Set("sni", p.ServerName)
@@ -1440,16 +1722,24 @@ func buildAnyTLSURI(p clashProxy) string {
 		query = "?" + params.Encode()
 	}
 
-	return fmt.Sprintf("anytls://%s@%s:%d%s#%s", p.Password, p.Server, int(p.Port), query, url.QueryEscape(p.Name))
+	return fmt.Sprintf("anytls://%s@%s%s#%s", url.User(p.Password).String(), endpoint, query, url.QueryEscape(p.Name))
 }
 
 func buildShadowsocksURI(p clashProxy) string {
+	_, endpoint, ok := clashProxyEndpoint(p)
+	if !ok {
+		return ""
+	}
 	// Encode method:password in base64
-	userInfo := base64.StdEncoding.EncodeToString([]byte(p.Cipher + ":" + p.Password))
-	return fmt.Sprintf("ss://%s@%s:%d#%s", userInfo, p.Server, int(p.Port), url.QueryEscape(p.Name))
+	userInfo := base64.RawURLEncoding.EncodeToString([]byte(p.Cipher + ":" + p.Password))
+	return fmt.Sprintf("ss://%s@%s#%s", userInfo, endpoint, url.QueryEscape(p.Name))
 }
 
 func buildHysteria2URI(p clashProxy) string {
+	_, endpoint, ok := clashProxyEndpoint(p)
+	if !ok {
+		return ""
+	}
 	params := url.Values{}
 	if p.ServerName != "" {
 		params.Set("sni", p.ServerName)
@@ -1466,7 +1756,11 @@ func buildHysteria2URI(p clashProxy) string {
 		}
 	}
 	if strings.TrimSpace(p.Ports) != "" {
-		params.Set("ports", normalizeHysteria2PortsValue(strings.TrimSpace(p.Ports)))
+		ports, valid := normalizeHysteria2PortsValue(strings.TrimSpace(p.Ports))
+		if !valid {
+			return ""
+		}
+		params.Set("ports", ports)
 	}
 
 	query := ""
@@ -1474,18 +1768,13 @@ func buildHysteria2URI(p clashProxy) string {
 		query = "?" + params.Encode()
 	}
 
-	port := int(p.Port)
-	if port <= 0 {
-		port = 443
-	}
-
-	return fmt.Sprintf("hysteria2://%s@%s:%d%s#%s", p.Password, p.Server, port, query, url.QueryEscape(p.Name))
+	return fmt.Sprintf("hysteria2://%s@%s%s#%s", url.User(p.Password).String(), endpoint, query, url.QueryEscape(p.Name))
 }
 
-func normalizeHysteria2PortsValue(value string) string {
+func normalizeHysteria2PortsValue(value string) (string, bool) {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return ""
+		return "", true
 	}
 
 	parts := strings.Split(value, ",")
@@ -1493,23 +1782,43 @@ func normalizeHysteria2PortsValue(value string) string {
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
 		if part == "" {
+			return "", false
+		}
+		separator := ""
+		if strings.Count(part, ":") == 1 && !strings.Contains(part, "-") {
+			separator = ":"
+		} else if strings.Count(part, "-") == 1 && !strings.Contains(part, ":") {
+			separator = "-"
+		} else if strings.ContainsAny(part, ":-") {
+			return "", false
+		}
+
+		if separator == "" {
+			port, err := strconv.Atoi(part)
+			if err != nil || port < 1 || port > 65535 {
+				return "", false
+			}
+			normalized = append(normalized, strconv.Itoa(port))
 			continue
 		}
-		if strings.Contains(part, ":") {
-			normalized = append(normalized, part)
-			continue
+
+		startText, endText, _ := strings.Cut(part, separator)
+		start, startErr := strconv.Atoi(strings.TrimSpace(startText))
+		end, endErr := strconv.Atoi(strings.TrimSpace(endText))
+		if startErr != nil || endErr != nil || start < 1 || start > 65535 || end < 1 || end > 65535 || start > end {
+			return "", false
 		}
-		if strings.Count(part, "-") == 1 {
-			normalized = append(normalized, strings.Replace(part, "-", ":", 1))
-			continue
-		}
-		normalized = append(normalized, part)
+		normalized = append(normalized, strconv.Itoa(start)+":"+strconv.Itoa(end))
 	}
 
-	return strings.Join(normalized, ",")
+	return strings.Join(normalized, ","), true
 }
 
 func buildTUICURI(p clashProxy) string {
+	_, endpoint, ok := clashProxyEndpoint(p)
+	if !ok {
+		return ""
+	}
 	params := url.Values{}
 	if p.ServerName != "" {
 		params.Set("sni", p.ServerName)
@@ -1535,15 +1844,15 @@ func buildTUICURI(p clashProxy) string {
 	}
 
 	// TUIC URI format: tuic://uuid:password@server:port?params#name
-	return fmt.Sprintf("tuic://%s:%s@%s:%d%s#%s", p.UUID, p.Password, p.Server, int(p.Port), query, url.QueryEscape(p.Name))
+	return fmt.Sprintf("tuic://%s@%s%s#%s", url.UserPassword(p.UUID, p.Password).String(), endpoint, query, url.QueryEscape(p.Name))
 }
 
 func buildShadowsocksRURI(p clashProxy) string {
-	port := int(p.Port)
-	if strings.TrimSpace(p.Server) == "" || port < 1 || port > 65535 || p.Password == "" {
+	host, _, ok := clashProxyEndpoint(p)
+	if !ok || p.Password == "" {
 		return ""
 	}
-	host := strings.TrimSpace(p.Server)
+	port := int(p.Port)
 	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
 		host = "[" + host + "]"
 	}
@@ -1573,8 +1882,8 @@ func buildShadowsocksRURI(p clashProxy) string {
 }
 
 func buildHysteriaURI(p clashProxy) string {
-	port := int(p.Port)
-	if strings.TrimSpace(p.Server) == "" || port < 1 || port > 65535 {
+	_, endpoint, ok := clashProxyEndpoint(p)
+	if !ok {
 		return ""
 	}
 	params := url.Values{}
@@ -1613,7 +1922,7 @@ func buildHysteriaURI(p clashProxy) string {
 	if p.DisableMTUDiscovery {
 		params.Set("disable_mtu_discovery", "1")
 	}
-	return "hysteria://" + net.JoinHostPort(strings.TrimSpace(p.Server), strconv.Itoa(port)) + "?" + params.Encode() + "#" + url.PathEscape(p.Name)
+	return "hysteria://" + endpoint + "?" + params.Encode() + "#" + url.PathEscape(p.Name)
 }
 
 func defaultString(value, fallback string) string {
@@ -1667,6 +1976,21 @@ func (c *Config) HealthStatePath() string {
 
 // writeNodesToFile writes nodes to a file (one URI per line) with file locking.
 func writeNodesToFile(path string, nodes []NodeConfig) error {
+	_, err := writeNodesToFileSnapshot(path, nodes)
+	return err
+}
+
+func writeNodesToFileSnapshot(path string, nodes []NodeConfig) (FileSnapshot, error) {
+	var snapshot FileSnapshot
+	err := withFileLock(path, func() error {
+		var err error
+		snapshot, err = writeNodesToFileLockedSnapshot(path, nodes)
+		return err
+	})
+	return snapshot, err
+}
+
+func writeNodesToFileLockedSnapshot(path string, nodes []NodeConfig) (FileSnapshot, error) {
 	var lines []string
 	for _, node := range nodes {
 		lines = append(lines, node.URI)
@@ -1675,8 +1999,7 @@ func writeNodesToFile(path string, nodes []NodeConfig) error {
 	if len(lines) > 0 {
 		content += "\n"
 	}
-	// Use file locking for safe concurrent writes
-	return writeFileWithLock(path, []byte(content), 0o644)
+	return writeFileLockedSnapshot(path, []byte(content), 0o600)
 }
 
 // WriteNodesToFile atomically persists a URI-per-line node file.
@@ -1708,12 +2031,48 @@ func (c *Config) SaveNodes() error {
 		return errors.New("config file path is unknown")
 	}
 
-	// Separate nodes by source
-	var inlineNodes []NodeConfig
-	var fileNodes []NodeConfig
+	plan := c.buildNodeSavePlan()
+	paths := orderedUniqueFilePaths(plan.lockPaths())
+	return withFileLocks(paths, func() error {
+		before, err := snapshotFilesLocked(paths)
+		if err != nil {
+			return err
+		}
+		_, err = c.saveNodesLocked(plan)
+		if err != nil {
+			return rollbackNodeFilesLocked(before, err)
+		}
+		return nil
+	})
+}
 
+type nodeSavePlan struct {
+	configPath    string
+	nodesPath     string
+	authPath      string
+	writeNodes    bool
+	inlineNodes   []NodeConfig
+	externalNodes []NodeConfig
+}
+
+func (plan nodeSavePlan) lockPaths() []string {
+	paths := []string{plan.configPath, plan.authPath}
+	if plan.writeNodes {
+		paths = append(paths, plan.nodesPath)
+	}
+	return paths
+}
+
+func (c *Config) buildNodeSavePlan() nodeSavePlan {
+	plan := nodeSavePlan{
+		configPath: c.filePath,
+		nodesPath:  c.NodesFile,
+		authPath:   c.nodeAuthPath(),
+	}
+	if plan.nodesPath == "" {
+		plan.nodesPath = filepath.Join(filepath.Dir(c.filePath), "nodes.txt")
+	}
 	for _, node := range c.Nodes {
-		// Create a clean copy without runtime fields for saving
 		cleanNode := NodeConfig{
 			Name:     node.Name,
 			URI:      node.URI,
@@ -1721,56 +2080,77 @@ func (c *Config) SaveNodes() error {
 			Username: node.Username,
 			Password: node.Password,
 		}
-		switch node.Source {
-		case NodeSourceInline:
-			inlineNodes = append(inlineNodes, cleanNode)
-		case NodeSourceFile, NodeSourceSubscription:
-			fileNodes = append(fileNodes, cleanNode)
-		default:
-			// Default to file nodes for unknown source
-			fileNodes = append(fileNodes, cleanNode)
+		if node.Source == NodeSourceInline {
+			plan.inlineNodes = append(plan.inlineNodes, cleanNode)
+			continue
 		}
+		plan.externalNodes = append(plan.externalNodes, cleanNode)
 	}
+	plan.writeNodes = len(plan.externalNodes) > 0 || c.NodesFile != ""
+	return plan
+}
 
-	// Write file-based nodes to nodes.txt
-	if len(fileNodes) > 0 || c.NodesFile != "" {
-		nodesFilePath := c.NodesFile
-		if nodesFilePath == "" {
-			nodesFilePath = filepath.Join(filepath.Dir(c.filePath), "nodes.txt")
-		}
-		if err := writeNodesToFile(nodesFilePath, fileNodes); err != nil {
-			return fmt.Errorf("write nodes file %q: %w", nodesFilePath, err)
-		}
-	}
-
-	// Update config.yaml nodes array (including clearing it when all inline nodes are deleted)
-	{
-		// Read original config to preserve structure
-		data, err := os.ReadFile(c.filePath)
+// saveNodesLocked performs every node-file mutation while the caller holds
+// all paths from plan.lockPaths in their canonical order. Each successful
+// write returns the exact post-write snapshot observed before releasing those
+// locks, so a later rollback cannot adopt a concurrent writer as its expected
+// state.
+func (c *Config) saveNodesLocked(plan nodeSavePlan) (map[string]FileSnapshot, error) {
+	written := make(map[string]FileSnapshot, 3)
+	if plan.writeNodes {
+		snapshot, err := writeNodesToFileLockedSnapshot(plan.nodesPath, plan.externalNodes)
 		if err != nil {
-			return fmt.Errorf("read config: %w", err)
+			return written, fmt.Errorf("write nodes file %q: %w", plan.nodesPath, err)
 		}
+		written[snapshotPathKey(plan.nodesPath)] = snapshot
+	}
+
+	snapshot, err := transformFileLockedSnapshot(plan.configPath, 0o600, func(data []byte) ([]byte, error) {
 		var saveCfg Config
 		if err := yaml.Unmarshal(data, &saveCfg); err != nil {
-			return fmt.Errorf("decode config: %w", err)
+			return nil, fmt.Errorf("decode config: %w", err)
 		}
-		// Update only the inline nodes
-		saveCfg.Nodes = inlineNodes
+		saveCfg.Nodes = plan.inlineNodes
 
 		newData, err := yaml.Marshal(&saveCfg)
 		if err != nil {
-			return fmt.Errorf("encode config: %w", err)
+			return nil, fmt.Errorf("encode config: %w", err)
 		}
-		// Use file locking for safe concurrent writes
-		if err := writeFileWithLock(c.filePath, newData, 0o644); err != nil {
-			return fmt.Errorf("write config: %w", err)
-		}
+		return newData, nil
+	})
+	if err != nil {
+		return written, fmt.Errorf("update config nodes: %w", err)
 	}
-	if err := c.persistNodeAuthOverrides(); err != nil {
-		return err
-	}
+	written[snapshotPathKey(plan.configPath)] = snapshot
 
-	return nil
+	snapshot, err = c.persistNodeAuthOverridesLocked()
+	if err != nil {
+		return written, err
+	}
+	written[snapshotPathKey(plan.authPath)] = snapshot
+	return written, nil
+}
+
+// SaveSubscriptionCache commits the startup-fetched subscription nodes after
+// the runtime has demonstrated that the configuration can start.
+func (c *Config) SaveSubscriptionCache() error {
+	if c == nil || c.filePath == "" {
+		return errors.New("config file path is unknown")
+	}
+	nodesFilePath := c.NodesFile
+	if nodesFilePath == "" {
+		nodesFilePath = filepath.Join(filepath.Dir(c.filePath), "nodes.txt")
+	}
+	nodes := make([]NodeConfig, 0)
+	for _, node := range c.Nodes {
+		if node.Source == NodeSourceSubscription {
+			nodes = append(nodes, node)
+		}
+	}
+	if len(nodes) == 0 {
+		return nil
+	}
+	return writeNodesToFile(nodesFilePath, nodes)
 }
 
 // Save is deprecated, use SaveNodes instead.
@@ -1789,13 +2169,44 @@ func (c *Config) SaveSettings() error {
 		return errors.New("config file path is unknown")
 	}
 
-	data, err := os.ReadFile(c.filePath)
-	if err != nil {
-		return fmt.Errorf("read config: %w", err)
+	if err := transformFileWithLock(c.filePath, 0o600, c.transformSettingsData); err != nil {
+		return fmt.Errorf("update config settings: %w", err)
 	}
+	return nil
+}
+
+// SaveSettingsTransaction persists settings and returns a compare-and-swap
+// rollback whose expected image is captured before releasing the file lock.
+// This closes the checkpoint window between SaveSettings and a second read.
+func (c *Config) SaveSettingsTransaction() (func() error, error) {
+	if c == nil || c.filePath == "" {
+		return nil, errors.New("config file path is unknown")
+	}
+	path := c.filePath
+	var before FileSnapshot
+	var expected FileSnapshot
+	err := withFileLock(path, func() error {
+		var err error
+		before, err = snapshotFileLocked(path)
+		if err != nil {
+			return err
+		}
+		expected, err = transformFileLockedSnapshot(path, 0o600, c.transformSettingsData)
+		if err != nil {
+			return rollbackNodeFilesLocked([]FileSnapshot{before}, err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("update config settings: %w", err)
+	}
+	return func() error { return RestoreFileSnapshotCAS(before, expected) }, nil
+}
+
+func (c *Config) transformSettingsData(data []byte) ([]byte, error) {
 	var saveCfg Config
 	if err := yaml.Unmarshal(data, &saveCfg); err != nil {
-		return fmt.Errorf("decode config: %w", err)
+		return nil, fmt.Errorf("decode config: %w", err)
 	}
 
 	saveCfg.ExternalIP = c.ExternalIP
@@ -1813,19 +2224,15 @@ func (c *Config) SaveSettings() error {
 
 	newData, err := yaml.Marshal(&saveCfg)
 	if err != nil {
-		return fmt.Errorf("encode config: %w", err)
+		return nil, fmt.Errorf("encode config: %w", err)
 	}
-
-	// Use file locking for safe concurrent writes
-	if err := writeFileWithLock(c.filePath, newData, 0o644); err != nil {
-		return fmt.Errorf("write config: %w", err)
-	}
-	return nil
+	return newData, nil
 }
 
 // IsPortAvailable checks if a port is available for binding.
 func IsPortAvailable(address string, port uint16) bool {
-	addr := fmt.Sprintf("%s:%d", address, port)
+	address = strings.Trim(strings.TrimSpace(address), "[]")
+	addr := net.JoinHostPort(address, strconv.Itoa(int(port)))
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return false
@@ -1834,10 +2241,16 @@ func IsPortAvailable(address string, port uint16) bool {
 	return true
 }
 
-// writeFileWithLock writes data to a file with exclusive locking.
-func writeFileWithLock(path string, data []byte, perm os.FileMode) error {
+// withFileLock holds the stable sidecar lock for the complete operation. RMW
+// callers must do both their read and atomic replacement inside fn; locking
+// only the final write still permits two writers to derive output from the
+// same stale snapshot.
+func withFileLock(path string, fn func() error) error {
 	if strings.TrimSpace(path) == "" {
 		return errors.New("file path is empty")
+	}
+	if fn == nil {
+		return errors.New("file operation is nil")
 	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -1858,6 +2271,103 @@ func writeFileWithLock(path string, data []byte, perm os.FileMode) error {
 	}
 	defer unlockFile(lockHandle)
 
+	return fn()
+}
+
+// withFileLocks acquires multiple sidecar locks in one canonical order. This
+// makes multi-file transactions deadlock-free relative to every cooperating
+// writer and lets their rollback validation cover all files before restoring
+// any of them.
+func withFileLocks(paths []string, fn func() error) error {
+	if fn == nil {
+		return errors.New("file operation is nil")
+	}
+	ordered := orderedUniqueFilePaths(paths)
+	var acquire func(int) error
+	acquire = func(index int) error {
+		if index == len(ordered) {
+			return fn()
+		}
+		return withFileLock(ordered[index], func() error {
+			return acquire(index + 1)
+		})
+	}
+	return acquire(0)
+}
+
+// transformFileWithLock serializes a read-transform-atomic-replace transaction
+// against every other helper using the destination's stable sidecar lock.
+func transformFileWithLock(path string, perm os.FileMode, transform func([]byte) ([]byte, error)) error {
+	_, err := transformFileWithLockSnapshot(path, perm, transform)
+	return err
+}
+
+func transformFileWithLockSnapshot(path string, perm os.FileMode, transform func([]byte) ([]byte, error)) (FileSnapshot, error) {
+	if transform == nil {
+		return FileSnapshot{}, errors.New("file transform is nil")
+	}
+	var snapshot FileSnapshot
+	err := withFileLock(path, func() error {
+		var err error
+		snapshot, err = transformFileLockedSnapshot(path, perm, transform)
+		return err
+	})
+	return snapshot, err
+}
+
+func transformFileLockedSnapshot(path string, perm os.FileMode, transform func([]byte) ([]byte, error)) (FileSnapshot, error) {
+	if transform == nil {
+		return FileSnapshot{}, errors.New("file transform is nil")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return FileSnapshot{}, err
+	}
+	updated, err := transform(data)
+	if err != nil {
+		return FileSnapshot{}, err
+	}
+	return writeFileLockedSnapshot(path, updated, perm)
+}
+
+// writeFileWithLock writes data to a file with exclusive locking.
+func writeFileWithLock(path string, data []byte, perm os.FileMode) error {
+	_, err := writeFileWithLockSnapshot(path, data, perm)
+	return err
+}
+
+func writeFileWithLockSnapshot(path string, data []byte, perm os.FileMode) (FileSnapshot, error) {
+	var snapshot FileSnapshot
+	err := withFileLock(path, func() error {
+		var err error
+		snapshot, err = writeFileLockedSnapshot(path, data, perm)
+		return err
+	})
+	return snapshot, err
+}
+
+func writeFileLockedSnapshot(path string, data []byte, perm os.FileMode) (FileSnapshot, error) {
+	if err := writeFileLocked(path, data, perm); err != nil {
+		return FileSnapshot{}, err
+	}
+	return snapshotFileLocked(path)
+}
+
+// writeFileLocked atomically replaces path. The caller must already hold the
+// sidecar lock acquired by withFileLock.
+func writeFileLocked(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+
+	// Atomic replacement creates a new inode, so explicitly carry forward any
+	// permission bits that are stricter than the requested mode. In particular,
+	// credential-bearing config and node files must never become group/world
+	// readable, and an existing read-only file must not be made writable merely
+	// because it was saved through the WebUI.
+	effectivePerm, err := restrictiveWritePerm(path, perm)
+	if err != nil {
+		return err
+	}
+
 	tempFile, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return fmt.Errorf("create temporary file: %w", err)
@@ -1865,7 +2375,7 @@ func writeFileWithLock(path string, data []byte, perm os.FileMode) error {
 	tempPath := tempFile.Name()
 	defer os.Remove(tempPath)
 
-	if err := tempFile.Chmod(perm); err != nil {
+	if err := tempFile.Chmod(effectivePerm); err != nil {
 		tempFile.Close()
 		return fmt.Errorf("set temporary file permissions: %w", err)
 	}
@@ -1885,4 +2395,18 @@ func writeFileWithLock(path string, data []byte, perm os.FileMode) error {
 	}
 
 	return nil
+}
+
+func restrictiveWritePerm(path string, requested os.FileMode) (os.FileMode, error) {
+	requested = requested.Perm()
+	info, err := os.Stat(path)
+	if err == nil {
+		// Intersection can only remove permissions. This both tightens legacy
+		// 0644 files to 0600 and preserves stricter modes such as 0400.
+		return requested & info.Mode().Perm(), nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return requested, nil
+	}
+	return 0, fmt.Errorf("inspect existing file permissions: %w", err)
 }

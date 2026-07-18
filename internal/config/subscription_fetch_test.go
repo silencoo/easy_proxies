@@ -4,8 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -50,9 +54,10 @@ func TestFetchSubscriptionSourcesConcurrentStableDedupeAndRedaction(t *testing.T
 		server.URL + "/one?client=one&token=secret#ignored",
 		server.URL + "/two?token=second-secret",
 	}, SubscriptionFetchOptions{
-		Concurrency: 2,
-		Timeout:     2 * time.Second,
-		Client:      server.Client(),
+		Concurrency:          2,
+		Timeout:              2 * time.Second,
+		Client:               server.Client(),
+		AllowPrivateNetworks: true,
 		Loggerf: func(format string, args ...any) {
 			logs = append(logs, fmt.Sprintf(format, args...))
 		},
@@ -75,9 +80,41 @@ func TestFetchSubscriptionSourcesConcurrentStableDedupeAndRedaction(t *testing.T
 	nodes, aggregateStats := FetchSubscriptionNodes(context.Background(), []string{
 		server.URL + "/one",
 		server.URL + "/two",
-	}, SubscriptionFetchOptions{Concurrency: 2, Client: server.Client()})
+	}, SubscriptionFetchOptions{Concurrency: 2, Client: server.Client(), AllowPrivateNetworks: true})
 	if len(nodes) != 2 || aggregateStats.DedupedNodes != 1 {
 		t.Fatalf("expected stable node identity dedupe, got %d nodes and %+v", len(nodes), aggregateStats)
+	}
+}
+
+func TestStartupSubscriptionCacheCommitsOnlyAfterExplicitSuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "socks5://127.0.0.1:1082#fresh\n")
+	}))
+	defer server.Close()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	nodesPath := filepath.Join(dir, "nodes.txt")
+	original := []byte("socks5://127.0.0.1:1081#last-known-good\n")
+	if err := os.WriteFile(nodesPath, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configYAML := fmt.Sprintf("mode: pool\nsubscriptions:\n  - %q\nnodes_file: nodes.txt\nsubscription_refresh:\n  allow_private_networks: true\n", server.URL)
+	if err := os.WriteFile(configPath, []byte(configYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(nodesPath); err != nil || string(got) != string(original) {
+		t.Fatalf("Load overwrote last-known-good cache: err=%v data=%q", err, got)
+	}
+	if err := cfg.SaveSubscriptionCache(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(nodesPath); err != nil || !strings.Contains(string(got), "127.0.0.1:1082") {
+		t.Fatalf("explicit cache commit missing fresh node: err=%v data=%q", err, got)
 	}
 }
 
@@ -97,7 +134,10 @@ func TestFetchSubscriptionStrictBodyLimit(t *testing.T) {
 			}))
 			defer server.Close()
 
-			results, _ := FetchSubscriptionSources(context.Background(), []string{server.URL}, SubscriptionFetchOptions{Client: server.Client()})
+			results, _ := FetchSubscriptionSources(context.Background(), []string{server.URL}, SubscriptionFetchOptions{
+				Client:               server.Client(),
+				AllowPrivateNetworks: true,
+			})
 			if len(results) != 1 {
 				t.Fatalf("expected one result, got %d", len(results))
 			}
@@ -147,6 +187,114 @@ func TestNormalizeSubscriptionFetchConcurrency(t *testing.T) {
 	}
 	if got := NormalizeSubscriptionFetchConcurrency(7); got != 7 {
 		t.Fatalf("configured concurrency=%d", got)
+	}
+}
+
+func TestSubscriptionNetworkPolicyBlocksPrivateTargetsByDefault(t *testing.T) {
+	for _, rawURL := range []string{
+		"http://127.0.0.1/subscription",
+		"http://[::1]/subscription",
+		"http://10.0.0.1/subscription",
+		"http://169.254.169.254/latest/meta-data",
+		"http://100.100.100.200/latest/meta-data",
+	} {
+		t.Run(rawURL, func(t *testing.T) {
+			target, err := url.Parse(rawURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := validateSubscriptionURLTarget(context.Background(), target, false); err == nil {
+				t.Fatalf("private destination %q was accepted", rawURL)
+			}
+		})
+	}
+}
+
+func TestSubscriptionPrivateNetworkOptIn(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "socks5://127.0.0.1:1080#local\n")
+	}))
+	defer server.Close()
+
+	blocked, _ := FetchSubscriptionSources(context.Background(), []string{server.URL}, SubscriptionFetchOptions{})
+	if len(blocked) != 1 || blocked[0].Err == nil {
+		t.Fatalf("default policy did not block loopback: %#v", blocked)
+	}
+	allowed, _ := FetchSubscriptionSources(context.Background(), []string{server.URL}, SubscriptionFetchOptions{AllowPrivateNetworks: true})
+	if len(allowed) != 1 || allowed[0].Err != nil || len(allowed[0].Nodes) != 1 {
+		t.Fatalf("private-network opt-in did not fetch loopback subscription: %#v", allowed)
+	}
+}
+
+func TestSubscriptionRedirectRevalidatesDestination(t *testing.T) {
+	var calls atomic.Int32
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusFound,
+			Header:     http.Header{"Location": []string{"http://169.254.169.254/latest/meta-data"}},
+			Body:       io.NopCloser(strings.NewReader("")),
+			Request:    request,
+		}, nil
+	})}
+	results, _ := FetchSubscriptionSources(context.Background(), []string{"https://93.184.216.34/sub"}, SubscriptionFetchOptions{Client: client})
+	if len(results) != 1 || results[0].Err == nil {
+		t.Fatalf("private redirect was not rejected: %#v", results)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("redirect target reached transport; calls=%d", calls.Load())
+	}
+}
+
+func TestSubscriptionRedirectErrorRedactsFinalSignedURL(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		target, err := url.Parse(server.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		target.User = url.UserPassword("user", "pass")
+		target.Path = "/private/signed"
+		target.RawQuery = "token=TOPSECRET"
+		http.Redirect(w, request, target.String(), http.StatusFound)
+	}))
+	defer server.Close()
+
+	client := server.Client()
+	client.CheckRedirect = func(request *http.Request, _ []*http.Request) error {
+		return fmt.Errorf("redirect rejected at %s", request.URL.String())
+	}
+	_, err := fetchSubscriptionWithClient(context.Background(), client, server.URL+"/start", time.Second, true)
+	if err == nil {
+		t.Fatal("expected redirect rejection")
+	}
+	message := err.Error()
+	for _, secret := range []string{"TOPSECRET", "user:pass", "/private/signed", "token="} {
+		if strings.Contains(message, secret) {
+			t.Fatalf("redirect error leaked %q: %s", secret, message)
+		}
+	}
+}
+
+func TestSubscriptionInputLimits(t *testing.T) {
+	tooMany := make([]string, MaxSubscriptionURLs+1)
+	for index := range tooMany {
+		tooMany[index] = fmt.Sprintf("https://example.com/sub/%d", index)
+	}
+	if _, err := ValidateSubscriptionURLs(tooMany); err == nil {
+		t.Fatal("URL count limit was not enforced")
+	}
+	if _, err := ValidateSubscriptionURLs([]string{"https://example.com/" + strings.Repeat("x", MaxSubscriptionURLLength)}); err == nil {
+		t.Fatal("URL length limit was not enforced")
+	}
+	if err := validateSubscriptionNodes(make([]NodeConfig, MaxSubscriptionNodesPerSource+1)); err == nil {
+		t.Fatal("node count limit was not enforced")
+	}
+	if err := validateSubscriptionNodes([]NodeConfig{{Name: strings.Repeat("n", MaxSubscriptionNodeNameBytes+1), URI: "socks5://127.0.0.1:1"}}); err == nil {
+		t.Fatal("node name limit was not enforced")
+	}
+	if err := validateSubscriptionNodes([]NodeConfig{{Name: "node", URI: strings.Repeat("u", MaxSubscriptionNodeURIBytes+1)}}); err == nil {
+		t.Fatal("node URI limit was not enforced")
 	}
 }
 
