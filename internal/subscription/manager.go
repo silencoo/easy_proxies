@@ -4,16 +4,16 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
-	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"easy_proxies/internal/commitguard"
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/monitor"
 )
@@ -26,12 +26,13 @@ type Logger interface {
 }
 
 type boxManager interface {
-	CurrentPortMap() map[string]uint16
-	ReloadWithPortMap(newCfg *config.Config, portMap map[string]uint16) error
-}
-
-type configNodeLister interface {
-	ListConfigNodes(ctx context.Context) ([]config.NodeConfig, error)
+	ConfigSnapshot() (*config.Config, uint64)
+	CommitConfig(
+		ctx context.Context,
+		expectedRevision uint64,
+		candidate *config.Config,
+		persist func(*config.Config) (rollback func() error, err error),
+	) error
 }
 
 // Option configures the Manager.
@@ -46,63 +47,55 @@ func WithLogger(l Logger) Option {
 type Manager struct {
 	mu sync.RWMutex
 
-	baseCfg    *config.Config
-	boxMgr     boxManager
-	logger     Logger
-	httpClient *http.Client // Custom HTTP client with connection pooling
+	baseCfg *config.Config
+	boxMgr  boxManager
+	logger  Logger
 
 	status        monitor.SubscriptionStatus
 	ctx           context.Context
 	cancel        context.CancelFunc
-	refreshMu     sync.Mutex // serializes refreshes with subscription config changes
+	refreshSlot   chan struct{} // serializes refreshes with context-aware cancellation
 	loopOnce      sync.Once
+	loopWG        sync.WaitGroup
+	stopOnce      sync.Once
+	stopped       bool
 	manualRefresh chan struct{}
 	configChanged chan struct{}
 	requestSeq    uint64
+	completedSeq  uint64
 	waiters       map[uint64]chan error
+	canceled      map[uint64]error
+	activeBatch   *refreshBatch
+	pendingUpdate *pendingConfigUpdate
 	sourceCache   map[string][]config.NodeConfig
 
 	// Track nodes.txt content hash to detect modifications
 	lastSubHash      string    // Hash of nodes.txt content after last subscription refresh
 	lastNodesModTime time.Time // Last known modification time of nodes.txt
+
+	saveSettingsFn func(*config.Config) error
+	writeNodesFn   func(string, []config.NodeConfig) error
+	waitBudgetFn   func(*config.Config, int) time.Duration
 }
 
 // New creates a SubscriptionManager.
 func New(cfg *config.Config, boxMgr boxManager, opts ...Option) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Create optimized HTTP client with connection pooling
-	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   10,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		ResponseHeaderTimeout: 10 * time.Second,
-	}
-
-	httpClient := &http.Client{
-		Transport: transport,
-		Timeout:   60 * time.Second, // Overall timeout
-	}
-
 	m := &Manager{
-		baseCfg:       cfg,
+		baseCfg:       cfg.Clone(),
 		boxMgr:        boxMgr,
 		ctx:           ctx,
 		cancel:        cancel,
 		manualRefresh: make(chan struct{}, 1),
+		refreshSlot:   make(chan struct{}, 1),
 		configChanged: make(chan struct{}, 1),
 		waiters:       make(map[uint64]chan error),
+		canceled:      make(map[uint64]error),
 		sourceCache:   make(map[string][]config.NodeConfig),
-		httpClient:    httpClient,
+		waitBudgetFn:  refreshWaitBudget,
 	}
+	m.refreshSlot <- struct{}{}
 	for _, opt := range opts {
 		opt(m)
 	}
@@ -134,49 +127,89 @@ func (m *Manager) Start() {
 
 // Stop stops the periodic refresh.
 func (m *Manager) Stop() {
-	m.mu.RLock()
-	cancel := m.cancel
-	m.mu.RUnlock()
-	if cancel != nil {
-		cancel()
-	}
+	m.stopOnce.Do(func() {
+		m.mu.Lock()
+		m.stopped = true
+		cancel := m.cancel
+		if m.activeBatch != nil {
+			m.activeBatch.cancel()
+		}
+		m.pendingUpdate = nil
+		m.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		m.loopWG.Wait()
 
-	// Close idle connections
-	if m.httpClient != nil {
-		m.httpClient.CloseIdleConnections()
-	}
+		// Active batches complete their own tickets before the loop exits. Any
+		// requests still present here were queued but never started, so they can
+		// now be canceled without leaving work capable of committing later.
+		m.mu.Lock()
+		for sequence, waiter := range m.waiters {
+			waiter <- context.Canceled
+			close(waiter)
+			delete(m.waiters, sequence)
+		}
+		m.mu.Unlock()
+	})
 }
 
 // UpdateConfig hot-reloads subscription URLs and refresh settings without restart.
 func (m *Manager) UpdateConfig(urls []string, enabled bool, interval time.Duration) {
-	m.updateConfig(urls, enabled, interval, 0, false)
+	cleanURLs, err := config.ValidateSubscriptionURLs(urls)
+	if err != nil {
+		m.logger.Errorf("refusing invalid subscription config: %v", err)
+		return
+	}
+	m.mu.RLock()
+	allowPrivateNetworks := m.baseCfg.SubscriptionRefresh.AllowPrivateNetworks
+	m.mu.RUnlock()
+	if _, err := m.updateConfig(cleanURLs, enabled, interval, 0, allowPrivateNetworks, false, nil); err != nil {
+		m.logger.Errorf("failed to update subscription config: %v", err)
+	}
 }
 
 // UpdateConfigAndRefresh updates subscription config and synchronously waits for
 // the first refresh to complete before returning. This ensures the caller (WebUI API)
 // can confirm the update took effect.
-func (m *Manager) UpdateConfigAndRefresh(urls []string, enabled bool, interval time.Duration, fetchConcurrency int) error {
-	waiter := m.updateConfig(urls, enabled, interval, fetchConcurrency, true)
-	if waiter == nil {
-		return nil
+func (m *Manager) UpdateConfigAndRefresh(urls []string, enabled bool, interval time.Duration, fetchConcurrency int, allowPrivateNetworks bool) error {
+	return m.updateConfigAndRefresh(urls, enabled, interval, fetchConcurrency, allowPrivateNetworks, nil)
+}
+
+// UpdateConfigAndRefreshAtRevision applies subscription settings only if the
+// same configuration revision is still active at the final commit. Network
+// fetching happens before that commit, so the revision must travel with the
+// queued update instead of being checked only by the HTTP handler.
+func (m *Manager) UpdateConfigAndRefreshAtRevision(urls []string, enabled bool, interval time.Duration, fetchConcurrency int, allowPrivateNetworks bool, expectedRevision uint64) error {
+	return m.updateConfigAndRefresh(urls, enabled, interval, fetchConcurrency, allowPrivateNetworks, &expectedRevision)
+}
+
+func (m *Manager) updateConfigAndRefresh(urls []string, enabled bool, interval time.Duration, fetchConcurrency int, allowPrivateNetworks bool, expectedRevision *uint64) error {
+	cleanURLs, err := config.ValidateSubscriptionURLs(urls)
+	if err != nil {
+		return err
+	}
+	ticket, err := m.updateConfig(cleanURLs, enabled, interval, fetchConcurrency, allowPrivateNetworks, true, expectedRevision)
+	if err != nil || ticket == nil {
+		return err
 	}
 	m.mu.RLock()
-	timeout := m.baseCfg.SubscriptionRefresh.Timeout
-	healthTimeout := m.baseCfg.SubscriptionRefresh.HealthCheckTimeout
 	waitCtx := m.ctx
 	m.mu.RUnlock()
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
-	deadline := timeout + healthTimeout
-
-	ctx, cancel := context.WithTimeout(waitCtx, deadline)
+	ctx, cancel := context.WithTimeout(waitCtx, ticket.waitFor)
 	defer cancel()
 
 	select {
 	case <-ctx.Done():
-		return fmt.Errorf("refresh timeout: %w", ctx.Err())
-	case err := <-waiter:
+		if m.cancelRefreshTicket(ticket.sequence, ctx.Err()) {
+			resultErr := <-ticket.result
+			if resultErr == nil {
+				return nil
+			}
+			return fmt.Errorf("refresh timeout: %w", ctx.Err())
+		}
+		return <-ticket.result
+	case err := <-ticket.result:
 		return err
 	}
 }
@@ -185,82 +218,148 @@ func (m *Manager) UpdateConfigAndRefresh(urls []string, enabled bool, interval t
 func (m *Manager) RefreshNow() error {
 	m.mu.RLock()
 	hasSubscriptions := len(m.baseCfg.Subscriptions) > 0
-	timeout := m.baseCfg.SubscriptionRefresh.Timeout
-	healthTimeout := m.baseCfg.SubscriptionRefresh.HealthCheckTimeout
 	waitCtx := m.ctx
 	m.mu.RUnlock()
 	if !hasSubscriptions {
 		return fmt.Errorf("no subscription URLs configured")
 	}
-	m.startLoop()
-	waiter := m.requestRefresh(true)
-
-	// Wait for refresh to complete or timeout
-	if timeout <= 0 {
-		timeout = 30 * time.Second
+	if !m.startLoop() {
+		return context.Canceled
 	}
+	ticket := m.requestRefresh(true, nil, nil)
 
-	ctx, cancel := context.WithTimeout(waitCtx, timeout+healthTimeout)
+	ctx, cancel := context.WithTimeout(waitCtx, ticket.waitFor)
 	defer cancel()
 
 	select {
 	case <-ctx.Done():
-		return fmt.Errorf("refresh timeout: %w", ctx.Err())
-	case err := <-waiter:
+		if m.cancelRefreshTicket(ticket.sequence, ctx.Err()) {
+			resultErr := <-ticket.result
+			if resultErr == nil {
+				return nil
+			}
+			return fmt.Errorf("refresh timeout: %w", ctx.Err())
+		}
+		return <-ticket.result
+	case err := <-ticket.result:
 		return err
 	}
 }
 
-func (m *Manager) startLoop() {
+func (m *Manager) startLoop() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stopped {
+		return false
+	}
 	m.loopOnce.Do(func() {
-		go m.refreshLoop()
+		m.loopWG.Add(1)
+		go func() {
+			defer m.loopWG.Done()
+			m.refreshLoop()
+		}()
 	})
+	return true
 }
 
-func (m *Manager) updateConfig(urls []string, enabled bool, interval time.Duration, fetchConcurrency int, wait bool) <-chan error {
-	m.startLoop()
+func (m *Manager) updateConfig(urls []string, enabled bool, interval time.Duration, fetchConcurrency int, allowPrivateNetworks bool, wait bool, expectedRevision *uint64) (*refreshTicket, error) {
+	if !m.startLoop() {
+		return nil, context.Canceled
+	}
 
-	// Do not allow an in-flight refresh based on the old URLs to publish after
-	// the new settings have been persisted.
-	m.refreshMu.Lock()
-	m.mu.Lock()
-	m.baseCfg.Subscriptions = append([]string(nil), urls...)
-	m.baseCfg.SubscriptionRefresh.Enabled = enabled
+	liveCfg, liveRevision := m.boxMgr.ConfigSnapshot()
+	if liveCfg == nil {
+		return nil, errors.New("active config is unavailable")
+	}
+	if expectedRevision != nil && liveRevision != *expectedRevision {
+		return nil, configRevisionConflict(*expectedRevision, liveRevision)
+	}
+	desired := liveCfg.Clone()
+	desired.Subscriptions = append([]string(nil), urls...)
+	desired.SubscriptionRefresh.Enabled = enabled
 	if interval > 0 {
-		m.baseCfg.SubscriptionRefresh.Interval = interval
+		desired.SubscriptionRefresh.Interval = interval
 	}
 	if fetchConcurrency > 0 {
-		m.baseCfg.SubscriptionRefresh.FetchConcurrency = config.NormalizeSubscriptionFetchConcurrency(fetchConcurrency)
+		desired.SubscriptionRefresh.FetchConcurrency = config.NormalizeSubscriptionFetchConcurrency(fetchConcurrency)
 	}
-	effectiveInterval := m.baseCfg.SubscriptionRefresh.Interval
-	saveErr := m.baseCfg.SaveSettings()
-	m.mu.Unlock()
-	m.refreshMu.Unlock()
-	if saveErr != nil {
-		m.logger.Errorf("failed to save subscription config: %v", saveErr)
-	}
+	desired.SubscriptionRefresh.AllowPrivateNetworks = allowPrivateNetworks
 
-	select {
-	case m.configChanged <- struct{}{}:
-	default:
-	}
-	if len(urls) == 0 {
-		m.logger.Infof("no subscription URLs configured, skipping refresh")
-		return nil
-	}
-
-	m.logger.Infof("subscription config updated: %d URLs, enabled=%v, interval=%s", len(urls), enabled, effectiveInterval)
-	return m.requestRefresh(wait)
+	m.notifyConfigChanged()
+	m.logger.Infof("subscription config prepared: %d URLs, enabled=%v, interval=%s", len(urls), enabled, desired.SubscriptionRefresh.Interval)
+	return m.requestRefresh(wait, desired, expectedRevision), nil
 }
 
-func (m *Manager) requestRefresh(wait bool) <-chan error {
+type refreshTicket struct {
+	sequence uint64
+	result   chan error
+	waitFor  time.Duration
+}
+
+var errSubscriptionUpdateSuperseded = errors.New("subscription update superseded by a newer configuration")
+
+func cloneRevision(revision *uint64) *uint64 {
+	if revision == nil {
+		return nil
+	}
+	cloned := *revision
+	return &cloned
+}
+
+func configRevisionConflict(expected, current uint64) error {
+	return fmt.Errorf("%w: expected %d, current %d", monitor.ErrSubscriptionConfigRevisionConflict, expected, current)
+}
+
+type pendingConfigUpdate struct {
+	sequence         uint64
+	config           *config.Config
+	expectedRevision *uint64
+}
+
+type refreshBatch struct {
+	upTo            uint64
+	selectedPending uint64
+	cancel          context.CancelFunc
+	committed       bool
+}
+
+func (m *Manager) requestRefresh(wait bool, desired *config.Config, expectedRevision *uint64) *refreshTicket {
 	m.mu.Lock()
+	if m.stopped {
+		m.mu.Unlock()
+		if !wait {
+			return nil
+		}
+		result := make(chan error, 1)
+		result <- context.Canceled
+		close(result)
+		return &refreshTicket{result: result}
+	}
 	m.requestSeq++
 	sequence := m.requestSeq
-	var waiter chan error
+	if desired != nil {
+		m.supersedePendingLocked()
+		m.pendingUpdate = &pendingConfigUpdate{
+			sequence:         sequence,
+			config:           desired.Clone(),
+			expectedRevision: cloneRevision(expectedRevision),
+		}
+	}
+	var ticket *refreshTicket
 	if wait {
-		waiter = make(chan error, 1)
-		m.waiters[sequence] = waiter
+		result := make(chan error, 1)
+		m.waiters[sequence] = result
+		budgetCfg := m.baseCfg
+		urlCount := len(m.baseCfg.Subscriptions)
+		if desired != nil {
+			budgetCfg = desired
+			urlCount = len(desired.Subscriptions)
+		}
+		ticket = &refreshTicket{
+			sequence: sequence,
+			result:   result,
+			waitFor:  m.waitBudgetFn(budgetCfg, urlCount),
+		}
 	}
 	m.mu.Unlock()
 
@@ -268,7 +367,76 @@ func (m *Manager) requestRefresh(wait bool) <-chan error {
 	case m.manualRefresh <- struct{}{}:
 	default:
 	}
-	return waiter
+	return ticket
+}
+
+func (m *Manager) supersedePendingLocked() {
+	if m.pendingUpdate == nil {
+		return
+	}
+	sequence := m.pendingUpdate.sequence
+	if m.activeBatch != nil && m.activeBatch.selectedPending == sequence {
+		if m.activeBatch.committed {
+			m.pendingUpdate = nil
+			return
+		}
+		m.canceled[sequence] = errSubscriptionUpdateSuperseded
+		m.activeBatch.cancel()
+		m.pendingUpdate = nil
+		return
+	}
+	if waiter, ok := m.waiters[sequence]; ok {
+		waiter <- errSubscriptionUpdateSuperseded
+		close(waiter)
+		delete(m.waiters, sequence)
+	}
+	delete(m.canceled, sequence)
+	m.pendingUpdate = nil
+}
+
+// cancelRefreshTicket cancels the scheduled/active batch containing sequence.
+// The caller then waits for ticket.result, which guarantees it cannot return a
+// timeout while the same batch is still able to commit in the background.
+func (m *Manager) cancelRefreshTicket(sequence uint64, err error) bool {
+	m.mu.Lock()
+	_, pending := m.waiters[sequence]
+	if !pending {
+		m.mu.Unlock()
+		return false
+	}
+	if m.activeBatch != nil && sequence <= m.activeBatch.upTo {
+		if m.activeBatch.committed {
+			// The runtime and persistence transaction has crossed its final
+			// publish barrier. A caller-side timeout can no longer cancel it and
+			// must not replace its eventual success result with a stale timeout.
+			m.mu.Unlock()
+			return false
+		}
+		m.canceled[sequence] = err
+		m.activeBatch.cancel()
+		m.mu.Unlock()
+		return true
+	}
+	// This request has not started. Remove its pending configuration and
+	// complete it immediately; no earlier batch needs to finish before the
+	// caller can safely observe cancellation.
+	if m.pendingUpdate != nil && m.pendingUpdate.sequence == sequence {
+		m.pendingUpdate = nil
+	}
+	delete(m.canceled, sequence)
+	waiter := m.waiters[sequence]
+	delete(m.waiters, sequence)
+	waiter <- err
+	close(waiter)
+	m.mu.Unlock()
+	return false
+}
+
+func (m *Manager) notifyConfigChanged() {
+	select {
+	case m.configChanged <- struct{}{}:
+	default:
+	}
 }
 
 func (m *Manager) requestedSequence() uint64 {
@@ -280,15 +448,39 @@ func (m *Manager) requestedSequence() uint64 {
 
 func (m *Manager) completeRequests(upTo uint64, err error) {
 	m.mu.Lock()
+	if upTo > m.completedSeq {
+		m.completedSeq = upTo
+	}
+	if m.activeBatch != nil && m.activeBatch.upTo == upTo {
+		m.activeBatch.cancel()
+		m.activeBatch = nil
+	}
 	for sequence, waiter := range m.waiters {
 		if sequence > upTo {
 			continue
 		}
-		waiter <- err
+		requestErr := err
+		if canceledErr, ok := m.canceled[sequence]; ok {
+			requestErr = canceledErr
+		}
+		waiter <- requestErr
 		close(waiter)
 		delete(m.waiters, sequence)
 	}
+	for sequence := range m.canceled {
+		if sequence <= upTo {
+			delete(m.canceled, sequence)
+		}
+	}
 	m.mu.Unlock()
+}
+
+func (m *Manager) pendingManualTarget() (uint64, bool) {
+	m.mu.RLock()
+	target := m.requestSeq
+	pending := target > m.completedSeq
+	m.mu.RUnlock()
+	return target, pending
 }
 
 // Status returns the current refresh status.
@@ -342,15 +534,32 @@ func (m *Manager) refreshLoop() {
 			continue
 		case <-timerChannel:
 			target := m.requestedSequence()
-			err := m.doRefresh()
+			err := m.runScheduledRefresh(target)
 			m.completeRequests(target, err)
 		case <-m.manualRefresh:
 			stopTimer(timer)
-			target := m.requestedSequence()
-			err := m.doRefresh()
+			target, pending := m.pendingManualTarget()
+			if !pending {
+				continue
+			}
+			err := m.runScheduledRefresh(target)
 			m.completeRequests(target, err)
 		}
 	}
+}
+
+func (m *Manager) runScheduledRefresh(target uint64) error {
+	ctx, cancel := context.WithCancel(m.ctx)
+	m.mu.Lock()
+	m.activeBatch = &refreshBatch{upTo: target, cancel: cancel}
+	for sequence := range m.canceled {
+		if sequence <= target {
+			cancel()
+			break
+		}
+	}
+	m.mu.Unlock()
+	return m.doRefreshContext(ctx, target)
 }
 
 func stopTimer(timer *time.Timer) {
@@ -362,10 +571,108 @@ func stopTimer(timer *time.Timer) {
 	}
 }
 
+// refreshWaitBudget is a conservative upper bound for one legal refresh. A
+// source timeout applies per URL, not per batch, so the fetch portion must
+// include every concurrency wave. Candidate preflight is likewise bounded per
+// node wave. The small fixed allowance covers config generation and atomic I/O.
+func refreshWaitBudget(cfg *config.Config, urlCount int) time.Duration {
+	if cfg == nil {
+		return 30 * time.Second
+	}
+	fetchTimeout := cfg.SubscriptionRefresh.Timeout
+	if fetchTimeout <= 0 {
+		fetchTimeout = 30 * time.Second
+	}
+	fetchConcurrency := config.NormalizeSubscriptionFetchConcurrency(cfg.SubscriptionRefresh.FetchConcurrency)
+	fetchWaves := ceilingDivision(urlCount, fetchConcurrency)
+	budget := multiplyDuration(fetchTimeout, fetchWaves)
+
+	inlineNodes := 0
+	for _, node := range cfg.Nodes {
+		if node.Source == config.NodeSourceInline {
+			inlineNodes++
+		}
+	}
+	maximumSubscriptionNodes := urlCount * config.MaxSubscriptionNodesPerSource
+	if maximumSubscriptionNodes > config.MaxSubscriptionNodesTotal {
+		maximumSubscriptionNodes = config.MaxSubscriptionNodesTotal
+	}
+	probeConcurrency := cfg.ProbeConcurrencyOrDefault()
+	if probeConcurrency < 1 {
+		probeConcurrency = 1
+	}
+	healthTimeout := cfg.SubscriptionRefresh.HealthCheckTimeout
+	if healthTimeout <= 0 {
+		healthTimeout = 60 * time.Second
+	}
+	healthWaves := ceilingDivision(inlineNodes+maximumSubscriptionNodes, probeConcurrency)
+	budget = addDuration(budget, multiplyDuration(healthTimeout, healthWaves))
+
+	drainTimeout := cfg.SubscriptionRefresh.DrainTimeout
+	if drainTimeout <= 0 {
+		drainTimeout = 30 * time.Second
+	}
+	budget = addDuration(budget, drainTimeout)
+	budget = addDuration(budget, 5*time.Second)
+	if budget <= 0 {
+		return 30 * time.Second
+	}
+	return budget
+}
+
+func ceilingDivision(value, divisor int) int {
+	if value <= 0 {
+		return 0
+	}
+	if divisor <= 0 {
+		return value
+	}
+	return 1 + (value-1)/divisor
+}
+
+func multiplyDuration(value time.Duration, factor int) time.Duration {
+	if value <= 0 || factor <= 0 {
+		return 0
+	}
+	const maximum = time.Duration(1<<63 - 1)
+	if int64(factor) > int64(maximum/value) {
+		return maximum
+	}
+	return value * time.Duration(factor)
+}
+
+func addDuration(left, right time.Duration) time.Duration {
+	const maximum = time.Duration(1<<63 - 1)
+	if right > 0 && left > maximum-right {
+		return maximum
+	}
+	return left + right
+}
+
 // doRefresh performs one atomic fetch, file update, and runtime reload.
 func (m *Manager) doRefresh() (refreshErr error) {
-	m.refreshMu.Lock()
-	defer m.refreshMu.Unlock()
+	return m.doRefreshContext(m.ctx, ^uint64(0))
+}
+
+func (m *Manager) doRefreshContext(refreshCtx context.Context, targetSequence uint64) (refreshErr error) {
+	select {
+	case <-refreshCtx.Done():
+		return refreshCtx.Err()
+	case <-m.refreshSlot:
+	}
+	defer func() { m.refreshSlot <- struct{}{} }()
+
+	var selectedPending uint64
+	var selectedExpectedRevision *uint64
+	defer func() {
+		if refreshErr != nil && selectedPending != 0 {
+			m.mu.Lock()
+			if m.pendingUpdate != nil && m.pendingUpdate.sequence == selectedPending {
+				m.pendingUpdate = nil
+			}
+			m.mu.Unlock()
+		}
+	}()
 
 	m.mu.Lock()
 	m.status.IsRefreshing = true
@@ -376,68 +683,81 @@ func (m *Manager) doRefresh() (refreshErr error) {
 		m.status.RefreshCount++
 		m.status.LastRefresh = time.Now()
 		if refreshErr != nil {
-			m.status.LastError = refreshErr.Error()
+			m.status.LastError = monitor.SanitizeProbeError(refreshErr)
 		} else {
 			m.status.LastError = ""
 		}
 		m.mu.Unlock()
 	}()
 
-	m.mu.RLock()
-	baseCfg := *m.baseCfg
-	baseCfg.Nodes = cloneNodes(m.baseCfg.Nodes)
-	baseCfg.Subscriptions = append([]string(nil), m.baseCfg.Subscriptions...)
-	fetchCtx := m.ctx
-	m.mu.RUnlock()
-	nodesFilePath := nodesFilePathForConfig(&baseCfg)
+	m.mu.Lock()
+	baseCfg := m.baseCfg.Clone()
+	if m.pendingUpdate != nil && m.pendingUpdate.sequence <= targetSequence {
+		selectedPending = m.pendingUpdate.sequence
+		selectedExpectedRevision = cloneRevision(m.pendingUpdate.expectedRevision)
+		baseCfg = m.pendingUpdate.config.Clone()
+		if m.activeBatch != nil && m.activeBatch.upTo == targetSequence {
+			m.activeBatch.selectedPending = selectedPending
+		}
+	}
+	m.mu.Unlock()
+	if baseCfg == nil {
+		return errors.New("subscription config is unavailable")
+	}
+	if err := refreshCtx.Err(); err != nil {
+		return err
+	}
+	if selectedPending != 0 && len(baseCfg.Subscriptions) == 0 {
+		if err := m.validatePendingGeneration(refreshCtx, selectedPending); err != nil {
+			return err
+		}
+		committed, err := m.commitClearedSubscriptions(refreshCtx, baseCfg, targetSequence, selectedPending, selectedExpectedRevision)
+		if err != nil {
+			return err
+		}
+		m.mu.Lock()
+		m.baseCfg = committed.Clone()
+		if m.pendingUpdate != nil && m.pendingUpdate.sequence == selectedPending {
+			m.pendingUpdate = nil
+		}
+		m.sourceCache = make(map[string][]config.NodeConfig)
+		m.lastSubHash = ""
+		m.lastNodesModTime = time.Time{}
+		m.status.NodesModified = false
+		m.status.NodeCount = len(committed.Nodes)
+		m.mu.Unlock()
+		m.logger.Infof("subscription config cleared; %d inline nodes remain", len(committed.Nodes))
+		return nil
+	}
+	// A queued manual signal can outlive a synchronous clear operation. Treat
+	// it as already satisfied instead of turning a successful clear into a
+	// spurious "no nodes fetched" status error.
+	if len(baseCfg.Subscriptions) == 0 {
+		return nil
+	}
+	nodesFilePath := nodesFilePathForConfig(baseCfg)
 
 	m.logger.Infof("starting subscription refresh")
-	plan, err := m.fetchAllSubscriptions(fetchCtx, &baseCfg, nodesFilePath)
+	plan, err := m.fetchAllSubscriptions(refreshCtx, baseCfg, nodesFilePath, selectedPending == 0)
 	if err != nil {
 		m.logger.Errorf("fetch subscriptions failed: %v", err)
 		return err
 	}
 	m.logger.Infof("prepared %d subscription nodes", len(plan.nodes))
-	if lister, ok := m.boxMgr.(configNodeLister); ok {
-		currentNodes, listErr := lister.ListConfigNodes(fetchCtx)
-		if listErr != nil {
-			return fmt.Errorf("snapshot current explicit nodes: %w", listErr)
-		}
-		baseCfg.Nodes = cloneNodes(currentNodes)
+	if err := m.validatePendingGeneration(refreshCtx, selectedPending); err != nil {
+		return err
 	}
-
-	// Persist the candidate before switching runtime, retaining the previous
-	// bytes so a rejected candidate cannot replace the last bootable cache.
-	previousNodes, readErr := os.ReadFile(nodesFilePath)
-	previousFileExisted := readErr == nil
-	if readErr != nil && !os.IsNotExist(readErr) {
-		return fmt.Errorf("snapshot nodes.txt: %w", readErr)
-	}
-	if err := m.writeNodesToFile(nodesFilePath, plan.nodes); err != nil {
-		return fmt.Errorf("write nodes.txt: %w", err)
-	}
-
-	portMap := m.boxMgr.CurrentPortMap()
-	newCfg := m.createNewConfig(&baseCfg, cloneNodes(plan.nodes))
-	if err := m.boxMgr.ReloadWithPortMap(newCfg, portMap); err != nil {
-		var restoreErr error
-		if previousFileExisted {
-			restoreErr = config.WriteFileAtomic(nodesFilePath, previousNodes, 0o644)
-		} else {
-			restoreErr = os.Remove(nodesFilePath)
-			if os.IsNotExist(restoreErr) {
-				restoreErr = nil
-			}
-		}
-		if restoreErr != nil {
-			return fmt.Errorf("reload: %w; restore nodes.txt: %v", err, restoreErr)
-		}
-		return fmt.Errorf("reload: %w", err)
+	newCfg, committedNodesPath, err := m.commitRefreshPlan(refreshCtx, baseCfg, plan.nodes, targetSequence, selectedPending, selectedExpectedRevision)
+	if err != nil {
+		return err
 	}
 
 	newHash := m.computeNodesHash(plan.nodes)
 	m.mu.Lock()
-	m.baseCfg = newCfg
+	m.baseCfg = newCfg.Clone()
+	if selectedPending != 0 && m.pendingUpdate != nil && m.pendingUpdate.sequence == selectedPending {
+		m.pendingUpdate = nil
+	}
 	for key := range m.sourceCache {
 		if _, active := plan.activeKeys[key]; !active {
 			delete(m.sourceCache, key)
@@ -447,7 +767,7 @@ func (m *Manager) doRefresh() (refreshErr error) {
 		m.sourceCache[key] = cloneNodes(nodes)
 	}
 	m.lastSubHash = newHash
-	if info, statErr := os.Stat(nodesFilePath); statErr == nil {
+	if info, statErr := os.Stat(committedNodesPath); statErr == nil {
 		m.lastNodesModTime = info.ModTime()
 	} else {
 		m.lastNodesModTime = time.Now()
@@ -462,6 +782,230 @@ func (m *Manager) doRefresh() (refreshErr error) {
 		m.logger.Infof("subscription refresh completed, %d nodes active", len(newCfg.Nodes))
 	}
 	return nil
+}
+
+const maxConfigCommitAttempts = 4
+
+// commitRefreshPlan rebases the fetched nodes onto the latest committed
+// configuration. This is deliberately done after the network fetch so a
+// settings update or inline-node CRUD operation that completes while a slow
+// provider is responding is not overwritten by a stale snapshot.
+func (m *Manager) commitRefreshPlan(ctx context.Context, desired *config.Config, subscriptionNodes []config.NodeConfig, targetSequence, pendingGeneration uint64, expectedRevision *uint64) (*config.Config, string, error) {
+	guardedCtx := commitguard.With(ctx, m.acquireCommitBarrier(ctx, targetSequence, pendingGeneration))
+	for attempt := 0; attempt < maxConfigCommitAttempts; attempt++ {
+		if err := m.validatePendingGeneration(ctx, pendingGeneration); err != nil {
+			return nil, "", err
+		}
+		latest, revision := m.boxMgr.ConfigSnapshot()
+		if latest == nil {
+			return nil, "", errors.New("active config is unavailable")
+		}
+		if expectedRevision != nil && revision != *expectedRevision {
+			return nil, "", configRevisionConflict(*expectedRevision, revision)
+		}
+		applySubscriptionSettings(latest, desired)
+		candidate := m.createNewConfig(latest, cloneNodes(subscriptionNodes))
+		nodesPath := nodesFilePathForConfig(candidate)
+		err := m.boxMgr.CommitConfig(guardedCtx, revision, candidate, func(committed *config.Config) (func() error, error) {
+			if err := m.validatePendingGeneration(ctx, pendingGeneration); err != nil {
+				return nil, err
+			}
+			return m.persistSubscriptionState(committed, subscriptionNodes)
+		})
+		if err == nil {
+			committed, _ := m.boxMgr.ConfigSnapshot()
+			if committed == nil {
+				return nil, "", errors.New("committed config is unavailable")
+			}
+			return committed, nodesPath, nil
+		}
+
+		_, currentRevision := m.boxMgr.ConfigSnapshot()
+		if expectedRevision != nil && currentRevision != *expectedRevision {
+			return nil, "", configRevisionConflict(*expectedRevision, currentRevision)
+		}
+		if currentRevision == revision {
+			return nil, "", fmt.Errorf("commit subscription refresh: %w", err)
+		}
+		if expectedRevision != nil {
+			return nil, "", configRevisionConflict(*expectedRevision, currentRevision)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, "", ctxErr
+		}
+	}
+	return nil, "", errors.New("commit subscription refresh: configuration changed too frequently")
+}
+
+func (m *Manager) commitClearedSubscriptions(ctx context.Context, desired *config.Config, targetSequence, pendingGeneration uint64, expectedRevision *uint64) (*config.Config, error) {
+	guardedCtx := commitguard.With(ctx, m.acquireCommitBarrier(ctx, targetSequence, pendingGeneration))
+	for attempt := 0; attempt < maxConfigCommitAttempts; attempt++ {
+		if err := m.validatePendingGeneration(ctx, pendingGeneration); err != nil {
+			return nil, err
+		}
+		latest, revision := m.boxMgr.ConfigSnapshot()
+		if latest == nil {
+			return nil, errors.New("active config is unavailable")
+		}
+		if expectedRevision != nil && revision != *expectedRevision {
+			return nil, configRevisionConflict(*expectedRevision, revision)
+		}
+		applySubscriptionSettings(latest, desired)
+		candidate := m.createNewConfig(latest, nil)
+		err := m.boxMgr.CommitConfig(guardedCtx, revision, candidate, func(committed *config.Config) (func() error, error) {
+			if err := m.validatePendingGeneration(ctx, pendingGeneration); err != nil {
+				return nil, err
+			}
+			return m.persistSubscriptionState(committed, nil)
+		})
+		if err == nil {
+			committed, _ := m.boxMgr.ConfigSnapshot()
+			if committed == nil {
+				return nil, errors.New("committed config is unavailable")
+			}
+			return committed, nil
+		}
+		_, currentRevision := m.boxMgr.ConfigSnapshot()
+		if expectedRevision != nil && currentRevision != *expectedRevision {
+			return nil, configRevisionConflict(*expectedRevision, currentRevision)
+		}
+		if currentRevision == revision {
+			return nil, fmt.Errorf("clear subscriptions: %w", err)
+		}
+		if expectedRevision != nil {
+			return nil, configRevisionConflict(*expectedRevision, currentRevision)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+	}
+	return nil, errors.New("clear subscriptions: configuration changed too frequently")
+}
+
+func (m *Manager) acquireCommitBarrier(ctx context.Context, targetSequence, pendingGeneration uint64) commitguard.AcquireFunc {
+	return func() (func(), func(), error) {
+		m.mu.Lock()
+		if err := ctx.Err(); err != nil {
+			m.mu.Unlock()
+			return nil, nil, err
+		}
+		if pendingGeneration != 0 {
+			current := m.pendingUpdate != nil && m.pendingUpdate.sequence == pendingGeneration
+			if canceledErr, canceled := m.canceled[pendingGeneration]; canceled {
+				m.mu.Unlock()
+				return nil, nil, canceledErr
+			}
+			if !current {
+				m.mu.Unlock()
+				return nil, nil, errSubscriptionUpdateSuperseded
+			}
+		}
+		markCommitted := func() {
+			if m.activeBatch != nil && m.activeBatch.upTo == targetSequence {
+				m.activeBatch.committed = true
+			}
+		}
+		return markCommitted, m.mu.Unlock, nil
+	}
+}
+
+func (m *Manager) validatePendingGeneration(ctx context.Context, generation uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if generation == 0 {
+		return nil
+	}
+	m.mu.RLock()
+	current := m.pendingUpdate != nil && m.pendingUpdate.sequence == generation
+	m.mu.RUnlock()
+	if !current {
+		return errSubscriptionUpdateSuperseded
+	}
+	return nil
+}
+
+func applySubscriptionSettings(target, desired *config.Config) {
+	target.Subscriptions = append([]string(nil), desired.Subscriptions...)
+	target.SubscriptionRefresh = desired.SubscriptionRefresh
+}
+
+// persistSubscriptionState updates config.yaml and nodes.txt as one logical
+// transaction. CommitConfig invokes the returned rollback after either a
+// persistence or runtime reload failure.
+func (m *Manager) persistSubscriptionState(candidate *config.Config, subscriptionNodes []config.NodeConfig) (func() error, error) {
+	if m.saveSettingsFn == nil && m.writeNodesFn == nil {
+		return candidate.SaveSubscriptionStateTransaction(subscriptionNodes, len(candidate.Subscriptions) == 0)
+	}
+	configPath := candidate.FilePath()
+	nodesPath := nodesFilePathForConfig(candidate)
+	if strings.TrimSpace(configPath) == "" {
+		return nil, errors.New("config file path is unknown")
+	}
+	if filepath.Clean(configPath) == filepath.Clean(nodesPath) {
+		return nil, errors.New("config file and nodes file must be different")
+	}
+
+	configBefore, err := config.CaptureFileSnapshot(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot config: %w", err)
+	}
+	nodesBefore, err := config.CaptureFileSnapshot(nodesPath)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot nodes: %w", err)
+	}
+	configExpected := configBefore
+	nodesExpected := nodesBefore
+	checkpointConfig := func() error {
+		var err error
+		configExpected, err = config.CaptureFileSnapshot(configPath)
+		if err != nil {
+			return fmt.Errorf("snapshot persisted config: %w", err)
+		}
+		return nil
+	}
+	checkpointNodes := func() error {
+		var err error
+		nodesExpected, err = config.CaptureFileSnapshot(nodesPath)
+		if err != nil {
+			return fmt.Errorf("snapshot persisted nodes: %w", err)
+		}
+		return nil
+	}
+	rollback := func() error {
+		return errors.Join(
+			config.RestoreFileSnapshotCAS(nodesBefore, nodesExpected),
+			config.RestoreFileSnapshotCAS(configBefore, configExpected),
+		)
+	}
+
+	saveSettings := m.saveSettingsFn
+	if saveSettings == nil {
+		saveSettings = func(cfg *config.Config) error { return cfg.SaveSettings() }
+	}
+	writeNodes := m.writeNodesFn
+	if writeNodes == nil {
+		writeNodes = config.WriteNodesToFile
+	}
+	if err := saveSettings(candidate); err != nil {
+		if checkpointErr := checkpointConfig(); checkpointErr != nil {
+			return nil, fmt.Errorf("save subscription settings: %w; capture rollback checkpoint: %v", err, checkpointErr)
+		}
+		return rollback, fmt.Errorf("save subscription settings: %w", err)
+	}
+	if err := checkpointConfig(); err != nil {
+		return nil, fmt.Errorf("capture subscription config rollback checkpoint: %w", err)
+	}
+	if err := writeNodes(nodesPath, cloneNodes(subscriptionNodes)); err != nil {
+		if checkpointErr := checkpointNodes(); checkpointErr != nil {
+			return nil, fmt.Errorf("write subscription nodes: %w; capture rollback checkpoint: %v", err, checkpointErr)
+		}
+		return rollback, fmt.Errorf("write subscription nodes: %w", err)
+	}
+	if err := checkpointNodes(); err != nil {
+		return nil, fmt.Errorf("capture subscription nodes rollback checkpoint: %w", err)
+	}
+	return rollback, nil
 }
 
 func nodesFilePathForConfig(cfg *config.Config) string {
@@ -483,11 +1027,6 @@ func (m *Manager) getNodesFilePath() string {
 	return filepath.Join(filepath.Dir(configPath), "nodes.txt")
 }
 
-// writeNodesToFile writes nodes to a file (one URI per line).
-func (m *Manager) writeNodesToFile(path string, nodes []config.NodeConfig) error {
-	return config.WriteNodesToFile(path, nodes)
-}
-
 // computeNodesHash computes a hash of node URIs for change detection.
 func (m *Manager) computeNodesHash(nodes []config.NodeConfig) string {
 	var uris []string
@@ -503,6 +1042,10 @@ func (m *Manager) computeNodesHash(nodes []config.NodeConfig) string {
 // Uses file modification time as a fast path to avoid unnecessary file reads.
 func (m *Manager) CheckNodesModified() bool {
 	m.mu.RLock()
+	if m.status.NodesModified {
+		m.mu.RUnlock()
+		return true
+	}
 	lastHash := m.lastSubHash
 	lastMod := m.lastNodesModTime
 	m.mu.RUnlock()
@@ -516,7 +1059,11 @@ func (m *Manager) CheckNodesModified() bool {
 	// Fast path: check modification time first
 	info, err := os.Stat(nodesFilePath)
 	if err != nil {
-		return false // File doesn't exist or can't stat
+		// Once a successful refresh established a hash, deletion, permission
+		// loss, and other read failures are all observable modifications. Latch
+		// the state so a later recreation cannot hide the diagnostic event.
+		m.MarkNodesModified()
+		return true
 	}
 	modTime := info.ModTime()
 	if !modTime.After(lastMod) {
@@ -526,7 +1073,8 @@ func (m *Manager) CheckNodesModified() bool {
 	// Slow path: file was modified, compute hash
 	data, err := os.ReadFile(nodesFilePath)
 	if err != nil {
-		return false // File doesn't exist or can't read
+		m.MarkNodesModified()
+		return true
 	}
 
 	// Parse nodes from file content
@@ -548,6 +1096,9 @@ func (m *Manager) CheckNodesModified() bool {
 	// Update cached mod time
 	m.mu.Lock()
 	m.lastNodesModTime = modTime
+	if changed {
+		m.status.NodesModified = true
+	}
 	m.mu.Unlock()
 
 	return changed
@@ -571,11 +1122,11 @@ type subscriptionFetchPlan struct {
 // refresh has populated sourceCache, a failed source can be replaced by only
 // that source's last known-good nodes. On the first incomplete refresh after a
 // restart, nodes.txt remains the conservative aggregate fallback.
-func (m *Manager) fetchAllSubscriptions(ctx context.Context, baseCfg *config.Config, nodesFilePath string) (subscriptionFetchPlan, error) {
+func (m *Manager) fetchAllSubscriptions(ctx context.Context, baseCfg *config.Config, nodesFilePath string, allowAggregateFallback bool) (subscriptionFetchPlan, error) {
 	results, stats := config.FetchSubscriptionSources(ctx, baseCfg.Subscriptions, config.SubscriptionFetchOptions{
-		Timeout:     baseCfg.SubscriptionRefresh.Timeout,
-		Concurrency: baseCfg.SubscriptionRefresh.FetchConcurrency,
-		Client:      m.httpClient,
+		Timeout:              baseCfg.SubscriptionRefresh.Timeout,
+		Concurrency:          baseCfg.SubscriptionRefresh.FetchConcurrency,
+		AllowPrivateNetworks: baseCfg.SubscriptionRefresh.AllowPrivateNetworks,
 		Loggerf: func(format string, args ...any) {
 			m.logger.Infof(format, args...)
 		},
@@ -615,7 +1166,7 @@ func (m *Manager) fetchAllSubscriptions(ctx context.Context, baseCfg *config.Con
 		}
 	}
 
-	if unresolved > 0 {
+	if unresolved > 0 && allowAggregateFallback {
 		cachedNodes, cacheErr := config.LoadNodesFromFile(nodesFilePath)
 		if cacheErr == nil && len(cachedNodes) > 0 {
 			cachedNodes, _ = config.DedupeNodesByStableIdentity(cachedNodes)
@@ -630,6 +1181,12 @@ func (m *Manager) fetchAllSubscriptions(ctx context.Context, baseCfg *config.Con
 		}
 		if cacheErr != nil && !os.IsNotExist(cacheErr) {
 			return subscriptionFetchPlan{}, fmt.Errorf("%w; read aggregate cache: %v", lastErr, cacheErr)
+		}
+		return subscriptionFetchPlan{}, lastErr
+	}
+	if unresolved > 0 {
+		if lastErr == nil {
+			lastErr = fmt.Errorf("%d subscription sources could not be refreshed", unresolved)
 		}
 		return subscriptionFetchPlan{}, lastErr
 	}
