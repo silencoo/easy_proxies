@@ -453,8 +453,13 @@ func (c *Config) normalize() error {
 		}
 
 	}
-	if err := validateUniqueNodeKeys(c.Nodes); err != nil {
+	var dedupedNodes int
+	c.Nodes, dedupedNodes, err = dedupeExternalNodeKeys(c.Nodes)
+	if err != nil {
 		return err
+	}
+	if dedupedNodes > 0 {
+		log.Printf("deduplicated %d repeated external proxy nodes", dedupedNodes)
 	}
 	if err := c.ApplyNodeAuthOverrides(); err != nil {
 		return err
@@ -1075,8 +1080,13 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 			c.Nodes[idx].Name = fmt.Sprintf("node-%d", idx)
 		}
 	}
-	if err := validateUniqueNodeKeys(c.Nodes); err != nil {
+	var dedupedNodes int
+	c.Nodes, dedupedNodes, err = dedupeExternalNodeKeys(c.Nodes)
+	if err != nil {
 		return err
+	}
+	if dedupedNodes > 0 {
+		log.Printf("deduplicated %d repeated external proxy nodes", dedupedNodes)
 	}
 	if err := c.ApplyNodeAuthOverrides(); err != nil {
 		return err
@@ -1097,16 +1107,41 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	return nil
 }
 
-func validateUniqueNodeKeys(nodes []NodeConfig) error {
-	seen := make(map[string]int, len(nodes))
-	for index := range nodes {
-		key := nodes[index].NodeKey()
-		if previous, exists := seen[key]; exists {
-			return fmt.Errorf("nodes %d and %d resolve to the same proxy identity", previous, index)
-		}
-		seen[key] = index
+func dedupeExternalNodeKeys(nodes []NodeConfig) ([]NodeConfig, int, error) {
+	type identityOwner struct {
+		outputIndex int
+		inputIndex  int
+		inline      bool
 	}
-	return nil
+
+	seen := make(map[string]identityOwner, len(nodes))
+	unique := make([]NodeConfig, 0, len(nodes))
+	deduped := 0
+	for inputIndex, node := range nodes {
+		key := node.NodeKey()
+		inline := node.Source == "" || node.Source == NodeSourceInline
+		previous, exists := seen[key]
+		if !exists {
+			seen[key] = identityOwner{outputIndex: len(unique), inputIndex: inputIndex, inline: inline}
+			unique = append(unique, node)
+			continue
+		}
+
+		if inline && previous.inline {
+			return nil, deduped, fmt.Errorf("nodes %d and %d resolve to the same proxy identity", previous.inputIndex, inputIndex)
+		}
+
+		// Subscription and nodes_file caches commonly repeat the same endpoint
+		// under different display names. Keep one stable runtime identity instead
+		// of making an otherwise usable last-known-good cache unbootable. Explicit
+		// inline configuration always wins, regardless of merge order.
+		if inline && !previous.inline {
+			unique[previous.outputIndex] = node
+			seen[key] = identityOwner{outputIndex: previous.outputIndex, inputIndex: inputIndex, inline: true}
+		}
+		deduped++
+	}
+	return unique, deduped, nil
 }
 
 func sanitizeNodeName(name string) string {
