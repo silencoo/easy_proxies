@@ -101,12 +101,27 @@ func TestProbeSweepCoalescesOverlappingTriggers(t *testing.T) {
 	<-firstStarted
 	go func() { defer wg.Done(); manager.ProbeAllNow(time.Second) }()
 	go func() { defer wg.Done(); manager.ProbeAllNow(time.Second) }()
-	waitForRerunRequest(t, manager)
+	waitForProbeWaiters(t, manager, 2)
 	close(releaseFirst)
 	wg.Wait()
 	if got := calls.Load(); got != 2 {
 		t.Fatalf("underlying callback ran %d times, want initial + one coalesced rerun", got)
 	}
+}
+
+func waitForProbeWaiters(t *testing.T, manager *Manager, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		manager.probeGate.Lock()
+		waiters := manager.sweepWaiters
+		manager.probeGate.Unlock()
+		if waiters >= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("probe sweep has fewer than %d overlapping waiters", want)
 }
 
 func TestProbeSweepDoesNotQueueMoreThanOneFollowup(t *testing.T) {

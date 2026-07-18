@@ -165,6 +165,7 @@ type Manager struct {
 
 	probeGate      sync.Mutex
 	sweepRunning   bool
+	sweepWaiters   int
 	rerunRequested bool
 	rerunTimeout   time.Duration
 	sweepIdle      chan struct{}
@@ -325,6 +326,7 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 	m.probeGate.Lock()
 	if m.sweepRunning {
 		m.rerunRequested = true
+		m.sweepWaiters++
 		if timeout > m.rerunTimeout {
 			m.rerunTimeout = timeout
 		}
@@ -333,6 +335,9 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 		if idle != nil {
 			<-idle
 		}
+		m.probeGate.Lock()
+		m.sweepWaiters--
+		m.probeGate.Unlock()
 		return
 	}
 	m.sweepRunning = true

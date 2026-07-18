@@ -9,7 +9,6 @@ import (
 	"log"
 	"reflect"
 	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -629,10 +628,7 @@ func (m *Manager) preflightCandidateSet(ctx context.Context, instance *box.Box, 
 		timeout = defaultHealthCheckTimeout
 	}
 
-	workerCount := runtime.NumCPU() * 2
-	if workerCount < 8 {
-		workerCount = 8
-	}
+	workerCount := m.monitorMgr.ProbeConcurrency()
 	if workerCount > len(tags) {
 		workerCount = len(tags)
 	}
