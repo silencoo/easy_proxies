@@ -82,3 +82,27 @@ func TestEmbeddedWebUIHasScalableNodeOperations(t *testing.T) {
 		}
 	}
 }
+
+func TestEmbeddedWebUIExposesAdaptivePoolSettings(t *testing.T) {
+	data, err := embeddedFS.ReadFile("assets/index.html")
+	if err != nil {
+		t.Fatalf("read embedded WebUI: %v", err)
+	}
+	html := string(data)
+	required := []string{
+		`value="latency"`,
+		`id="settingPoolRetry"`,
+		`id="settingPoolCooldown"`,
+		`id="settingPoolSticky"`,
+		`id="settingStickyTTL"`,
+		`id="settingStickyMax"`,
+		`function togglePoolStrategySettings()`,
+		`n.cooling_down`,
+		`'冷却 Cooling': 'Cooling down'`,
+	}
+	for _, value := range required {
+		if !strings.Contains(html, value) {
+			t.Errorf("embedded WebUI is missing %q", value)
+		}
+	}
+}

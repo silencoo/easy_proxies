@@ -205,6 +205,9 @@
       outline: none; width: 100%; box-sizing: border-box; transition: border-color 0.2s;
     }
     .setting-input:focus { border-color: var(--primary); }
+    .setting-input:disabled { opacity: 0.55; cursor: not-allowed; }
+    .settings-grid { padding: 16px; display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 16px; }
+    .settings-help { grid-column: 1 / -1; font-size: 11px; line-height: 1.6; color: var(--text-muted); }
     @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
 
     /* UI Components */
@@ -866,17 +869,28 @@
 
             <div class="panel" style="margin-bottom: 16px;">
               <div class="panel-header"><div class="panel-title">节点池配置 (Pool)</div></div>
-              <div style="padding: 16px; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px;">
+              <div class="settings-grid">
                 <div class="form-group">
-                  <label>调度模式</label>
-                  <select id="settingPoolMode" class="setting-input">
+                  <label for="settingPoolMode">调度模式</label>
+                  <select id="settingPoolMode" class="setting-input" onchange="togglePoolStrategySettings()">
+                    <option value="sequential">sequential - 轮询</option>
                     <option value="random">random - 随机</option>
-                    <option value="round-robin">round-robin - 轮询</option>
                     <option value="balance">balance - 均衡</option>
+                    <option value="latency">latency - 延迟感知</option>
                   </select>
                 </div>
-                <div class="form-group"><label>故障阈值</label><input type="number" id="settingPoolFailure" class="setting-input" min="1" max="100" placeholder="3" /></div>
-                <div class="form-group"><label>黑名单时长</label><input type="text" id="settingPoolBlacklist" class="setting-input" placeholder="24h" /></div>
+                <div class="form-group"><label for="settingPoolFailure">故障阈值</label><input type="number" id="settingPoolFailure" class="setting-input" min="1" max="100" placeholder="3" /></div>
+                <div class="form-group"><label for="settingPoolBlacklist">黑名单时长</label><input type="text" id="settingPoolBlacklist" class="setting-input" placeholder="24h" /></div>
+                <div class="form-group"><label for="settingPoolCooldown">临时故障冷却</label><input type="text" id="settingPoolCooldown" class="setting-input" placeholder="1m" /></div>
+                <div class="form-group"><label for="settingPoolRetryAttempts">最大连接尝试次数</label><input type="number" id="settingPoolRetryAttempts" class="setting-input" min="1" max="10" placeholder="3" /></div>
+                <div class="form-group"><label for="settingLatencySamples">延迟模式采样节点数</label><input type="number" id="settingLatencySamples" class="setting-input" min="1" max="32" placeholder="4" /></div>
+                <div class="form-group"><label for="settingLatencyTolerance">延迟均衡容差</label><input type="text" id="settingLatencyTolerance" class="setting-input" placeholder="50ms" /></div>
+                <div class="form-group"><label for="settingStickyTTL">会话保持 TTL</label><input type="text" id="settingStickyTTL" class="setting-input" placeholder="30m" /></div>
+                <div class="form-group"><label for="settingStickyMax">会话保持最大条目</label><input type="number" id="settingStickyMax" class="setting-input" min="1" max="1000000" placeholder="4096" /></div>
+                <div class="checkbox-row"><input type="checkbox" id="settingPoolRetry" onchange="togglePoolStrategySettings()" /><label for="settingPoolRetry">连接失败时切换节点重试</label></div>
+                <div class="checkbox-row"><input type="checkbox" id="settingPoolSticky" onchange="togglePoolStrategySettings()" /><label for="settingPoolSticky">启用有界会话保持</label></div>
+                <div class="checkbox-row"><input type="checkbox" id="settingPoolFailOpen" /><label for="settingPoolFailOpen">全部节点不可用时尝试恢复</label></div>
+                <div class="settings-help">重试和会话保持只应用于统一池入口；每节点独立端口始终固定到对应节点。延迟模式在小样本内选择低延迟节点，并在容差内优先分配给当前连接较少的节点。</div>
               </div>
             </div>
 
@@ -1161,11 +1175,23 @@
       '起始端口': 'Base port',
       '节点池配置 (Pool)': 'Proxy pool',
       '调度模式': 'Scheduling mode',
+      'sequential - 轮询': 'sequential - round robin',
       'random - 随机': 'random',
       'round-robin - 轮询': 'round-robin',
       'balance - 均衡': 'balance',
+      'latency - 延迟感知': 'latency-aware',
       '故障阈值': 'Failure threshold',
       '黑名单时长': 'Blacklist duration',
+      '临时故障冷却': 'Transient failure cooldown',
+      '最大连接尝试次数': 'Maximum dial attempts',
+      '延迟模式采样节点数': 'Latency sample size',
+      '延迟均衡容差': 'Latency balancing tolerance',
+      '会话保持 TTL': 'Session affinity TTL',
+      '会话保持最大条目': 'Maximum affinity entries',
+      '连接失败时切换节点重试': 'Retry another node after a dial failure',
+      '启用有界会话保持': 'Enable bounded session affinity',
+      '全部节点不可用时尝试恢复': 'Fail open when every node is unavailable',
+      '重试和会话保持只应用于统一池入口；每节点独立端口始终固定到对应节点。延迟模式在小样本内选择低延迟节点，并在容差内优先分配给当前连接较少的节点。': 'Retries and session affinity apply only to the unified pool listener. Dedicated ports always use their assigned node. Latency mode samples a bounded set and balances active connections among nodes inside the latency tolerance.',
       '管理面板 (Management)': 'Management UI',
       '访问密码': 'Access password',
       'GeoIP 地域路由': 'GeoIP region routing',
@@ -1217,6 +1243,8 @@
       '解封': 'Release',
       '拉黑': 'Block',
       '拉黑 Blocked': 'Blocked',
+      '冷却 Cooling': 'Cooling down',
+      '解除冷却': 'Release cooldown',
       '未测试 Unknown': 'Not tested',
       '异常 Error': 'Error',
       '在线 Healthy': 'Healthy',
@@ -1312,6 +1340,7 @@
 
     function getNodeStatusRank(node) {
       if (node.blacklisted) return 3;
+      if (node.cooling_down) return 2.5;
       if ((node.last_latency_ms || -1) < 0) return 2;
       if ((node.failure_count || 0) > 0) return 1;
       return 0;
@@ -1752,6 +1781,7 @@
         const ms = n.last_latency_ms || -1;
         let badge = '', statusText = '';
         if (n.blacklisted) { badge = 'badge-error'; statusText = tr('拉黑 Blocked'); }
+        else if (n.cooling_down) { badge = 'badge-warning'; statusText = tr('冷却 Cooling'); }
         else if (ms < 0) { badge = 'badge-offline'; statusText = tr('未测试 Unknown'); }
         else if (n.failure_count >= 1) { badge = 'badge-error'; statusText = tr('异常 Error'); }
         else { badge = 'badge-healthy'; statusText = tr('在线 Healthy'); }
@@ -1774,7 +1804,7 @@
           <td class="tt-mono" style="color: ${n.failure_count>0 ? 'var(--error)' : 'inherit'}">${n.failure_count||0}</td>
           <td>
             <button type="button" class="btn btn-sm" onclick="probeNode(${inlineStringArg(n.tag)})">${iconMarkup('search')}<span>${tr('探测')}</span></button>
-            ${n.blacklisted ? `<button type="button" class="btn btn-sm btn-primary" onclick="releaseNode(${inlineStringArg(n.tag)})">${iconMarkup('unlock')}<span>${tr('解封')}</span></button>` : `<button type="button" class="btn btn-sm btn-danger" onclick="blacklistNode(${inlineStringArg(n.tag)})">${iconMarkup('ban')}<span>${tr('拉黑')}</span></button>`}
+            ${(n.blacklisted || n.cooling_down) ? `<button type="button" class="btn btn-sm btn-primary" onclick="releaseNode(${inlineStringArg(n.tag)})">${iconMarkup('unlock')}<span>${tr(n.cooling_down && !n.blacklisted ? '解除冷却' : '解封')}</span></button>` : `<button type="button" class="btn btn-sm btn-danger" onclick="blacklistNode(${inlineStringArg(n.tag)})">${iconMarkup('ban')}<span>${tr('拉黑')}</span></button>`}
           </td>
         </tr>`;
       }).join('');
@@ -2130,6 +2160,17 @@
         document.getElementById('settingPoolMode').value = pl.mode || 'random';
         document.getElementById('settingPoolFailure').value = pl.failure_threshold || 3;
         document.getElementById('settingPoolBlacklist').value = pl.blacklist_duration || '24h';
+        document.getElementById('settingPoolCooldown').value = pl.transient_cooldown || '1m0s';
+        document.getElementById('settingPoolRetry').checked = pl.retry_enabled !== false;
+        document.getElementById('settingPoolRetryAttempts').value = pl.retry_attempts || 3;
+        document.getElementById('settingPoolFailOpen').checked = pl.fail_open || false;
+        document.getElementById('settingLatencySamples').value = pl.latency_sample_size || 4;
+        document.getElementById('settingLatencyTolerance').value = pl.latency_tolerance || '50ms';
+        const sticky = pl.sticky || {};
+        document.getElementById('settingPoolSticky').checked = sticky.enabled || false;
+        document.getElementById('settingStickyTTL').value = sticky.ttl || '30m0s';
+        document.getElementById('settingStickyMax').value = sticky.max_entries || 4096;
+        togglePoolStrategySettings();
         // Management
         const mgmt = d.management || {};
         document.getElementById('settingMgmtListen').value = mgmt.listen || '';
@@ -2183,6 +2224,15 @@
         pool_mode: document.getElementById('settingPoolMode').value,
         pool_failure: document.getElementById('settingPoolFailure').value,
         pool_blacklist: document.getElementById('settingPoolBlacklist').value,
+        pool_cooldown: document.getElementById('settingPoolCooldown').value,
+        pool_retry: document.getElementById('settingPoolRetry').checked,
+        pool_retry_attempts: document.getElementById('settingPoolRetryAttempts').value,
+        pool_fail_open: document.getElementById('settingPoolFailOpen').checked,
+        latency_samples: document.getElementById('settingLatencySamples').value,
+        latency_tolerance: document.getElementById('settingLatencyTolerance').value,
+        pool_sticky: document.getElementById('settingPoolSticky').checked,
+        sticky_ttl: document.getElementById('settingStickyTTL').value,
+        sticky_max: document.getElementById('settingStickyMax').value,
         mgmt_listen: document.getElementById('settingMgmtListen').value,
         mgmt_password: document.getElementById('settingMgmtPassword').value,
         geoip_enabled: document.getElementById('settingGeoIPEnabled').checked,
@@ -2201,6 +2251,17 @@
     function toggleLogFileSettings() {
       const output = document.getElementById('settingLogOutput').value;
       document.getElementById('logFileSettings').style.display = output === 'file' ? 'grid' : 'none';
+    }
+
+    function togglePoolStrategySettings() {
+      const retryEnabled = document.getElementById('settingPoolRetry').checked;
+      const stickyEnabled = document.getElementById('settingPoolSticky').checked;
+      const latencyEnabled = document.getElementById('settingPoolMode').value === 'latency';
+      document.getElementById('settingPoolRetryAttempts').disabled = !retryEnabled;
+      document.getElementById('settingStickyTTL').disabled = !stickyEnabled;
+      document.getElementById('settingStickyMax').disabled = !stickyEnabled;
+      document.getElementById('settingLatencySamples').disabled = !latencyEnabled;
+      document.getElementById('settingLatencyTolerance').disabled = !latencyEnabled;
     }
 
     async function handleSettingsSave(e) {
@@ -2247,6 +2308,17 @@
             mode: document.getElementById('settingPoolMode').value,
             failure_threshold: parseInt(document.getElementById('settingPoolFailure').value) || 3,
             blacklist_duration: document.getElementById('settingPoolBlacklist').value || '24h',
+            transient_cooldown: document.getElementById('settingPoolCooldown').value || '1m',
+            retry_enabled: document.getElementById('settingPoolRetry').checked,
+            retry_attempts: parseInt(document.getElementById('settingPoolRetryAttempts').value) || 3,
+            fail_open: document.getElementById('settingPoolFailOpen').checked,
+            latency_sample_size: parseInt(document.getElementById('settingLatencySamples').value) || 4,
+            latency_tolerance: document.getElementById('settingLatencyTolerance').value || '50ms',
+            sticky: {
+              enabled: document.getElementById('settingPoolSticky').checked,
+              ttl: document.getElementById('settingStickyTTL').value || '30m',
+              max_entries: parseInt(document.getElementById('settingStickyMax').value) || 4096,
+            },
           },
           management: {
             listen: document.getElementById('settingMgmtListen').value,

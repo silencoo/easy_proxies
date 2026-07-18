@@ -49,7 +49,7 @@ listener:
 # 代理池配置
 # ───────────────────────────────────────────────────────────────
 pool:
-  # 调度模式: sequential（顺序）, random（随机）, balance（均衡）
+  # 调度模式: sequential（轮询）, random（随机）, balance（连接均衡）, latency（延迟感知均衡）
   mode: sequential
   # 连续失败多少次后加入黑名单
   failure_threshold: 3
@@ -57,6 +57,20 @@ pool:
   blacklist_duration: 24h
   # 所有节点被拉黑时是否强制重新尝试；爬虫场景建议保持 false，快速失败
   fail_open: false
+  # 统一池入口连接失败时切换到其他节点；每节点独立端口始终不会切换
+  retry_enabled: true
+  # 包含首次连接在内的最大尝试次数（1-10）
+  retry_attempts: 3
+  # 429、超时、连接重置等临时错误只短暂冷却，不累计长期黑名单阈值
+  transient_cooldown: 1m
+  # latency 模式每次最多采样的健康节点数，以及视为同档延迟的容差
+  latency_sample_size: 4
+  latency_tolerance: 50ms
+  # 统一池入口的有界会话保持；优先按认证用户和来源地址建立映射
+  sticky:
+    enabled: false
+    ttl: 30m
+    max_entries: 4096
   # 失败计数、黑名单和测活结果的重启持久化文件（相对 config.yaml）
   health_state_file: health-state.yaml
 

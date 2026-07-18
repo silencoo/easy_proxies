@@ -808,6 +808,19 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(strings.Join(lines, "\n")))
 }
 
+func parsePositiveSettingsDuration(value string) (time.Duration, error) {
+	duration, err := time.ParseDuration(strings.TrimSpace(value))
+	if err != nil || duration <= 0 {
+		return 0, errors.New("duration must be positive")
+	}
+	return duration, nil
+}
+
+func writeSettingsBadRequest(w http.ResponseWriter, message string) {
+	w.WriteHeader(http.StatusBadRequest)
+	writeJSON(w, map[string]any{"error": message})
+}
+
 // handleSettings handles GET/PUT for dynamic settings (external_ip, probe_target, skip_cert_verify, log).
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -860,10 +873,20 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				"port_reuse_delay": cfg.MultiPort.PortReuseDelay.String(),
 			}
 			resp["pool"] = map[string]any{
-				"mode":               cfg.Pool.Mode,
-				"failure_threshold":  cfg.Pool.FailureThreshold,
-				"blacklist_duration": cfg.Pool.BlacklistDuration.String(),
-				"fail_open":          cfg.Pool.FailOpen,
+				"mode":                cfg.Pool.Mode,
+				"failure_threshold":   cfg.Pool.FailureThreshold,
+				"blacklist_duration":  cfg.Pool.BlacklistDuration.String(),
+				"fail_open":           cfg.Pool.FailOpen,
+				"retry_enabled":       cfg.Pool.RetryEnabledValue(),
+				"retry_attempts":      cfg.Pool.RetryAttempts,
+				"transient_cooldown":  cfg.Pool.TransientCooldown.String(),
+				"latency_sample_size": cfg.Pool.LatencySampleSize,
+				"latency_tolerance":   cfg.Pool.LatencyTolerance.String(),
+				"sticky": map[string]any{
+					"enabled":     cfg.Pool.Sticky.Enabled,
+					"ttl":         cfg.Pool.Sticky.TTL.String(),
+					"max_entries": cfg.Pool.Sticky.MaxEntries,
+				},
 			}
 			resp["management"] = map[string]any{
 				"listen":   cfg.Management.Listen,
@@ -907,6 +930,16 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				FailureThreshold  int    `json:"failure_threshold"`
 				BlacklistDuration string `json:"blacklist_duration"`
 				FailOpen          *bool  `json:"fail_open"`
+				RetryEnabled      *bool  `json:"retry_enabled"`
+				RetryAttempts     int    `json:"retry_attempts"`
+				TransientCooldown string `json:"transient_cooldown"`
+				LatencySampleSize int    `json:"latency_sample_size"`
+				LatencyTolerance  string `json:"latency_tolerance"`
+				Sticky            *struct {
+					Enabled    bool   `json:"enabled"`
+					TTL        string `json:"ttl"`
+					MaxEntries int    `json:"max_entries"`
+				} `json:"sticky"`
 			} `json:"pool,omitempty"`
 			Management *struct {
 				Listen   string `json:"listen"`
@@ -951,6 +984,58 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		var poolBlacklist, transientCooldown, latencyTolerance, stickyTTL time.Duration
+		if req.Pool != nil {
+			mode := strings.ToLower(strings.TrimSpace(req.Pool.Mode))
+			if mode == "round-robin" || mode == "round_robin" {
+				mode = "sequential"
+			}
+			switch mode {
+			case "sequential", "random", "balance", "latency":
+				req.Pool.Mode = mode
+			default:
+				writeSettingsBadRequest(w, "不支持的调度模式")
+				return
+			}
+			if req.Pool.FailureThreshold < 1 || req.Pool.FailureThreshold > 100 {
+				writeSettingsBadRequest(w, "故障阈值必须在 1 到 100 之间")
+				return
+			}
+			if req.Pool.RetryAttempts < 1 || req.Pool.RetryAttempts > 10 {
+				writeSettingsBadRequest(w, "重试次数必须在 1 到 10 之间")
+				return
+			}
+			if req.Pool.LatencySampleSize < 1 || req.Pool.LatencySampleSize > 32 {
+				writeSettingsBadRequest(w, "延迟采样数必须在 1 到 32 之间")
+				return
+			}
+			var err error
+			if poolBlacklist, err = parsePositiveSettingsDuration(req.Pool.BlacklistDuration); err != nil {
+				writeSettingsBadRequest(w, "黑名单时长格式无效")
+				return
+			}
+			if transientCooldown, err = parsePositiveSettingsDuration(req.Pool.TransientCooldown); err != nil {
+				writeSettingsBadRequest(w, "临时冷却时长格式无效")
+				return
+			}
+			if latencyTolerance, err = parsePositiveSettingsDuration(req.Pool.LatencyTolerance); err != nil {
+				writeSettingsBadRequest(w, "延迟容差格式无效")
+				return
+			}
+			if req.Pool.Sticky == nil {
+				writeSettingsBadRequest(w, "缺少会话保持配置")
+				return
+			}
+			if req.Pool.Sticky.MaxEntries < 1 || req.Pool.Sticky.MaxEntries > 1_000_000 {
+				writeSettingsBadRequest(w, "会话保持容量必须在 1 到 1000000 之间")
+				return
+			}
+			if stickyTTL, err = parsePositiveSettingsDuration(req.Pool.Sticky.TTL); err != nil {
+				writeSettingsBadRequest(w, "会话保持 TTL 格式无效")
+				return
+			}
+		}
+
 		if err := s.updateSettings(extIP, probeTarget, req.SkipCertVerify, logCfg, req.GeoIP != nil && req.GeoIP.Enabled); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			writeJSON(w, map[string]any{"error": err.Error()})
@@ -989,11 +1074,17 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				if req.Pool.FailOpen != nil {
 					s.cfgSrc.Pool.FailOpen = *req.Pool.FailOpen
 				}
-				if req.Pool.BlacklistDuration != "" {
-					if d, err := time.ParseDuration(req.Pool.BlacklistDuration); err == nil {
-						s.cfgSrc.Pool.BlacklistDuration = d
-					}
+				if req.Pool.RetryEnabled != nil {
+					s.cfgSrc.Pool.RetryEnabled = req.Pool.RetryEnabled
 				}
+				s.cfgSrc.Pool.RetryAttempts = req.Pool.RetryAttempts
+				s.cfgSrc.Pool.BlacklistDuration = poolBlacklist
+				s.cfgSrc.Pool.TransientCooldown = transientCooldown
+				s.cfgSrc.Pool.LatencySampleSize = req.Pool.LatencySampleSize
+				s.cfgSrc.Pool.LatencyTolerance = latencyTolerance
+				s.cfgSrc.Pool.Sticky.Enabled = req.Pool.Sticky.Enabled
+				s.cfgSrc.Pool.Sticky.TTL = stickyTTL
+				s.cfgSrc.Pool.Sticky.MaxEntries = req.Pool.Sticky.MaxEntries
 			}
 			if req.Management != nil {
 				s.cfgSrc.Management.Listen = req.Management.Listen
@@ -1021,7 +1112,12 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-			_ = s.cfgSrc.SaveSettings()
+			if err := s.cfgSrc.SaveSettings(); err != nil {
+				s.cfgMu.Unlock()
+				w.WriteHeader(http.StatusInternalServerError)
+				writeJSON(w, map[string]any{"error": err.Error()})
+				return
+			}
 		}
 		s.cfgMu.Unlock()
 
