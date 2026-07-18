@@ -91,10 +91,13 @@ multi_port:
 # ───────────────────────────────────────────────────────────────
 management:
   enabled: true                                      # 是否启用管理面板
-  listen: 0.0.0.0:9091                               # 监听地址
+  listen: 127.0.0.1:9091                             # 默认仅本机访问
   probe_target: http://cp.cloudflare.com/generate_204  # 健康检查目标
   probe_concurrency: 32  # 全局批量探测并发数（1-1024）
   password: ""                                       # WebUI 访问密码，为空则不需要密码
+  # 非回环 listen 必须同时配置强密码和下列原生 TLS 证书，禁止明文远程管理。
+  # tls_cert_file: ./certs/management.crt
+  # tls_key_file: ./certs/management.key
 
 # ───────────────────────────────────────────────────────────────
 # DNS 配置（用于节点域名解析，尤其是 VMess）
@@ -137,6 +140,7 @@ geoip:
 #   drain_timeout: 30s          # 节点移出流量池后，旧 outbound 延迟回收时间
 #   min_available_nodes: 1      # 最少可用节点数，低于此值不切换
 #   fetch_concurrency: 16       # 订阅并发抓取数（默认 16，最大 32）
+#   allow_private_networks: false # 默认拒绝回环、私网、链路本地和元数据地址；仅可信内网订阅需要开启
 
 # ═══════════════════════════════════════════════════════════════
 # 节点配置方式（三选一或混合使用）

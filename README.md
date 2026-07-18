@@ -94,10 +94,13 @@ pool:
 
 management:
   enabled: true
-  listen: 0.0.0.0:9091
+  listen: 127.0.0.1:9091
   probe_target: http://cp.cloudflare.com/generate_204
   probe_concurrency: 32  # process-wide batch probe workers (1-1024)
   password: ""
+  # Required together with a strong password for any non-loopback listen address:
+  # tls_cert_file: ./certs/management.crt
+  # tls_key_file: ./certs/management.key
 
 dns:
   server: 223.5.5.5
@@ -155,42 +158,38 @@ Key behaviors:
 
 ### How to Use
 
-The GeoIP router is an HTTP proxy that listens on its own port. You select a region by adding a path prefix to your request.
+The GeoIP router is an HTTP proxy that listens on its own port. Region selection uses standard proxy credentials, so it works for both normal HTTP requests and HTTPS `CONNECT` tunnels without changing the destination URL.
 
-#### HTTP Requests
-
-Format: `http://<geoip_host>:<geoip_port>/<region>/`
+When proxy authentication is configured, append `@<region>` to the proxy username (URL-encode the `@` as `%40`). Without authentication, use the region code as the proxy username. The normal configured username selects the global pool.
 
 ```bash
 # Route through Japanese nodes
-curl -x http://user:pass@localhost:1221/jp/ http://example.com
+curl -x http://user%40jp:pass@localhost:1221 http://example.com
 
 # Route through US nodes
-curl -x http://user:pass@localhost:1221/us/ http://example.com
+curl -x http://user%40us:pass@localhost:1221 http://example.com
 
 # Route through Hong Kong nodes
-curl -x http://user:pass@localhost:1221/hk/ http://example.com
+curl -x http://user%40hk:pass@localhost:1221 http://example.com
 
 # Route through Singapore nodes
-curl -x http://user:pass@localhost:1221/sg/ http://example.com
+curl -x http://user%40sg:pass@localhost:1221 http://example.com
 
-# No region prefix = use global pool (all nodes)
-curl -x http://user:pass@localhost:1221/ http://example.com
+# Normal configured credentials = global pool (all nodes)
+curl -x http://user:pass@localhost:1221 http://example.com
 ```
 
 #### HTTPS Requests (CONNECT Tunnel)
 
-For HTTPS, the region prefix goes before the target host in the CONNECT request:
-
 ```bash
 # Route HTTPS through Japanese nodes
-https_proxy=http://user:pass@localhost:1221/jp/ curl https://www.google.com
+https_proxy=http://user%40jp:pass@localhost:1221 curl https://www.google.com
 
 # Route HTTPS through US nodes
-https_proxy=http://user:pass@localhost:1221/us/ curl https://www.google.com
+https_proxy=http://user%40us:pass@localhost:1221 curl https://www.google.com
 
-# No region prefix = use global pool
-https_proxy=http://user:pass@localhost:1221/ curl https://www.google.com
+# Normal configured credentials = global pool
+https_proxy=http://user:pass@localhost:1221 curl https://www.google.com
 ```
 
 #### Using with Applications
@@ -199,12 +198,12 @@ https_proxy=http://user:pass@localhost:1221/ curl https://www.google.com
 
 ```bash
 # Use Japanese nodes for all traffic
-export http_proxy=http://user:pass@your-server:1221/jp/
-export https_proxy=http://user:pass@your-server:1221/jp/
+export http_proxy=http://user%40jp:pass@your-server:1221
+export https_proxy=http://user%40jp:pass@your-server:1221
 
 # Use global pool (all nodes)
-export http_proxy=http://user:pass@your-server:1221/
-export https_proxy=http://user:pass@your-server:1221/
+export http_proxy=http://user:pass@your-server:1221
+export https_proxy=http://user:pass@your-server:1221
 ```
 
 **Browser proxy extensions (SwitchyOmega, FoxyProxy, etc.):**
@@ -212,8 +211,7 @@ export https_proxy=http://user:pass@your-server:1221/
 - Protocol: HTTP
 - Server: your-server-ip
 - Port: 1221
-- Username/Password: as configured in `listener`
-- For region-specific routing: set the proxy URL path to include the region prefix (e.g., `/jp/`)
+- Username/Password: use `<configured username>@<region>` with the configured password; use the unmodified username for the global pool
 
 **Python requests:**
 
@@ -221,8 +219,8 @@ export https_proxy=http://user:pass@your-server:1221/
 import requests
 
 proxies = {
-    "http": "http://user:pass@your-server:1221/jp/",
-    "https": "http://user:pass@your-server:1221/jp/",
+    "http": "http://user%40jp:pass@your-server:1221",
+    "https": "http://user%40jp:pass@your-server:1221",
 }
 r = requests.get("http://example.com", proxies=proxies)
 ```
@@ -230,7 +228,7 @@ r = requests.get("http://example.com", proxies=proxies)
 **Go net/http:**
 
 ```go
-proxyURL, _ := url.Parse("http://user:pass@your-server:1221/jp/")
+proxyURL, _ := url.Parse("http://user%40jp:pass@your-server:1221")
 client := &http.Client{
     Transport: &http.Transport{
         Proxy: http.ProxyURL(proxyURL),
@@ -243,7 +241,7 @@ resp, err := client.Get("http://example.com")
 
 1. After outbounds start, each node requests the configured IP-echo endpoint through that exact proxy
 2. The observed public exit IP is looked up in MaxMind and nodes are grouped into per-region pools (`pool-jp`, `pool-kr`, `pool-us`, etc.)
-3. The GeoIP router listens on its own port and inspects the request path for a region prefix
+3. The GeoIP router listens on its own port and reads the optional region suffix from the proxy username
 4. Matching requests are routed through the corresponding region pool; unmatched requests use the global pool
 5. Each region pool uses the same scheduling algorithm configured in the `pool` section
 6. The last successfully observed exit IP is retained across a transient probe failure within the running process
@@ -291,11 +289,14 @@ subscription_refresh:
   enabled: true
   interval: 1h
   fetch_concurrency: 16 # default 16, capped at 32
+  allow_private_networks: false # opt in only for trusted private subscription services
 ```
 
-Supports Base64, plain text, and Clash YAML formats. Subscription URLs are fetched with bounded concurrency, responses are strictly limited to 10 MB, and URL credentials/query data are redacted from errors and logs. Duplicate URLs and nodes are removed by stable identity. Runtime refreshes cache each URL independently so one failed provider can reuse only its own last known-good nodes; after a restart, `nodes_file` is the conservative aggregate fallback until every provider has refreshed successfully. Inline and WebUI-added nodes remain explicit configuration and are never overwritten by a subscription refresh.
+Supports Base64, plain text, and Clash YAML formats. Subscription URLs are fetched with bounded concurrency, responses are strictly limited to 10 MB, and URL credentials/query data are redacted from errors and logs. Loopback, private, link-local, and metadata destinations (including redirects) are blocked by default; set `allow_private_networks: true` only when a trusted subscription service is intentionally hosted on such a network. Duplicate URLs and nodes are removed by stable identity. Runtime refreshes cache each URL independently so one failed provider can reuse only its own last known-good nodes; after a restart, `nodes_file` is the conservative aggregate fallback until every provider has refreshed successfully. Inline and WebUI-added nodes remain explicit configuration and are never overwritten by a subscription refresh.
 
 When subscriptions are configured, fetched nodes are written to `nodes_file`. Subscription changes are validated before the active sing-box instance is stopped, failed replacements roll back automatically, and dedicated node ports are restored from `port-map.yaml`. Rebinding the same listen ports still interrupts existing TCP connections briefly.
+
+When the management password is empty, `management.listen` must use a loopback address. External management access requires a non-empty password and should be placed behind a TLS reverse proxy.
 
 ## WebUI Dashboard
 

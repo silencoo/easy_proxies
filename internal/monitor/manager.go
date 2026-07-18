@@ -4,13 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"easy_proxies/internal/probetarget"
 
 	M "github.com/sagernet/sing/common/metadata"
 )
@@ -21,6 +21,8 @@ type Config struct {
 	Listen           string
 	ProbeTarget      string
 	Password         string
+	TLSCertFile      string
+	TLSKeyFile       string
 	ProxyUsername    string // 代理池的用户名（用于导出）
 	ProxyPassword    string // 代理池的密码（用于导出）
 	ExternalIP       string // 外部 IP 地址，用于导出时替换 0.0.0.0
@@ -32,10 +34,12 @@ type Config struct {
 type NodeInfo struct {
 	Tag           string `json:"tag"`
 	Name          string `json:"name"`
-	URI           string `json:"uri"`
+	URI           string `json:"-"`
 	Mode          string `json:"mode"`
 	ListenAddress string `json:"listen_address,omitempty"`
 	Port          uint16 `json:"port,omitempty"`
+	Username      string `json:"-"`
+	Password      string `json:"-"`
 	Region        string `json:"region,omitempty"`  // GeoIP region code: "jp", "kr", "us", "hk", "tw", "other"
 	Country       string `json:"country,omitempty"` // Full country name from GeoIP
 	ExitIP        string `json:"exit_ip,omitempty"` // Public egress IP observed through this node
@@ -117,6 +121,10 @@ type entry struct {
 	probeMu          sync.Mutex
 	probeGeneration  uint64
 	probeCall        *inFlightProbe
+	probeSlots       chan struct{}
+	probeLifecycleMu *sync.RWMutex
+	probeStopped     *atomic.Bool
+	probeWG          *sync.WaitGroup
 }
 
 type probeOutcome struct {
@@ -130,10 +138,24 @@ type inFlightProbe struct {
 	result     probeOutcome
 }
 
+type probeSweepRequest struct {
+	generation uint64
+	ctx        context.Context
+	timeout    time.Duration
+	done       chan struct{}
+	err        error
+}
+
 const (
 	defaultProbeConcurrency = 32
 	maxProbeConcurrency     = 1024
 	defaultProbeTimeout     = 10 * time.Second
+	maxHungProbeCallbacks   = 64
+)
+
+var (
+	errProbeSuperseded     = errors.New("probe callback was replaced")
+	errProbeManagerStopped = errors.New("probe manager stopped")
 )
 
 // ProbeTarget is an immutable snapshot of the live health-check destination.
@@ -156,6 +178,7 @@ type Manager struct {
 	ctx              context.Context
 	cancel           context.CancelFunc
 	logger           Logger
+	loggerMu         sync.RWMutex
 
 	probeSweepActive atomic.Int32
 	probeSweepTotal  atomic.Int32
@@ -163,12 +186,16 @@ type Manager struct {
 	probeSweepOK     atomic.Int32
 	probeSweepFail   atomic.Int32
 
-	probeGate      sync.Mutex
-	sweepRunning   bool
-	sweepWaiters   int
-	rerunRequested bool
-	rerunTimeout   time.Duration
-	sweepIdle      chan struct{}
+	probeGate           sync.Mutex
+	sweepRunning        bool
+	requestedGeneration uint64
+	completedGeneration uint64
+	probeRequests       []*probeSweepRequest
+	probeCond           *sync.Cond
+	probeSlots          chan struct{}
+	probeLifecycleMu    sync.RWMutex
+	probeStopped        atomic.Bool
+	probeWG             sync.WaitGroup
 }
 
 // Logger interface for logging
@@ -187,53 +214,33 @@ func clampProbeConcurrency(n int) int {
 	return n
 }
 
-func resolveProbeTarget(value string, skipCertVerify bool) (ProbeTarget, bool) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return ProbeTarget{}, false
-	}
-	lower := strings.ToLower(value)
-	if strings.Contains(lower, "://") && !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
-		return ProbeTarget{}, false
-	}
-	useTLS := strings.HasPrefix(lower, "https://")
-	target := value
-	if strings.HasPrefix(lower, "https://") {
-		target = value[len("https://"):]
-	} else if strings.HasPrefix(lower, "http://") {
-		target = value[len("http://"):]
-	}
-	if idx := strings.IndexAny(target, "/?#"); idx >= 0 {
-		target = target[:idx]
-	}
-	target = strings.TrimSpace(target)
-	if target == "" {
-		return ProbeTarget{}, false
-	}
-	host, port, err := net.SplitHostPort(target)
-	if err != nil {
-		host = strings.Trim(target, "[]")
-		if useTLS {
-			port = "443"
-		} else {
-			port = "80"
-		}
-	}
-	if host == "" {
-		return ProbeTarget{}, false
+func resolveProbeTarget(value string, skipCertVerify bool) (ProbeTarget, bool, error) {
+	parsed, ready, err := probetarget.Parse(value)
+	if err != nil || !ready {
+		return ProbeTarget{}, ready, err
 	}
 	return ProbeTarget{
-		Destination:    M.ParseSocksaddrHostPort(host, parsePort(port)),
-		Host:           host,
-		TLS:            useTLS,
+		Destination:    M.ParseSocksaddrHostPort(parsed.Host, parsed.Port),
+		Host:           parsed.Host,
+		TLS:            parsed.TLS,
 		SkipCertVerify: skipCertVerify,
-	}, true
+	}, true, nil
+}
+
+// ResolveProbeTarget returns an immutable target suitable for validating a
+// candidate configuration without mutating the live monitor manager.
+func ResolveProbeTarget(value string, skipCertVerify bool) (ProbeTarget, bool, error) {
+	return resolveProbeTarget(value, skipCertVerify)
 }
 
 // NewManager constructs a manager and pre-validates the probe target.
 func NewManager(cfg Config) (*Manager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-	target, ready := resolveProbeTarget(cfg.ProbeTarget, cfg.SkipCertVerify)
+	target, ready, err := resolveProbeTarget(cfg.ProbeTarget, cfg.SkipCertVerify)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
 	m := &Manager{
 		cfg:              cfg,
 		probeTarget:      target,
@@ -242,7 +249,9 @@ func NewManager(cfg Config) (*Manager, error) {
 		nodes:            make(map[string]*entry),
 		ctx:              ctx,
 		cancel:           cancel,
+		probeSlots:       make(chan struct{}, maxHungProbeCallbacks),
 	}
+	m.probeCond = sync.NewCond(&m.probeGate)
 	return m, nil
 }
 
@@ -270,19 +279,31 @@ func (m *Manager) ProbeConcurrency() int {
 
 // SetProbeTarget updates both the destination and TLS verification policy for
 // existing probe callbacks. Pool callbacks resolve this snapshot per request.
-func (m *Manager) SetProbeTarget(value string, skipCertVerify bool) {
-	target, ready := resolveProbeTarget(value, skipCertVerify)
+func (m *Manager) SetProbeTarget(value string, skipCertVerify bool) error {
+	target, ready, err := resolveProbeTarget(value, skipCertVerify)
+	if err != nil {
+		return err
+	}
 	m.mu.Lock()
 	m.cfg.ProbeTarget = value
 	m.cfg.SkipCertVerify = skipCertVerify
 	m.probeTarget = target
 	m.probeReady = ready
 	m.mu.Unlock()
+	return nil
 }
 
 // SetLogger sets the logger for the manager.
 func (m *Manager) SetLogger(logger Logger) {
+	m.loggerMu.Lock()
 	m.logger = logger
+	m.loggerMu.Unlock()
+}
+
+func (m *Manager) loggerSnapshot() Logger {
+	m.loggerMu.RLock()
+	defer m.loggerMu.RUnlock()
+	return m.logger
 }
 
 // StartPeriodicHealthCheck starts a background goroutine that periodically checks all nodes.
@@ -292,7 +313,7 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 	go func() {
 		// The initial pass uses the same process-wide coordinator as periodic,
 		// post-reload and WebUI-triggered sweeps.
-		m.probeAllNodes(timeout)
+		_ = m.probeAllNodesContext(m.ctx, timeout)
 
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -302,71 +323,147 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 			case <-m.ctx.Done():
 				return
 			case <-ticker.C:
-				m.probeAllNodes(timeout)
+				_ = m.probeAllNodesContext(m.ctx, timeout)
 			}
 		}
 	}()
 
-	if m.logger != nil {
-		m.logger.Info("periodic health check started, interval: ", interval)
+	if logger := m.loggerSnapshot(); logger != nil {
+		logger.Info("periodic health check started, interval: ", interval)
 	}
 }
 
 // ProbeAllNow triggers a one-time health check on all nodes (e.g. after reload).
 func (m *Manager) ProbeAllNow(timeout time.Duration) {
-	m.probeAllNodes(timeout)
+	_ = m.ProbeAllNowContext(context.Background(), timeout)
 }
 
-// probeAllNodes serializes all batch probe sources. A trigger that overlaps an
-// active sweep requests one coalesced follow-up pass and waits for the flight to
-// become idle; callers that validate a reload therefore never observe stale
-// pre-sweep availability.
-func (m *Manager) probeAllNodes(timeout time.Duration) {
-	timeout = probeTimeout(timeout)
-	m.probeGate.Lock()
-	if m.sweepRunning {
-		m.rerunRequested = true
-		m.sweepWaiters++
-		if timeout > m.rerunTimeout {
-			m.rerunTimeout = timeout
-		}
-		idle := m.sweepIdle
-		m.probeGate.Unlock()
-		if idle != nil {
-			<-idle
-		}
-		m.probeGate.Lock()
-		m.sweepWaiters--
-		m.probeGate.Unlock()
-		return
+// ProbeAllNowContext triggers a synchronous health check and lets callers
+// cancel both their wait and the underlying sweep work. Overlapping requests
+// are still coalesced into the fewest possible passes.
+func (m *Manager) ProbeAllNowContext(ctx context.Context, timeout time.Duration) error {
+	return m.probeAllNodesContext(ctx, timeout)
+}
+
+func (m *Manager) probeAllNodesContext(ctx context.Context, timeout time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	m.sweepRunning = true
-	m.sweepIdle = make(chan struct{})
-	idle := m.sweepIdle
-	m.probeSweepActive.Store(1)
-	m.probeGate.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if m.probeStopped.Load() {
+		return errProbeManagerStopped
+	}
 
-	followupRan := false
+	timeout = probeTimeout(timeout)
+	request := &probeSweepRequest{
+		ctx:     ctx,
+		timeout: timeout,
+		done:    make(chan struct{}),
+	}
+	m.probeGate.Lock()
+	if m.probeStopped.Load() {
+		m.probeGate.Unlock()
+		return errProbeManagerStopped
+	}
+	m.requestedGeneration++
+	request.generation = m.requestedGeneration
+	m.probeRequests = append(m.probeRequests, request)
+	startCoordinator := !m.sweepRunning
+	if startCoordinator {
+		m.sweepRunning = true
+		m.probeSweepActive.Store(1)
+	}
+	m.probeGate.Unlock()
+	if startCoordinator {
+		go m.runProbeCoordinator()
+	}
+
+	select {
+	case <-request.done:
+		return request.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// runProbeCoordinator serializes batch probes by generation. Requests that
+// arrive during a pass are folded into one follow-up pass. A pass is canceled
+// only after every operation context represented by that pass is canceled.
+func (m *Manager) runProbeCoordinator() {
 	for {
-		m.runProbeSweep(timeout)
+		m.probeGate.Lock()
+		if len(m.probeRequests) == 0 {
+			m.sweepRunning = false
+			m.probeSweepActive.Store(0)
+			m.probeCond.Broadcast()
+			m.probeGate.Unlock()
+			return
+		}
+		batch := m.probeRequests
+		m.probeRequests = nil
+		sweepGeneration := batch[len(batch)-1].generation
+		m.probeGate.Unlock()
+
+		active := make([]*probeSweepRequest, 0, len(batch))
+		sweepTimeout := time.Duration(0)
+		for _, request := range batch {
+			if request.ctx.Err() != nil {
+				continue
+			}
+			active = append(active, request)
+			if request.timeout > sweepTimeout {
+				sweepTimeout = request.timeout
+			}
+		}
+
+		var sweepErr error
+		if len(active) > 0 {
+			sweepCtx, cancelSweep := context.WithCancel(context.Background())
+			var remaining atomic.Int32
+			remaining.Store(int32(len(active)))
+			stops := make([]func() bool, 0, len(active)+1)
+			for _, request := range active {
+				stops = append(stops, context.AfterFunc(request.ctx, func() {
+					if remaining.Add(-1) == 0 {
+						cancelSweep()
+					}
+				}))
+			}
+			stops = append(stops, context.AfterFunc(m.ctx, cancelSweep))
+			sweepErr = m.runProbeSweep(sweepCtx, sweepTimeout)
+			cancelSweep()
+			for _, stop := range stops {
+				stop()
+			}
+			if m.ctx.Err() != nil {
+				sweepErr = errProbeManagerStopped
+			}
+		}
 
 		m.probeGate.Lock()
-		if m.rerunRequested && !followupRan {
-			m.rerunRequested = false
-			timeout = m.rerunTimeout
-			m.rerunTimeout = 0
-			followupRan = true
-			m.probeGate.Unlock()
-			continue
+		if sweepGeneration > m.completedGeneration {
+			m.completedGeneration = sweepGeneration
 		}
-		m.rerunRequested = false
-		m.rerunTimeout = 0
-		m.sweepRunning = false
-		m.sweepIdle = nil
-		m.probeSweepActive.Store(0)
-		close(idle)
+		caughtUp := len(m.probeRequests) == 0
+		if caughtUp {
+			m.sweepRunning = false
+			m.probeSweepActive.Store(0)
+		}
+		for _, request := range batch {
+			if err := request.ctx.Err(); err != nil {
+				request.err = err
+			} else {
+				request.err = sweepErr
+			}
+			close(request.done)
+		}
+		m.probeCond.Broadcast()
 		m.probeGate.Unlock()
-		return
+		if caughtUp {
+			return
+		}
 	}
 }
 
@@ -390,7 +487,13 @@ func sweepTimeout(total, workers int, perProbe time.Duration) time.Duration {
 // runProbeSweep executes one bounded worker-pool pass. The outer sweep context
 // and the per-entry contexts both have deadlines, so even an outbound that
 // ignores cancellation cannot keep a worker or WaitGroup stuck indefinitely.
-func (m *Manager) runProbeSweep(timeout time.Duration) {
+func (m *Manager) runProbeSweep(operationCtx context.Context, timeout time.Duration) error {
+	if operationCtx == nil {
+		operationCtx = context.Background()
+	}
+	if err := operationCtx.Err(); err != nil {
+		return err
+	}
 	m.mu.RLock()
 	entries := make([]*entry, 0, len(m.nodes))
 	for _, e := range m.nodes {
@@ -403,22 +506,19 @@ func (m *Manager) runProbeSweep(timeout time.Duration) {
 	m.probeSweepOK.Store(0)
 	m.probeSweepFail.Store(0)
 	if len(entries) == 0 {
-		return
+		return nil
 	}
 
-	if m.logger != nil {
-		m.logger.Info("starting health check for ", len(entries), " nodes")
+	logger := m.loggerSnapshot()
+	if logger != nil {
+		logger.Info("starting health check for ", len(entries), " nodes")
 	}
 	if _, ready := m.DestinationForProbe(); !ready {
-		for _, entry := range entries {
-			entry.markProbeResult(0, nil)
-			m.probeSweepOK.Add(1)
-			m.probeSweepDone.Add(1)
+		m.probeSweepDone.Store(int32(len(entries)))
+		if logger != nil {
+			logger.Warn("probe target not configured; existing node state left unchanged")
 		}
-		if m.logger != nil {
-			m.logger.Warn("probe target not configured; nodes left available without verification")
-		}
-		return
+		return nil
 	}
 
 	perProbe := probeTimeout(timeout)
@@ -426,7 +526,7 @@ func (m *Manager) runProbeSweep(timeout time.Duration) {
 	if workerLimit > len(entries) {
 		workerLimit = len(entries)
 	}
-	sweepCtx, sweepCancel := context.WithTimeout(m.ctx, sweepTimeout(len(entries), workerLimit, perProbe))
+	sweepCtx, sweepCancel := context.WithTimeout(operationCtx, sweepTimeout(len(entries), workerLimit, perProbe))
 	defer sweepCancel()
 
 	jobs := make(chan *entry, len(entries))
@@ -439,29 +539,44 @@ func (m *Manager) runProbeSweep(timeout time.Duration) {
 		go func() {
 			defer wg.Done()
 			for entry := range jobs {
+				if operationCtx.Err() != nil {
+					m.probeSweepDone.Add(1)
+					continue
+				}
+				entry.probeMu.Lock()
 				entry.mu.RLock()
 				probeFn := entry.probe
 				tag := entry.info.Tag
 				uri := entry.info.URI
 				entry.mu.RUnlock()
+				probeGeneration := entry.probeGeneration
+				entry.probeMu.Unlock()
 
 				if probeFn == nil {
-					entry.markProbeResult(0, nil)
-					availableCount.Add(1)
-					m.probeSweepOK.Add(1)
+					if entry.markProbeResultGeneration(probeGeneration, 0, nil) {
+						availableCount.Add(1)
+						m.probeSweepOK.Add(1)
+					}
 					m.probeSweepDone.Add(1)
 					continue
 				}
 
 				probeCtx, cancel := context.WithTimeout(sweepCtx, perProbe)
-				latency, err := entry.executeProbe(probeCtx)
+				latency, err, probeGeneration := entry.executeProbeGeneration(probeCtx, sweepCtx, perProbe)
 				cancel()
-				entry.markProbeResult(latency, err)
+				if operationCtx.Err() != nil {
+					m.probeSweepDone.Add(1)
+					continue
+				}
+				if !entry.markProbeResultGeneration(probeGeneration, latency, err) {
+					m.probeSweepDone.Add(1)
+					continue
+				}
 				if err != nil {
 					failedCount.Add(1)
 					m.probeSweepFail.Add(1)
-					if m.logger != nil {
-						m.logger.Warn("probe failed: ", FormatProbeFailure(tag, uri, err))
+					if logger != nil {
+						logger.Warn("probe failed: ", FormatProbeFailure(tag, uri, err))
 					}
 				} else {
 					availableCount.Add(1)
@@ -471,30 +586,61 @@ func (m *Manager) runProbeSweep(timeout time.Duration) {
 			}
 		}()
 	}
+	queueing := true
 	for _, entry := range entries {
-		jobs <- entry
+		select {
+		case jobs <- entry:
+		case <-sweepCtx.Done():
+			queueing = false
+		}
+		if !queueing {
+			break
+		}
 	}
 	close(jobs)
 	wg.Wait()
 
-	if m.logger != nil {
-		m.logger.Info("health check completed: ", availableCount.Load(), " available, ", failedCount.Load(), " failed")
+	if logger != nil {
+		logger.Info("health check completed: ", availableCount.Load(), " available, ", failedCount.Load(), " failed")
 	}
+	if m.ctx.Err() != nil {
+		return errProbeManagerStopped
+	}
+	return operationCtx.Err()
 }
 
 // Stop stops the periodic health check.
 func (m *Manager) Stop() {
+	m.probeLifecycleMu.Lock()
+	m.probeStopped.Store(true)
 	if m.cancel != nil {
 		m.cancel()
 	}
+	m.probeLifecycleMu.Unlock()
 }
 
-func parsePort(value string) uint16 {
-	p, err := strconv.Atoi(value)
-	if err != nil || p <= 0 || p > 65535 {
-		return 80
+// StopAndWait prevents new callbacks and waits for cooperative in-flight
+// probes. The caller controls the upper bound for legacy callbacks that ignore
+// cancellation.
+func (m *Manager) StopAndWait(ctx context.Context) error {
+	if m == nil {
+		return nil
 	}
-	return uint16(p)
+	m.Stop()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	done := make(chan struct{})
+	go func() {
+		m.probeWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Register ensures a node is tracked and returns its entry.
@@ -504,8 +650,12 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 	e, ok := m.nodes[info.Tag]
 	if !ok {
 		e = &entry{
-			info:     info,
-			timeline: make([]TimelineEvent, 0, maxTimelineSize),
+			info:             info,
+			timeline:         make([]TimelineEvent, 0, maxTimelineSize),
+			probeSlots:       m.probeSlots,
+			probeLifecycleMu: &m.probeLifecycleMu,
+			probeStopped:     &m.probeStopped,
+			probeWG:          &m.probeWG,
 		}
 		m.nodes[info.Tag] = e
 	} else {
@@ -571,7 +721,7 @@ func (m *Manager) SnapshotFiltered(onlyAvailable bool) []Snapshot {
 		// 如果只要可用节点：
 		// - 跳过已完成检查但不可用的节点
 		// - 保留未完成检查的节点（它们会在首次使用时被检查）
-		if onlyAvailable && ((snap.InitialCheckDone && !snap.Available) || snap.Blacklisted) {
+		if onlyAvailable && ((snap.InitialCheckDone && !snap.Available) || snap.Blacklisted || snap.CoolingDown) {
 			continue
 		}
 		snapshots = append(snapshots, snap)
@@ -618,8 +768,10 @@ func (m *Manager) Probe(ctx context.Context, tag string) (time.Duration, error) 
 		ctx, cancel = context.WithTimeout(ctx, defaultProbeTimeout)
 		defer cancel()
 	}
-	latency, err := e.executeProbe(ctx)
-	e.markProbeResult(latency, err)
+	latency, err, probeGeneration := e.executeProbeGeneration(ctx, m.ctx, defaultProbeTimeout)
+	if !e.markProbeResultGeneration(probeGeneration, latency, err) {
+		return 0, errProbeSuperseded
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -632,10 +784,13 @@ func (m *Manager) Release(tag string) error {
 	if err != nil {
 		return err
 	}
-	if e.release == nil {
+	e.mu.RLock()
+	release := e.release
+	e.mu.RUnlock()
+	if release == nil {
 		return errors.New("release not available for this node")
 	}
-	e.release()
+	release()
 	return nil
 }
 
@@ -799,6 +954,11 @@ func (e *entry) setProbe(fn probeFunc) {
 	defer e.mu.Unlock()
 	e.probe = fn
 	e.probeGeneration++
+	// A callback replacement represents a new runtime generation. Persisted or
+	// previously observed availability is not evidence that the replacement is
+	// healthy, and an older in-flight callback may not carry that state across.
+	e.initialCheckDone = false
+	e.available = false
 }
 
 func (e *entry) setRelease(fn releaseFunc) {
@@ -825,38 +985,122 @@ func (e *entry) markProbeResult(latency time.Duration, err error) {
 		e.lastError = ""
 		e.lastOK = now
 		e.lastProbe = latency
-		e.available = true
+		// A successful transport probe confirms the underlying outbound, but it
+		// must not bypass an administrative blacklist or transient cooldown.
+		e.available = !e.blacklist && !e.coolingDown
 	}
 	e.mu.Unlock()
+}
+
+func (e *entry) markProbeResultGeneration(generation uint64, latency time.Duration, err error) bool {
+	e.probeMu.Lock()
+	defer e.probeMu.Unlock()
+	if generation != e.probeGeneration {
+		return false
+	}
+	e.markProbeResult(latency, err)
+	return true
 }
 
 // executeProbe deduplicates concurrent probes for one entry and races the
 // underlying callback against the caller's deadline. If a broken outbound
 // ignores context while dialing, later sweeps join the same in-flight call
 // instead of leaking another goroutine for that node on every pass.
-func (e *entry) executeProbe(ctx context.Context) (time.Duration, error) {
-	e.probeMu.Lock()
-	e.mu.RLock()
-	probe := e.probe
-	e.mu.RUnlock()
-	if probe == nil {
-		e.probeMu.Unlock()
-		return 0, errors.New("probe not available for this node")
+func (e *entry) executeProbe(waitCtx, runBase context.Context, runTimeout time.Duration) (time.Duration, error) {
+	latency, err, _ := e.executeProbeGeneration(waitCtx, runBase, runTimeout)
+	return latency, err
+}
+
+func (e *entry) executeProbeGeneration(
+	waitCtx context.Context,
+	runBase context.Context,
+	runTimeout time.Duration,
+) (time.Duration, error, uint64) {
+	if waitCtx == nil {
+		waitCtx = context.Background()
 	}
-	generation := e.probeGeneration
-	call := e.probeCall
-	if call == nil || call.generation != generation {
+	if runBase == nil {
+		runBase = context.Background()
+	}
+	runTimeout = probeTimeout(runTimeout)
+	acquiredSlot := false
+	for {
+		e.probeMu.Lock()
+		e.mu.RLock()
+		probe := e.probe
+		e.mu.RUnlock()
+		if probe == nil {
+			generation := e.probeGeneration
+			e.probeMu.Unlock()
+			if acquiredSlot {
+				<-e.probeSlots
+			}
+			return 0, errors.New("probe not available for this node"), generation
+		}
+		generation := e.probeGeneration
+		call := e.probeCall
+		// Join any older in-flight callback even if reload installed a new probe
+		// generation. Once it returns, the next request starts the latest one.
+		if call != nil {
+			e.probeMu.Unlock()
+			if acquiredSlot {
+				<-e.probeSlots
+			}
+			return e.waitForProbeCall(waitCtx, call)
+		}
+		if e.probeSlots != nil && !acquiredSlot {
+			e.probeMu.Unlock()
+			select {
+			case e.probeSlots <- struct{}{}:
+				acquiredSlot = true
+				continue
+			case <-waitCtx.Done():
+				return 0, waitCtx.Err(), generation
+			}
+		}
+
+		// WaitGroup.Add must not race with StopAndWait.Wait while the counter is
+		// zero. The manager lifecycle lock forms the barrier: Stop takes the
+		// write lock before publishing the stopped state, while every new
+		// callback checks that state and registers itself under a read lock.
+		trackedProbe := false
+		if e.probeLifecycleMu != nil {
+			e.probeLifecycleMu.RLock()
+			if e.probeStopped != nil && e.probeStopped.Load() {
+				e.probeLifecycleMu.RUnlock()
+				e.probeMu.Unlock()
+				if acquiredSlot {
+					<-e.probeSlots
+				}
+				return 0, errProbeManagerStopped, generation
+			}
+			if e.probeWG != nil {
+				e.probeWG.Add(1)
+				trackedProbe = true
+			}
+			e.probeLifecycleMu.RUnlock()
+		}
+
 		call = &inFlightProbe{generation: generation, done: make(chan struct{})}
 		e.probeCall = call
-		go func() {
+		e.probeMu.Unlock()
+		runCtx, cancel := context.WithTimeout(runBase, runTimeout)
+		go func(probe probeFunc, call *inFlightProbe, releaseSlot, tracked bool) {
+			defer cancel()
+			if tracked {
+				defer e.probeWG.Done()
+			}
+			if releaseSlot {
+				defer func() { <-e.probeSlots }()
+			}
 			outcome := probeOutcome{}
 			func() {
 				defer func() {
-					if recovered := recover(); recovered != nil {
-						outcome.err = fmt.Errorf("probe panic: %v", recovered)
+					if recover() != nil {
+						outcome.err = errors.New("probe callback panicked")
 					}
 				}()
-				outcome.latency, outcome.err = probe(ctx)
+				outcome.latency, outcome.err = probe(runCtx)
 			}()
 			e.probeMu.Lock()
 			call.result = outcome
@@ -865,16 +1109,23 @@ func (e *entry) executeProbe(ctx context.Context) (time.Duration, error) {
 				e.probeCall = nil
 			}
 			e.probeMu.Unlock()
-		}()
+		}(probe, call, acquiredSlot, trackedProbe)
+		return e.waitForProbeCall(waitCtx, call)
 	}
-	done := call.done
-	e.probeMu.Unlock()
+}
 
+func (e *entry) waitForProbeCall(ctx context.Context, call *inFlightProbe) (time.Duration, error, uint64) {
 	select {
-	case <-done:
-		return call.result.latency, call.result.err
+	case <-call.done:
+		e.probeMu.Lock()
+		current := call.generation == e.probeGeneration
+		e.probeMu.Unlock()
+		if !current {
+			return 0, errProbeSuperseded, call.generation
+		}
+		return call.result.latency, call.result.err, call.generation
 	case <-ctx.Done():
-		return 0, ctx.Err()
+		return 0, ctx.Err(), call.generation
 	}
 }
 
@@ -958,7 +1209,7 @@ func (h *EntryHandle) ExportHealthState() PersistedHealthState {
 		SuccessCount:     e.success,
 		BlacklistedUntil: e.until,
 		CooldownUntil:    e.cooldownUntil,
-		LastError:        e.lastError,
+		LastError:        SanitizeProbeError(errors.New(e.lastError)),
 		LastFailure:      e.lastFail,
 		LastSuccess:      e.lastOK,
 		LastProbeLatency: e.lastProbe,
@@ -976,7 +1227,7 @@ func (h *EntryHandle) RestoreHealthState(state PersistedHealthState) {
 	e.mu.Lock()
 	e.failure = state.FailureCount
 	e.success = state.SuccessCount
-	e.lastError = state.LastError
+	e.lastError = SanitizeProbeError(errors.New(state.LastError))
 	e.lastFail = state.LastFailure
 	e.lastOK = state.LastSuccess
 	e.lastProbe = state.LastProbeLatency

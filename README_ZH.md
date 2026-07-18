@@ -73,10 +73,13 @@ pool:
 
 management:
   enabled: true
-  listen: 0.0.0.0:9091
+  listen: 127.0.0.1:9091
   probe_target: http://cp.cloudflare.com/generate_204
   probe_concurrency: 32  # 全局批量探测并发数（1-1024）
   password: ""
+  # 非回环监听地址必须同时配置强密码和原生 TLS：
+  # tls_cert_file: ./certs/management.crt
+  # tls_key_file: ./certs/management.key
 
 dns:
   server: 223.5.5.5
@@ -124,11 +127,14 @@ Pool 支持 `sequential`、`random`、`balance` 和有界采样的 `latency` 调
 
 - 配置了 `subscriptions` 时：
   - 会以有界并发抓取订阅节点（`subscription_refresh.fetch_concurrency`，默认 16，最大 32）
+  - 默认拒绝回环、私网、链路本地和元数据地址，并对重定向目标重新校验；只有可信内网订阅才应开启 `subscription_refresh.allow_private_networks`
   - 单个响应严格限制为 10 MB，日志和错误不会暴露订阅凭据、路径或查询参数
   - URL 和节点会按稳定身份去重；运行期按 URL 独立回退到上次成功节点
   - `nodes_file` 作为订阅节点写入路径
   - 重启后若首次抓取不完整，会保守使用 `nodes_file` 中上次可用的全局缓存
 - `nodes`（内联节点）以及 WebUI 手动新增的节点会保留在 `config.yaml`，订阅刷新不会覆盖。
+
+管理面板密码为空时，`management.listen` 只允许绑定回环地址；如需对外监听，必须配置非空密码，并建议在前置代理启用 TLS。
 
 ## 协议支持注意事项
 

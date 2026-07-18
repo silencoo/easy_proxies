@@ -11,15 +11,11 @@ import (
 )
 
 var probeURLPattern = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://[^\s]+`)
-var opaqueHostPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+={0,2}$`)
+var sensitiveAssignmentPattern = regexp.MustCompile(`(?i)\b(password|passwd|token|auth|authorization|uuid|secret|api[_-]?key)\s*[:=]\s*[^\s,;]+`)
+var userInfoPattern = regexp.MustCompile(`[^\s/@:]+:[^\s/@]+@`)
+var longOpaqueValuePattern = regexp.MustCompile(`\b[A-Za-z0-9_-]{32,}={0,2}\b`)
 
-func likelyOpaqueURIHost(u *url.URL) bool {
-	if u == nil || u.User != nil || u.Port() != "" {
-		return false
-	}
-	host := u.Hostname()
-	return len(host) >= 24 && !strings.Contains(host, ".") && net.ParseIP(host) == nil && opaqueHostPattern.MatchString(host)
-}
+const maxSanitizedProbeErrorLength = 512
 
 // nodeBrief returns only protocol and endpoint. Userinfo, path, query and
 // fragment can contain UUIDs, tokens or subscription credentials and are never
@@ -29,17 +25,10 @@ func nodeBrief(raw string) string {
 	if err != nil || u.Scheme == "" || u.Hostname() == "" {
 		return ""
 	}
-	if likelyOpaqueURIHost(u) {
-		return strings.ToLower(u.Scheme)
-	}
-	host := u.Hostname()
-	if strings.Contains(host, ":") {
-		host = "[" + host + "]"
-	}
 	if port := u.Port(); port != "" {
-		return fmt.Sprintf("%s@%s:%s", strings.ToLower(u.Scheme), host, port)
+		return fmt.Sprintf("%s@[redacted-host]:%s", strings.ToLower(u.Scheme), port)
 	}
-	return fmt.Sprintf("%s@%s", strings.ToLower(u.Scheme), host)
+	return fmt.Sprintf("%s@[redacted-host]", strings.ToLower(u.Scheme))
 }
 
 // SanitizeProbeError removes credentials and opaque URI components from an
@@ -48,18 +37,33 @@ func SanitizeProbeError(err error) string {
 	if err == nil {
 		return ""
 	}
-	return probeURLPattern.ReplaceAllStringFunc(err.Error(), func(raw string) string {
+	message := strings.Map(func(r rune) rune {
+		if r == '\r' || r == '\n' || r == '\t' || r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, err.Error())
+	message = probeURLPattern.ReplaceAllStringFunc(message, func(raw string) string {
 		trimmed := strings.TrimRight(raw, ".,;)]}")
 		suffix := raw[len(trimmed):]
 		u, parseErr := url.Parse(trimmed)
 		if parseErr != nil || u.Scheme == "" || u.Host == "" {
 			return "[redacted-uri]" + suffix
 		}
-		if likelyOpaqueURIHost(u) {
-			return strings.ToLower(u.Scheme) + "://[redacted]" + suffix
+		redacted := strings.ToLower(u.Scheme) + "://[redacted-host]"
+		if port := u.Port(); port != "" {
+			redacted += ":" + port
 		}
-		return strings.ToLower(u.Scheme) + "://" + u.Host + suffix
+		return redacted + suffix
 	})
+	message = sensitiveAssignmentPattern.ReplaceAllString(message, "$1=[redacted]")
+	message = userInfoPattern.ReplaceAllString(message, "[redacted]@")
+	message = longOpaqueValuePattern.ReplaceAllString(message, "[redacted]")
+	message = strings.Join(strings.Fields(message), " ")
+	if len(message) > maxSanitizedProbeErrorLength {
+		message = message[:maxSanitizedProbeErrorLength] + "..."
+	}
+	return message
 }
 
 func classifyProbeError(err error) (category, summary string) {

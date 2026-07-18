@@ -29,6 +29,8 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		Listen:           cfg.Management.Listen,
 		ProbeTarget:      cfg.Management.ProbeTarget,
 		Password:         cfg.Management.Password,
+		TLSCertFile:      cfg.Management.TLSCertFile,
+		TLSKeyFile:       cfg.Management.TLSKeyFile,
 		ProxyUsername:    proxyUsername,
 		ProxyPassword:    proxyPassword,
 		ExternalIP:       cfg.ExternalIP,
@@ -37,23 +39,27 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 
 	// Create and start BoxManager
-	boxMgr := boxmgr.New(cfg, monitorCfg)
+	boxMgr := boxmgr.New(cfg.Clone(), monitorCfg)
 	if err := boxMgr.Start(ctx); err != nil {
 		return fmt.Errorf("start box manager: %w", err)
 	}
 	defer boxMgr.Close()
+	runtimeCfg, _ := boxMgr.ConfigSnapshot()
+	if runtimeCfg == nil {
+		return fmt.Errorf("box manager has no active configuration")
+	}
 
 	// Wire up config to monitor server for settings API
 	if server := boxMgr.MonitorServer(); server != nil {
-		server.SetConfig(cfg)
+		server.SetConfig(runtimeCfg.Clone())
 	}
 
 	// Always create SubscriptionManager so WebUI can hot-reload subscription config
-	subMgr := subscription.New(cfg, boxMgr)
+	subMgr := subscription.New(runtimeCfg.Clone(), boxMgr)
 	defer subMgr.Stop()
 
 	// Start refresh loop only if subscriptions are already configured
-	if cfg.SubscriptionRefresh.Enabled && len(cfg.Subscriptions) > 0 {
+	if runtimeCfg.SubscriptionRefresh.Enabled && len(runtimeCfg.Subscriptions) > 0 {
 		subMgr.Start()
 	}
 

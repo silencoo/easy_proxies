@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -15,8 +16,13 @@ func TestFormatProbeFailureRedactsCredentialsAndOpaqueURIData(t *testing.T) {
 			t.Fatalf("diagnostic leaked %q: %s", secret, formatted)
 		}
 	}
-	if !strings.Contains(formatted, "vless@node.example:443") || !strings.Contains(formatted, "https://probe.example") {
-		t.Fatalf("diagnostic lost useful endpoint context: %s", formatted)
+	for _, host := range []string{"node.example", "probe.example"} {
+		if strings.Contains(formatted, host) {
+			t.Fatalf("diagnostic leaked hostname %q: %s", host, formatted)
+		}
+	}
+	if !strings.Contains(formatted, "vless@[redacted-host]:443") || !strings.Contains(formatted, "https://[redacted-host]") {
+		t.Fatalf("diagnostic lost protocol/port context: %s", formatted)
 	}
 }
 
@@ -25,6 +31,23 @@ func TestFormatProbeFailureRedactsBase64StyleURIHost(t *testing.T) {
 	formatted := FormatProbeFailure("node-a", "vmess://"+payload, errors.New("failed vmess://"+payload))
 	if strings.Contains(formatted, payload) || strings.Contains(formatted, "secret") {
 		t.Fatalf("diagnostic leaked opaque vmess payload: %s", formatted)
+	}
+}
+
+func TestSanitizeProbeErrorRemovesControlCharactersAndBareSecrets(t *testing.T) {
+	secret := "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"
+	got := SanitizeProbeError(fmt.Errorf("failed\r\nfor token=%s password:plain-text user:pass@example.test", secret))
+	for _, forbidden := range []string{"\r", "\n", secret, "plain-text", "user:pass@"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("sanitized error still contains %q: %q", forbidden, got)
+		}
+	}
+}
+
+func TestSanitizeProbeErrorIsBounded(t *testing.T) {
+	got := SanitizeProbeError(errors.New(strings.Repeat("failure ", 200)))
+	if len(got) > maxSanitizedProbeErrorLength+3 {
+		t.Fatalf("sanitized error length = %d", len(got))
 	}
 }
 

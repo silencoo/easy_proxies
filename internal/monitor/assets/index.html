@@ -475,7 +475,7 @@
       *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
     }
   </style>
-  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+  <script src="/assets/echarts.min.js"></script>
   <script>
     // Set theme before first paint to prevent FOUC
     (function(){
@@ -617,7 +617,7 @@
             <div class="chart-title">最优节点延迟 (Top Fastest Nodes)</div>
             <div class="chart-container" id="latencyChart"></div>
           </div>
-          <div class="chart-panel">
+          <div class="chart-panel" id="trafficPanel">
             <div class="chart-title">实时流量带宽 (Real-time Traffic)</div>
             <div class="chart-container" id="trafficChart"></div>
           </div>
@@ -953,6 +953,7 @@
               <div style="padding: 16px;">
                 <div class="checkbox-grid">
                   <div class="checkbox-row"><input type="checkbox" id="settingSubEnabled" /><label for="settingSubEnabled">启用订阅自动刷新</label></div>
+                  <div class="checkbox-row"><input type="checkbox" id="settingSubAllowPrivate" /><label for="settingSubAllowPrivate">允许访问内网订阅地址（高风险）</label></div>
                 </div>
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
                   <div class="form-group">
@@ -976,7 +977,7 @@
                     <button type="button" class="sensitive-toggle" aria-label="显示敏感信息" title="显示敏感信息" aria-pressed="false" onclick="toggleSensitiveField('settingSubURLs', this)"><svg class="icon"><use href="#i-eye"></use></svg></button>
                   </div>
                 </div>
-                <div style="font-size: 11px; color: var(--success); margin-top: 8px;">订阅配置变更保存后立即生效；并发数作用于订阅链接抓取，最大 32</div>
+                <div style="font-size: 11px; color: var(--success); margin-top: 8px;">订阅配置变更保存后立即生效；默认拒绝回环、私网、链路本地和元数据地址</div>
               </div>
             </div>
 
@@ -1069,6 +1070,9 @@
     let configNodes = [];
     let _savedSubSnapshot = '';
     let _savedCoreSnapshot = '';
+    let settingsETag = '';
+    let subscriptionETag = '';
+    let subscriptionSettingsLoaded = false;
     let _lastLogsPayload = null;
     const CHART_FONT_FAMILY = '"Segoe UI", "Microsoft YaHei UI", "Segoe UI Emoji", "Noto Color Emoji", sans-serif';
     const nodeTableState = { search: '', page: 1, pageSize: 50, sortKey: 'latency', sortDir: 'asc' };
@@ -1225,6 +1229,8 @@
       '启用订阅自动刷新': 'Enable automatic subscription refresh',
       '刷新间隔': 'Refresh interval',
       '订阅抓取并发数': 'Subscription fetch concurrency',
+      '允许访问内网订阅地址（高风险）': 'Allow private-network subscription URLs (high risk)',
+      '订阅配置变更保存后立即生效；默认拒绝回环、私网、链路本地和元数据地址': 'Subscription changes apply immediately; loopback, private, link-local, and metadata destinations are blocked by default.',
       '10 分钟': '10 minutes',
       '30 分钟': '30 minutes',
       '1 小时': '1 hour',
@@ -1248,6 +1254,7 @@
       '保存': 'Save',
       '处理中...': 'Processing...',
       '编辑节点': 'Edit node',
+      '加载节点失败': 'Failed to load node',
       '编辑': 'Edit',
       '删除': 'Delete',
       '探测': 'Probe',
@@ -1277,16 +1284,27 @@
       '配置未变更': 'No configuration changes',
       '保存中...': 'Saving...',
       '保存失败': 'Save failed',
+      '设置已被其他操作更新，已重新载入': 'Settings changed elsewhere and were reloaded.',
       '更新订阅中...': 'Updating subscription...',
       '正在拉取订阅并重载节点，请稍候': 'Fetching subscriptions and reloading nodes.',
       '订阅配置保存失败': 'Failed to save subscription settings',
+      '订阅设置加载失败，请刷新页面后重试': 'Failed to load subscription settings. Refresh the page and try again.',
       '订阅已保存，但刷新失败：{error}': 'Subscription saved, but refresh failed: {error}',
       '已保存，获取 {count} 个节点': 'Saved and loaded {count} nodes',
       '设置已保存': 'Settings saved',
       '重载核心中...': 'Reloading core...',
       '正在应用新配置': 'Applying the new configuration.',
       '已保存并重载成功': 'Saved and reloaded successfully',
-      '已保存，重载失败': 'Saved, but reload failed'
+      '配置已保存；管理监听地址将在重启程序后生效，当前地址和密码保持不变': 'Saved. The management listen address will take effect after restarting the process; the current address and password remain active.',
+      '配置已保存；部分设置将在重启程序后生效': 'Saved. Some settings will take effect after restarting the process.',
+      '已保存，重载失败': 'Saved, but reload failed',
+      '请求失败': 'Request failed',
+      '会话已过期，请重新登录': 'Your session has expired. Sign in again.',
+      '操作成功': 'Operation completed',
+      '加载数据失败': 'Failed to load data',
+      '加载日志失败': 'Failed to load logs',
+      '管理密码与订阅设置不能同时保存，请先保存订阅设置，再单独修改管理密码': 'The management password and subscription settings cannot be saved together. Save the subscription settings first, then change the management password separately.',
+      '管理密码已更新，请使用新密码重新登录': 'The management password was updated. Sign in again with the new password.'
     };
 
     let currentLanguage = localStorage.getItem('uiLanguage') || (navigator.language && navigator.language.toLowerCase().startsWith('zh') ? 'zh-CN' : 'en');
@@ -1452,9 +1470,13 @@
     let failureChartInst = null;
     let trafficChartInst = null;
     let trafficSource = null;
+    let trafficRetryTimer = null;
+    let trafficRetryAttempts = 0;
     let trafficDataUp = [];
     let trafficDataDown = [];
     let trafficTime = [];
+    let regionStatsCache = {};
+    let regionHealthyCache = {};
 
     // Resize observer for charts
     window.addEventListener('resize', () => {
@@ -1473,10 +1495,41 @@
       setTimeout(() => { t.style.opacity=0; setTimeout(()=>t.remove(),300); }, 3000);
     }
 
+    function showLoginOverlay() {
+      document.getElementById('loginOverlay').classList.add('show');
+      stopAutoRefresh();
+    }
+
+    function localizedAPIMessage(message, fallback='请求失败') {
+      const raw = String(message || '').trim();
+      if (!raw) return tr(fallback);
+      if (currentLanguage !== 'en') return raw;
+      if (TRANSLATIONS[raw]) return TRANSLATIONS[raw];
+      return /[\u3400-\u9fff]/.test(raw) ? tr(fallback) : raw;
+    }
+
+    async function readAPIJSON(response, fallback='请求失败') {
+      let payload = {};
+      try { payload = await response.json(); } catch (_) {}
+      if (response.status === 401) {
+        showLoginOverlay();
+        throw new Error(tr('会话已过期，请重新登录'));
+      }
+      if (!response.ok) throw new Error(localizedAPIMessage(payload.error, fallback));
+      return payload;
+    }
+
+    async function requireAPIResponse(response, fallback='请求失败') {
+      if (response.ok) return response;
+      await readAPIJSON(response, fallback);
+      return response;
+    }
+
     async function checkAuth() {
       try {
         const res = await fetch('/api/nodes');
-        if (res.status === 401) { document.getElementById('loginOverlay').classList.add('show'); return false; }
+        if (res.status === 401) { showLoginOverlay(); return false; }
+        if (!res.ok) return false;
         return true;
       } catch (e) { return false; }
     }
@@ -1487,7 +1540,11 @@
       const err = document.getElementById('loginError');
       try {
         const res = await fetch('/api/auth', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({password:pwd})});
-        if (res.ok) { document.getElementById('loginOverlay').classList.remove('show'); refresh(); }
+        if (res.ok) {
+          document.getElementById('loginOverlay').classList.remove('show');
+          refresh();
+          if (isAutoRefresh) startAutoRefresh();
+        }
         else { err.textContent = tr('身份验证失败'); err.style.display = 'block'; }
       } catch (ex) { err.textContent = ex.message; err.style.display = 'block'; }
     }
@@ -1544,6 +1601,13 @@
       const div = document.createElement('div'); div.textContent = text; return div.innerHTML;
     }
 
+    function maskNodeURI(uri) {
+      const value = String(uri || '').trim();
+      if (!value) return '';
+      const separator = value.indexOf('://');
+      return separator >= 0 ? `${value.slice(0, separator + 3)}********` : '********';
+    }
+
     function inlineStringArg(value) {
       return JSON.stringify(String(value || '')).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     }
@@ -1551,15 +1615,16 @@
     async function refresh() {
       try {
         const res = await fetch('/api/nodes');
-        if (res.status === 401) { document.getElementById('loginOverlay').classList.add('show'); stopAutoRefresh(); return; }
-        const data = await res.json();
+        const data = await readAPIJSON(res, '加载数据失败');
         allNodesCache = data.nodes || [];
+        regionStatsCache = data.region_stats || {};
+        regionHealthyCache = data.region_healthy || {};
         updateSweepProgress(data.probe_sweep);
         updateDashboardStats(data);
         filterByRegion(currentRegionFilter);
         document.getElementById('lastUpdate').textContent = `Sync: ${new Date().toLocaleTimeString()}`;
         fetchSubscriptionStatus();
-      } catch(e) {}
+      } catch(e) { console.error('Failed to refresh dashboard:', e); }
     }
 
     function updateSweepProgress(sweep) {
@@ -1581,7 +1646,8 @@
 
     function updateDashboardStats(data) {
       document.getElementById('totalNodes').textContent = data.total_nodes || allNodesCache.length;
-      document.getElementById('healthyNodes').textContent = allNodesCache.filter(n => !n.blacklisted && n.initial_check_done && n.available).length;
+      const healthyCount = Object.values(regionHealthyCache).reduce((sum, count) => sum + (Number(count) || 0), 0);
+      document.getElementById('healthyNodes').textContent = healthyCount || allNodesCache.filter(n => !n.blacklisted && n.initial_check_done && n.available).length;
       document.getElementById('activeConnections').textContent = allNodesCache.reduce((s, n) => s + (n.active_connections||0), 0);
       document.getElementById('blacklistedNodes').textContent = allNodesCache.filter(n => n.blacklisted || (!n.available && n.initial_check_done)).length;
       
@@ -1618,17 +1684,17 @@
       if(!regionChartInst) regionChartInst = initEchart('regionChart');
       if(!latencyChartInst) latencyChartInst = initEchart('latencyChart');
 
-      if (!allNodesCache || allNodesCache.length === 0) return;
+      if ((!allNodesCache || allNodesCache.length === 0) && Object.keys(regionStatsCache).length === 0) return;
 
       // 1. Region Chart Data
       const regionStats = {};
-      allNodesCache.forEach(n => {
-        const r = getNodeRegion(n).toUpperCase();
-        if(!regionStats[r]) regionStats[r] = { total: 0, healthy: 0 };
-        regionStats[r].total++;
-        if(!n.blacklisted && n.initial_check_done && n.available) {
-          regionStats[r].healthy++;
-        }
+      Object.entries(regionStatsCache).forEach(([region, total]) => {
+        const normalized = String(region || 'other').toUpperCase();
+        const healthyEntry = Object.entries(regionHealthyCache).find(([key]) => String(key).toUpperCase() === normalized);
+        regionStats[normalized] = {
+          total: Number(total) || 0,
+          healthy: healthyEntry ? (Number(healthyEntry[1]) || 0) : 0
+        };
       });
       
       const regionData = Object.keys(regionStats).map(k => ({
@@ -1718,7 +1784,7 @@
     }
 
     function connectTrafficSSE() {
-      if (trafficSource) return;
+      if (trafficSource || trafficRetryTimer) return;
       trafficSource = new EventSource('/api/traffic');
       trafficSource.onmessage = function(e) {
         try {
@@ -1726,6 +1792,9 @@
           const up = d.up || 0;
           const down = d.down || 0;
           const now = new Date().toLocaleTimeString([], {hour12: false});
+          trafficRetryAttempts = 0;
+          const panel = document.getElementById('trafficPanel');
+          if (panel) panel.hidden = false;
           trafficTime.push(now);
           trafficDataUp.push(up);
           trafficDataDown.push(down);
@@ -1744,7 +1813,16 @@
       trafficSource.onerror = function() {
         trafficSource.close();
         trafficSource = null;
-        setTimeout(connectTrafficSSE, 5000);
+        trafficRetryAttempts++;
+        if (trafficRetryAttempts >= 3 && trafficTime.length === 0) {
+          const panel = document.getElementById('trafficPanel');
+          if (panel) panel.hidden = true;
+        }
+        const retryDelay = Math.min(60000, 2000 * Math.pow(2, Math.min(trafficRetryAttempts - 1, 5)));
+        trafficRetryTimer = setTimeout(() => {
+          trafficRetryTimer = null;
+          connectTrafficSSE();
+        }, retryDelay);
       };
     }
 
@@ -1843,25 +1921,26 @@
       showToast(tr('探测中...'));
       try {
         const r = await fetch('/api/nodes/'+encodeURIComponent(tag)+'/probe', {method:'POST'});
-        const d = await r.json();
-        if(d.error) showToast(d.error, 'error'); else { showToast(`Latency: ${d.latency_ms}ms`); refresh(); }
+        const d = await readAPIJSON(r, '请求失败');
+        showToast(`Latency: ${d.latency_ms}ms`); refresh();
       } catch(e) { showToast(e.message, 'error'); }
     }
     
     async function releaseNode(tag) {
       try {
         const r = await fetch('/api/nodes/'+encodeURIComponent(tag)+'/release', {method:'POST'});
+        await requireAPIResponse(r, '请求失败');
         showToast(tr('已解封')); refresh();
-      } catch(e) { }
+      } catch(e) { showToast(e.message, 'error'); }
     }
 
     async function blacklistNode(tag) {
       if(!confirm(tr('确定拉黑该节点 24 小时？'))) return;
       try {
         const r = await fetch('/api/nodes/'+encodeURIComponent(tag)+'/blacklist', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({duration:'24h'})});
-        const d = await r.json();
-        if(d.error) showToast(d.error, 'error'); else { showToast(d.message); refresh(); }
-      } catch(e) { showToast(tr('拉黑失败'), 'error'); }
+        const d = await readAPIJSON(r, '拉黑失败');
+        showToast(localizedAPIMessage(d.message, '操作成功')); refresh();
+      } catch(e) { showToast(e.message || tr('拉黑失败'), 'error'); }
     }
 
     // Probe All
@@ -1873,6 +1952,7 @@
       let total = 0, current = 0, suc = 0, fail = 0;
       try {
         const res = await fetch('/api/nodes/probe-all', { method: 'POST' });
+        await requireAPIResponse(res, '请求失败');
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
         let buf = '';
@@ -1904,7 +1984,7 @@
             }
           }
         }
-      } catch(e){}
+      } catch(e){ showToast(e.message, 'error'); }
       finally {
         isProbing = false;
         setTimeout(()=>{ document.getElementById('probeProgress').classList.remove('show'); refresh(); }, 2000);
@@ -1914,7 +1994,7 @@
     async function exportNodes() {
       try {
         const res = await fetch('/api/export');
-        if(!res.ok) throw new Error();
+        await requireAPIResponse(res, '导出失败');
         const blob = await res.blob();
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a'); a.href = url; a.download = 'nodes.txt';
@@ -1926,25 +2006,25 @@
     async function fetchSubscriptionStatus() {
       try {
         const res = await fetch('/api/subscription/status');
-        if(!res.ok) return;
-        const d = await res.json();
+        const d = await readAPIJSON(res, '请求失败');
         const btn = document.getElementById('refreshSubBtn');
         if(!d.enabled) { btn.style.display='none'; return; }
         btn.style.display='inline-flex';
         document.getElementById('subscriptionStatus').textContent = `[Sub: ${d.node_count}]`;
         document.getElementById('subscriptionTrend').textContent = d.is_refreshing ? 'Syncing...' : (d.last_error ? 'ERR' : 'OK');
-      } catch(e){}
+      } catch(e){ console.error('Failed to load subscription status:', e); }
     }
     
     async function refreshSubscription() {
       try {
-        const s = await fetch('/api/subscription/status').then(r=>r.json());
+        const statusResponse = await fetch('/api/subscription/status');
+        const s = await readAPIJSON(statusResponse, '请求失败');
         if(s.nodes_modified && !confirm(tr('本地节点已修改，刷新将覆盖，继续？'))) return;
         showToast(tr('开始刷新订阅...'));
         const r = await fetch('/api/subscription/refresh', {method:'POST'});
-        const res = await r.json();
-        if(res.error) showToast(res.error, 'error'); else { showToast(tr('成功获取 {count} 个节点', {count: res.node_count})); refresh(); }
-      } catch(e) { showToast(tr('刷新失败：{error}', {error: e}), 'error'); }
+        const res = await readAPIJSON(r, '请求失败');
+        showToast(tr('成功获取 {count} 个节点', {count: res.node_count})); refresh();
+      } catch(e) { showToast(tr('刷新失败：{error}', {error: e.message || e}), 'error'); }
     }
 
     // Manage Nodes
@@ -1978,12 +2058,12 @@
       tbody.innerHTML = page.rows.length ? page.rows.map(n => `
         <tr>
           <td><strong>${escapeHtml(normalizeNodeName(n.name))}</strong></td>
-          <td class="tt-mono" style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(n.uri)}</td>
+          <td class="tt-mono" style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(maskNodeURI(n.uri))}</td>
           <td class="tt-mono">${n.port || '-'}</td>
           <td><span class="badge ${n.source==='subscription'?'badge-warning':'badge-healthy'}">${n.source||'manual'}</span></td>
           <td>
-            <button type="button" class="btn btn-sm" onclick="showEditNodeModal(${inlineStringArg(n.name)})">${iconMarkup('edit')}<span>${tr('编辑')}</span></button>
-            <button type="button" class="btn btn-sm btn-danger" onclick="deleteNode(${inlineStringArg(n.name)})">${iconMarkup('trash')}<span>${tr('删除')}</span></button>
+            <button type="button" class="btn btn-sm" onclick="showEditNodeModal(${inlineStringArg(n.id)})">${iconMarkup('edit')}<span>${tr('编辑')}</span></button>
+            <button type="button" class="btn btn-sm btn-danger" onclick="deleteNode(${inlineStringArg(n.id)}, ${inlineStringArg(n.name)})">${iconMarkup('trash')}<span>${tr('删除')}</span></button>
           </td>
         </tr>
       `).join('') : `<tr><td colspan="5" style="text-align:center;color:var(--text-muted)">${tr('暂无数据')}</td></tr>`;
@@ -1992,19 +2072,26 @@
     async function loadConfigNodes() {
       try {
         const res = await fetch('/api/nodes/config');
-        const data = await res.json();
+        const data = await readAPIJSON(res, '加载数据失败');
         configNodes = data.nodes || [];
         renderConfigNodes();
         document.getElementById('subscriptionWarning').style.display = configNodes.some(n=>n.source==='subscription') ? 'block' : 'none';
-      } catch(e){}
+      } catch(e){ showToast(e.message, 'error'); }
     }
 
     function showAddNodeModal() { isEditMode=false; document.getElementById('nodeModalTitle').textContent=tr('添加节点'); document.getElementById('nodeName').value=''; document.getElementById('nodeUri').value=''; document.getElementById('nodePort').value=''; document.getElementById('nodeModalOverlay').classList.add('show');}
-    function showEditNodeModal(name) { 
-      const n = configNodes.find(x=>x.name===name); if(!n) return;
-      isEditMode=true; document.getElementById('nodeModalTitle').textContent=tr('编辑节点');
-      document.getElementById('nodeName').value=n.name; document.getElementById('nodeUri').value=n.uri; document.getElementById('nodePort').value=n.port||''; document.getElementById('nodeEditName').value=n.name;
-      document.getElementById('nodeModalOverlay').classList.add('show');
+    async function showEditNodeModal(id) {
+      try {
+        const response = await fetch('/api/nodes/config/' + encodeURIComponent(id));
+        const payload = await readAPIJSON(response, '加载节点失败');
+        if (!payload.node) throw new Error(tr('加载节点失败'));
+        const n = payload.node;
+        isEditMode=true; document.getElementById('nodeModalTitle').textContent=tr('编辑节点');
+        document.getElementById('nodeName').value=n.name; document.getElementById('nodeUri').value=n.uri; document.getElementById('nodePort').value=n.port||''; document.getElementById('nodeEditName').value=n.id;
+        document.getElementById('nodeModalOverlay').classList.add('show');
+      } catch (error) {
+        showToast(error.message || tr('加载节点失败'), 'error');
+      }
     }
     async function handleNodeSubmit(e) {
       e.preventDefault();
@@ -2014,19 +2101,21 @@
         const url = isEditMode ? '/api/nodes/config/'+encodeURIComponent(editName) : '/api/nodes/config';
         const method = isEditMode ? 'PUT' : 'POST';
         const r = await fetch(url, {method, headers:{'Content-Type':'application/json'}, body:JSON.stringify(p)});
-        if(r.ok) { document.getElementById('nodeModalOverlay').classList.remove('show'); showToast(tr('成功')); loadConfigNodes(); } else { const d = await r.json(); showToast(d.error, 'error'); }
-      } catch(e){}
+        await readAPIJSON(r, '请求失败');
+        document.getElementById('nodeModalOverlay').classList.remove('show'); showToast(tr('成功')); loadConfigNodes();
+      } catch(e){ showToast(e.message, 'error'); }
     }
-    async function deleteNode(name) {
+    async function deleteNode(id, name) {
       if(!confirm(tr('确定删除节点 {name}？', {name}))) return;
       try {
-        const r = await fetch('/api/nodes/config/'+encodeURIComponent(name), {method:'DELETE'});
-        if(r.ok) { showToast(tr('删除成功')); loadConfigNodes(); }
-      } catch(e){}
+        const r = await fetch('/api/nodes/config/'+encodeURIComponent(id), {method:'DELETE'});
+        await readAPIJSON(r, '请求失败');
+        showToast(tr('删除成功')); loadConfigNodes();
+      } catch(e){ showToast(e.message, 'error'); }
     }
     async function triggerReload() {
       if(!confirm(tr('立即重载核心？'))) return;
-      try { const r = await fetch('/api/reload', {method:'POST'}); if(r.ok) {showToast(tr('重载成功')); refresh();} } catch(e){}
+      try { const r = await fetch('/api/reload', {method:'POST'}); await readAPIJSON(r, '请求失败'); showToast(tr('重载成功')); refresh(); } catch(e){ showToast(e.message, 'error'); }
     }
 
     // Debug
@@ -2093,7 +2182,7 @@
     async function loadDebugData() {
       try {
         const res = await fetch('/api/debug');
-        const d = await res.json();
+        const d = await readAPIJSON(res, '加载数据失败');
         document.getElementById('debugTotalCalls').textContent = d.total_calls||0;
         document.getElementById('debugTotalSuccess').textContent = d.total_success||0;
         document.getElementById('debugSuccessRate').textContent = (d.success_rate||0).toFixed(1)+'%';
@@ -2101,7 +2190,7 @@
         renderDebugNodes();
         updateDebugCharts(d.success_rate || 0);
 
-      } catch(e){}
+      } catch(e){ showToast(e.message, 'error'); }
     }
 
     function updateDebugCharts(globalRate) {
@@ -2167,8 +2256,13 @@
 
     // Settings
     async function loadSettingsPage() {
+      subscriptionSettingsLoaded = false;
+      _savedSubSnapshot = '';
+      subscriptionETag = '';
       try {
-        const r = await fetch('/api/settings'); const d = await r.json();
+        const r = await fetch('/api/settings');
+        const d = await readAPIJSON(r, '加载数据失败');
+        settingsETag = r.headers.get('ETag') || '';
         document.getElementById('settingLanguage').value = currentLanguage;
         // General
         document.getElementById('settingMode').value = d.mode || 'pool';
@@ -2226,7 +2320,10 @@
         toggleLogFileSettings();
         // Subscription
         try {
-          const sr = await fetch('/api/subscription/config'); const sd = await sr.json();
+          const sr = await fetch('/api/subscription/config');
+          const sd = await readAPIJSON(sr, '订阅设置加载失败，请刷新页面后重试');
+          if (!Array.isArray(sd.subscriptions)) throw new Error('invalid subscription settings response');
+          subscriptionETag = sr.headers.get('ETag') || '';
           document.getElementById('settingSubEnabled').checked = sd.enabled || false;
           const iv = sd.interval || '';
           const sel = document.getElementById('settingSubInterval');
@@ -2235,12 +2332,17 @@
           if (!matched) sel.value = '1h';
           const fetchConcurrency = Number(sd.fetch_concurrency) || 16;
           document.getElementById('settingSubFetchConcurrency').value = fetchConcurrency;
+          document.getElementById('settingSubAllowPrivate').checked = sd.allow_private_networks === true;
           document.getElementById('settingSubURLs').value = (sd.subscriptions || []).join('\n');
-          _savedSubSnapshot = JSON.stringify({urls: (sd.subscriptions || []).join('\n'), enabled: sd.enabled || false, interval: sel.value, fetch_concurrency: fetchConcurrency});
-        } catch(e){}
+          _savedSubSnapshot = JSON.stringify({urls: (sd.subscriptions || []).join('\n'), enabled: sd.enabled || false, interval: sel.value, fetch_concurrency: fetchConcurrency, allow_private_networks: sd.allow_private_networks === true});
+          subscriptionSettingsLoaded = true;
+        } catch(e){
+          console.error('Failed to load subscription settings:', e);
+          showToast(tr('订阅设置加载失败，请刷新页面后重试'), 'error');
+        }
         // Take core snapshot after all fields are populated
         _savedCoreSnapshot = _buildCoreSnapshot();
-      } catch(e){ console.error('Failed to load settings:', e); }
+      } catch(e){ console.error('Failed to load settings:', e); showToast(e.message || tr('加载数据失败'), 'error'); }
     }
     function _buildCoreSnapshot() {
       return JSON.stringify({
@@ -2312,12 +2414,30 @@
       const subEnabled = document.getElementById('settingSubEnabled').checked;
       const subInterval = document.getElementById('settingSubInterval').value;
       const subFetchConcurrency = parseInt(document.getElementById('settingSubFetchConcurrency').value) || 16;
-      const currentSubSnapshot = JSON.stringify({urls: subURLs.join('\n'), enabled: subEnabled, interval: subInterval, fetch_concurrency: subFetchConcurrency});
+      const subAllowPrivate = document.getElementById('settingSubAllowPrivate').checked;
+      const currentSubSnapshot = JSON.stringify({urls: subURLs.join('\n'), enabled: subEnabled, interval: subInterval, fetch_concurrency: subFetchConcurrency, allow_private_networks: subAllowPrivate});
 
       const coreChanged = currentCoreSnapshot !== _savedCoreSnapshot;
-      const subChanged = currentSubSnapshot !== _savedSubSnapshot;
+      const subChanged = subscriptionSettingsLoaded && currentSubSnapshot !== _savedSubSnapshot;
+      let coreRestartRequired = false;
+      let coreAuthChanged = false;
+      let savedCore = {};
+      try { savedCore = JSON.parse(_savedCoreSnapshot || '{}'); } catch (_) {}
+      const managementPasswordChanged = coreChanged && savedCore.mgmt_password !== document.getElementById('settingMgmtPassword').value;
+
+      // Rotating the password invalidates this browser session immediately. Do
+      // not start a deterministic partial save by attempting subscriptions
+      // after that rotation; keep both edits in the form for separate saves.
+      if (managementPasswordChanged && subChanged) {
+        showToast(tr('管理密码与订阅设置不能同时保存，请先保存订阅设置，再单独修改管理密码'), 'warning');
+        return;
+      }
 
       if (!coreChanged && !subChanged) {
+        if (!subscriptionSettingsLoaded) {
+          showToast(tr('订阅设置加载失败，请刷新页面后重试'), 'error');
+          return;
+        }
         showToast(tr('配置未变更')); return;
       }
 
@@ -2380,21 +2500,42 @@
           }
         };
         try {
-          const r = await fetch('/api/settings', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(p)});
-          if(!r.ok) { showToast(tr('保存失败'), 'error'); saveBtn.disabled = false; saveLabel.textContent = originalText; saveBtn.style.opacity = '1'; return; }
-        } catch(e){ showToast(tr('保存失败'), 'error'); saveBtn.disabled = false; saveLabel.textContent = originalText; saveBtn.style.opacity = '1'; return; }
+          const r = await fetch('/api/settings', {method:'PUT', headers:{'Content-Type':'application/json', 'If-Match': settingsETag}, body:JSON.stringify(p)});
+          const result = await r.json().catch(() => ({}));
+          if(!r.ok) {
+            if (r.status === 412 || r.status === 428) {
+              await loadSettingsPage();
+              showToast(tr('设置已被其他操作更新，已重新载入'), 'warning');
+            } else {
+              showToast(localizedAPIMessage(result.error, '保存失败'), 'error');
+            }
+            saveBtn.disabled = false; saveLabel.textContent = originalText; saveBtn.style.opacity = '1'; return;
+          }
+          const committedETag = r.headers.get('ETag') || settingsETag;
+          settingsETag = committedETag;
+          // A successful partial core update preserves the subscription fields,
+          // so its committed revision is also the correct subscription base.
+          subscriptionETag = committedETag || subscriptionETag;
+          coreRestartRequired = !!result.need_restart;
+          coreAuthChanged = !!result.auth_changed;
+        } catch(e){ showToast(e.message || tr('保存失败'), 'error'); saveBtn.disabled = false; saveLabel.textContent = originalText; saveBtn.style.opacity = '1'; return; }
         _savedCoreSnapshot = currentCoreSnapshot;
       }
 
       // Save subscription config if changed
       if (subChanged) {
         showFullscreenLoading(tr('更新订阅中...'), tr('正在拉取订阅并重载节点，请稍候'));
-        const subPayload = { subscriptions: subURLs, enabled: subEnabled, interval: subInterval, fetch_concurrency: subFetchConcurrency };
+        const subPayload = { subscriptions: subURLs, enabled: subEnabled, interval: subInterval, fetch_concurrency: subFetchConcurrency, allow_private_networks: subAllowPrivate };
         try {
-          const sr = await fetch('/api/subscription/config', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(subPayload)});
+          const sr = await fetch('/api/subscription/config', {method:'PUT', headers:{'Content-Type':'application/json', 'If-Match': subscriptionETag}, body:JSON.stringify(subPayload)});
           hideFullscreenLoading();
-          if(!sr.ok) { showToast(tr('订阅配置保存失败'), 'error'); saveBtn.disabled = false; saveLabel.textContent = originalText; saveBtn.style.opacity = '1'; return; }
-          const sd = await sr.json();
+          if (sr.status === 412 || sr.status === 428) {
+            await loadSettingsPage();
+            showToast(tr('设置已被其他操作更新，已重新载入'), 'warning');
+            saveBtn.disabled = false; saveLabel.textContent = originalText; saveBtn.style.opacity = '1'; return;
+          }
+          const sd = await readAPIJSON(sr, '订阅配置保存失败');
+          subscriptionETag = sr.headers.get('ETag') || subscriptionETag;
           _savedSubSnapshot = currentSubSnapshot;
           if (sd.refresh_error) {
             showToast(tr('订阅已保存，但刷新失败：{error}', {error: sd.refresh_error}), 'error');
@@ -2403,17 +2544,19 @@
           } else {
             showToast(tr('设置已保存'));
           }
-        } catch(e){ hideFullscreenLoading(); showToast(tr('订阅配置保存失败'), 'error'); saveBtn.disabled = false; saveLabel.textContent = originalText; saveBtn.style.opacity = '1'; return; }
-      } else if (coreChanged) {
-        // Core changed but no sub change — trigger reload
-        showFullscreenLoading(tr('重载核心中...'), tr('正在应用新配置'));
-        try {
-          const rr = await fetch('/api/reload', {method:'POST'});
-          hideFullscreenLoading();
-          if (rr.ok) { showToast(tr('已保存并重载成功')); } else { showToast(tr('已保存，重载失败'), 'error'); }
-        } catch(e) { hideFullscreenLoading(); showToast(tr('已保存，重载失败'), 'error'); }
+        } catch(e){ hideFullscreenLoading(); showToast(e.message || tr('订阅配置保存失败'), 'error'); saveBtn.disabled = false; saveLabel.textContent = originalText; saveBtn.style.opacity = '1'; return; }
+      } else if (coreChanged && !coreRestartRequired) {
+        showToast(tr('已保存并重载成功'));
+      }
+      if (coreRestartRequired) {
+        showToast(tr('配置已保存；部分设置将在重启程序后生效'), 'warning');
       }
       saveBtn.disabled = false; saveLabel.textContent = originalText; saveBtn.style.opacity = '1';
+      if (coreAuthChanged) {
+        showToast(tr('管理密码已更新，请使用新密码重新登录'), 'warning');
+        showLoginOverlay();
+        return;
+      }
       refresh();
     }
 
@@ -2460,9 +2603,9 @@
     async function pollLogs() {
       try {
         const r = await fetch('/api/logs');
-        const d = await r.json();
+        const d = await readAPIJSON(r, '加载日志失败');
         renderConsoleLogs(d.logs || '');
-      } catch(e){}
+      } catch(e){ console.error('Failed to load logs:', e); stopLogPolling(); showToast(e.message, 'error'); }
     }
 
     // ─── Theme System: Dark / Light / Auto (follow OS) ───
