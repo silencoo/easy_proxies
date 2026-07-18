@@ -361,9 +361,19 @@ func (m *Manager) installGeoPools(
 				Members:           append([]string(nil), members...),
 				FailureThreshold:  cfg.Pool.FailureThreshold,
 				BlacklistDuration: cfg.Pool.BlacklistDuration,
-				Metadata:          metadata,
-				FailOpen:          cfg.Pool.FailOpen,
-				SkipStartupProbe:  true,
+				TransientCooldown: cfg.Pool.TransientCooldown,
+				RetryEnabled:      cfg.Pool.RetryEnabledValue(),
+				RetryAttempts:     cfg.Pool.RetryAttempts,
+				LatencySampleSize: cfg.Pool.LatencySampleSize,
+				LatencyTolerance:  cfg.Pool.LatencyTolerance,
+				Sticky: pool.StickyOptions{
+					Enabled:    cfg.Pool.Sticky.Enabled,
+					TTL:        cfg.Pool.Sticky.TTL,
+					MaxEntries: cfg.Pool.Sticky.MaxEntries,
+				},
+				Metadata:         metadata,
+				FailOpen:         cfg.Pool.FailOpen,
+				SkipStartupProbe: true,
 			},
 		}
 	}

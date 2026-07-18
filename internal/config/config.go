@@ -79,6 +79,26 @@ type PoolConfig struct {
 	BlacklistDuration time.Duration `yaml:"blacklist_duration"`
 	FailOpen          bool          `yaml:"fail_open,omitempty"`
 	HealthStateFile   string        `yaml:"health_state_file,omitempty"`
+	RetryEnabled      *bool         `yaml:"retry_enabled,omitempty"`
+	RetryAttempts     int           `yaml:"retry_attempts,omitempty"`
+	TransientCooldown time.Duration `yaml:"transient_cooldown,omitempty"`
+	LatencySampleSize int           `yaml:"latency_sample_size,omitempty"`
+	LatencyTolerance  time.Duration `yaml:"latency_tolerance,omitempty"`
+	Sticky            StickyConfig  `yaml:"sticky,omitempty"`
+}
+
+// StickyConfig controls bounded session affinity on the unified pool listener.
+// Dedicated per-node listeners are already deterministic and ignore this setting.
+type StickyConfig struct {
+	Enabled    bool          `yaml:"enabled" json:"enabled"`
+	TTL        time.Duration `yaml:"ttl" json:"ttl"`
+	MaxEntries int           `yaml:"max_entries" json:"max_entries"`
+}
+
+// RetryEnabledValue returns the effective retry setting. Retries default to on
+// for pooled traffic, while dedicated listeners suppress them at runtime.
+func (c PoolConfig) RetryEnabledValue() bool {
+	return c.RetryEnabled == nil || *c.RetryEnabled
 }
 
 // MultiPortConfig defines address/credential defaults for multi-port mode.
@@ -277,14 +297,8 @@ func (c *Config) normalize() error {
 	if c.Listener.Port == 0 {
 		c.Listener.Port = 2323
 	}
-	if c.Pool.Mode == "" {
-		c.Pool.Mode = "sequential"
-	}
-	if c.Pool.FailureThreshold <= 0 {
-		c.Pool.FailureThreshold = 3
-	}
-	if c.Pool.BlacklistDuration <= 0 {
-		c.Pool.BlacklistDuration = 24 * time.Hour
+	if err := c.normalizePoolConfig(); err != nil {
+		return err
 	}
 	if c.MultiPort.Address == "" {
 		c.MultiPort.Address = "0.0.0.0"
@@ -839,14 +853,8 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	if c.Listener.Port == 0 {
 		c.Listener.Port = 2323
 	}
-	if c.Pool.Mode == "" {
-		c.Pool.Mode = "sequential"
-	}
-	if c.Pool.FailureThreshold <= 0 {
-		c.Pool.FailureThreshold = 3
-	}
-	if c.Pool.BlacklistDuration <= 0 {
-		c.Pool.BlacklistDuration = 24 * time.Hour
+	if err := c.normalizePoolConfig(); err != nil {
+		return err
 	}
 	if c.MultiPort.Address == "" {
 		c.MultiPort.Address = "0.0.0.0"
@@ -916,6 +924,54 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 
 	c.normalizeLogConfig()
 
+	return nil
+}
+
+func (c *Config) normalizePoolConfig() error {
+	mode := strings.ToLower(strings.TrimSpace(c.Pool.Mode))
+	if mode == "" || mode == "round-robin" || mode == "round_robin" {
+		mode = "sequential"
+	}
+	switch mode {
+	case "sequential", "random", "balance", "latency":
+		c.Pool.Mode = mode
+	default:
+		return fmt.Errorf("unsupported pool mode %q (use 'sequential', 'random', 'balance', or 'latency')", c.Pool.Mode)
+	}
+	if c.Pool.FailureThreshold <= 0 {
+		c.Pool.FailureThreshold = 3
+	}
+	if c.Pool.BlacklistDuration <= 0 {
+		c.Pool.BlacklistDuration = 24 * time.Hour
+	}
+	if c.Pool.RetryEnabled == nil {
+		enabled := true
+		c.Pool.RetryEnabled = &enabled
+	}
+	if c.Pool.RetryAttempts <= 0 {
+		c.Pool.RetryAttempts = 3
+	} else if c.Pool.RetryAttempts > 10 {
+		c.Pool.RetryAttempts = 10
+	}
+	if c.Pool.TransientCooldown <= 0 {
+		c.Pool.TransientCooldown = time.Minute
+	}
+	if c.Pool.LatencySampleSize <= 0 {
+		c.Pool.LatencySampleSize = 4
+	} else if c.Pool.LatencySampleSize > 32 {
+		c.Pool.LatencySampleSize = 32
+	}
+	if c.Pool.LatencyTolerance <= 0 {
+		c.Pool.LatencyTolerance = 50 * time.Millisecond
+	}
+	if c.Pool.Sticky.TTL <= 0 {
+		c.Pool.Sticky.TTL = 30 * time.Minute
+	}
+	if c.Pool.Sticky.MaxEntries <= 0 {
+		c.Pool.Sticky.MaxEntries = 4096
+	} else if c.Pool.Sticky.MaxEntries > 1_000_000 {
+		c.Pool.Sticky.MaxEntries = 1_000_000
+	}
 	return nil
 }
 

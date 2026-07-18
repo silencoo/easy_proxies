@@ -163,9 +163,19 @@ func Build(cfg *config.Config) (option.Options, error) {
 		Members:           memberTags,
 		FailureThreshold:  cfg.Pool.FailureThreshold,
 		BlacklistDuration: cfg.Pool.BlacklistDuration,
-		Metadata:          metadata,
-		FailOpen:          cfg.Pool.FailOpen,
-		DedicatedMembers:  dedicatedMembers,
+		TransientCooldown: cfg.Pool.TransientCooldown,
+		RetryEnabled:      cfg.Pool.RetryEnabledValue(),
+		RetryAttempts:     cfg.Pool.RetryAttempts,
+		LatencySampleSize: cfg.Pool.LatencySampleSize,
+		LatencyTolerance:  cfg.Pool.LatencyTolerance,
+		Sticky: poolout.StickyOptions{
+			Enabled:    cfg.Pool.Sticky.Enabled,
+			TTL:        cfg.Pool.Sticky.TTL,
+			MaxEntries: cfg.Pool.Sticky.MaxEntries,
+		},
+		Metadata:         metadata,
+		FailOpen:         cfg.Pool.FailOpen,
+		DedicatedMembers: dedicatedMembers,
 	}
 	outbounds = append(outbounds, option.Outbound{
 		Type:    poolout.Type,

@@ -33,6 +33,7 @@ const (
 	modeSequential = "sequential"
 	modeRandom     = "random"
 	modeBalance    = "balance"
+	modeLatency    = "latency"
 )
 
 // Options controls pool outbound behaviour.
@@ -41,6 +42,12 @@ type Options struct {
 	Members           []string
 	FailureThreshold  int
 	BlacklistDuration time.Duration
+	TransientCooldown time.Duration
+	RetryEnabled      bool
+	RetryAttempts     int
+	LatencySampleSize int
+	LatencyTolerance  time.Duration
+	Sticky            StickyOptions
 	Metadata          map[string]MemberMeta
 	// FailOpen retries blacklisted nodes when the entire shared pool is down.
 	// It is opt-in because silently reviving known-bad nodes is unsafe for
@@ -58,6 +65,13 @@ type Options struct {
 	// SkipStartupProbe is used for metadata-only pool replacements after exit
 	// GeoIP discovery; shared health state is already initialized at that point.
 	SkipStartupProbe bool
+}
+
+// StickyOptions configures bounded session affinity for pooled traffic.
+type StickyOptions struct {
+	Enabled    bool
+	TTL        time.Duration
+	MaxEntries int
 }
 
 // MemberMeta carries optional descriptive information for monitoring UI.
@@ -135,6 +149,7 @@ type poolOutbound struct {
 	rng         *rand.Rand
 	rngMu       sync.Mutex // protects rng for random mode
 	monitor     *monitor.Manager
+	sticky      *stickyCache
 	closed      atomic.Bool
 	initialized atomic.Bool
 }
@@ -166,6 +181,9 @@ func newPool(ctx context.Context, _ adapter.Router, logger singlog.ContextLogger
 		eligibleTCP: newMemberSet(len(normalized.Members)),
 		eligibleUDP: newMemberSet(len(normalized.Members)),
 	}
+	if normalized.Sticky.Enabled {
+		p.sticky = newStickyCache(normalized.Sticky.TTL, normalized.Sticky.MaxEntries)
+	}
 
 	return p, nil
 }
@@ -194,6 +212,28 @@ func normalizeOptions(options Options) Options {
 	if options.BlacklistDuration <= 0 {
 		options.BlacklistDuration = 24 * time.Hour
 	}
+	if options.TransientCooldown <= 0 {
+		options.TransientCooldown = time.Minute
+	}
+	if options.RetryAttempts <= 0 {
+		options.RetryAttempts = 3
+	} else if options.RetryAttempts > 10 {
+		options.RetryAttempts = 10
+	}
+	if options.LatencySampleSize <= 0 {
+		options.LatencySampleSize = 4
+	} else if options.LatencySampleSize > 32 {
+		options.LatencySampleSize = 32
+	}
+	if options.LatencyTolerance <= 0 {
+		options.LatencyTolerance = 50 * time.Millisecond
+	}
+	if options.Sticky.TTL <= 0 {
+		options.Sticky.TTL = 30 * time.Minute
+	}
+	if options.Sticky.MaxEntries <= 0 {
+		options.Sticky.MaxEntries = 4096
+	}
 	if options.Metadata == nil {
 		options.Metadata = make(map[string]MemberMeta)
 	}
@@ -202,6 +242,8 @@ func normalizeOptions(options Options) Options {
 		options.Mode = modeRandom
 	case modeBalance:
 		options.Mode = modeBalance
+	case modeLatency:
+		options.Mode = modeLatency
 	default:
 		options.Mode = modeSequential
 	}
@@ -367,7 +409,7 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 				res.member.entry.MarkInitialCheckDone(false)
 			}
 			if res.member.shared != nil {
-				res.member.shared.recordFailure(res.err, 1, p.options.BlacklistDuration)
+				res.member.shared.recordFailure(res.err, 1, p.options.BlacklistDuration, p.options.TransientCooldown)
 			} else if res.member.entry != nil {
 				res.member.entry.RecordFailure(res.err)
 			}
@@ -389,38 +431,76 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 }
 
 func (p *poolOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	member, err := p.pickMember(ctx, network)
-	if err != nil {
-		return nil, err
-	}
-	p.incActive(member)
-	conn, err := member.outbound.DialContext(ctx, network, destination)
-	if err != nil {
+	maxAttempts := p.maxAttempts(ctx)
+	tried := make(map[string]struct{}, maxAttempts)
+	stickyKey := p.stickyKeyFromContext(ctx)
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		member, err := p.pickMemberExcluding(ctx, network, tried, stickyKey)
+		if err != nil {
+			if lastErr != nil {
+				return nil, fmt.Errorf("proxy dial failed after %d attempt(s): %w", attempt-1, lastErr)
+			}
+			return nil, err
+		}
+		p.incActive(member)
+		conn, err := member.outbound.DialContext(ctx, network, destination)
+		if err == nil {
+			p.recordSuccess(member)
+			return p.wrapConn(conn, member), nil
+		}
 		p.decActive(member)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		p.recordFailure(member, err)
-		return nil, err
+		tried[member.tag] = struct{}{}
+		if stickyKey != "" {
+			p.sticky.delete(stickyKey)
+		}
+		lastErr = err
 	}
-	p.recordSuccess(member)
-	return p.wrapConn(conn, member), nil
+	return nil, fmt.Errorf("proxy dial failed after %d attempt(s): %w", maxAttempts, lastErr)
 }
 
 func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	member, err := p.pickMember(ctx, N.NetworkUDP)
-	if err != nil {
-		return nil, err
-	}
-	p.incActive(member)
-	conn, err := member.outbound.ListenPacket(ctx, destination)
-	if err != nil {
+	maxAttempts := p.maxAttempts(ctx)
+	tried := make(map[string]struct{}, maxAttempts)
+	stickyKey := p.stickyKeyFromContext(ctx)
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		member, err := p.pickMemberExcluding(ctx, N.NetworkUDP, tried, stickyKey)
+		if err != nil {
+			if lastErr != nil {
+				return nil, fmt.Errorf("proxy packet dial failed after %d attempt(s): %w", attempt-1, lastErr)
+			}
+			return nil, err
+		}
+		p.incActive(member)
+		conn, err := member.outbound.ListenPacket(ctx, destination)
+		if err == nil {
+			p.recordSuccess(member)
+			return p.wrapPacketConn(conn, member), nil
+		}
 		p.decActive(member)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		p.recordFailure(member, err)
-		return nil, err
+		tried[member.tag] = struct{}{}
+		if stickyKey != "" {
+			p.sticky.delete(stickyKey)
+		}
+		lastErr = err
 	}
-	p.recordSuccess(member)
-	return p.wrapPacketConn(conn, member), nil
+	return nil, fmt.Errorf("proxy packet dial failed after %d attempt(s): %w", maxAttempts, lastErr)
 }
 
 func (p *poolOutbound) pickMember(ctx context.Context, network string) (*memberState, error) {
+	return p.pickMemberExcluding(ctx, network, nil, p.stickyKeyFromContext(ctx))
+}
+
+func (p *poolOutbound) pickMemberExcluding(ctx context.Context, network string, tried map[string]struct{}, stickyKey string) (*memberState, error) {
 	if !p.initialized.Load() {
 		p.mu.Lock()
 		if err := p.initializeMembersLocked(); err != nil {
@@ -438,11 +518,27 @@ func (p *poolOutbound) pickMember(ctx context.Context, network string) (*memberS
 			return nil, E.New("dedicated proxy member not found: ", dedicatedTag)
 		}
 	}
-	if member := p.selectHealthyMember(network); member != nil {
+	if stickyKey != "" && p.sticky != nil {
+		if tag, ok := p.sticky.get(stickyKey, time.Now()); ok {
+			member := p.memberByTag[tag]
+			_, wasTried := tried[tag]
+			if !wasTried && p.memberEligible(member, network) {
+				return member, nil
+			}
+			p.sticky.delete(stickyKey)
+		}
+	}
+	if member := p.selectHealthyMemberExcluding(network, tried); member != nil {
+		if stickyKey != "" && p.sticky != nil {
+			p.sticky.set(stickyKey, member.tag, time.Now())
+		}
 		return member, nil
 	}
 	if p.releaseIfAllBlacklisted() {
-		if member := p.selectHealthyMember(network); member != nil {
+		if member := p.selectHealthyMemberExcluding(network, tried); member != nil {
+			if stickyKey != "" && p.sticky != nil {
+				p.sticky.set(stickyKey, member.tag, time.Now())
+			}
 			return member, nil
 		}
 	}
@@ -450,11 +546,15 @@ func (p *poolOutbound) pickMember(ctx context.Context, network string) (*memberS
 }
 
 func (p *poolOutbound) selectHealthyMember(network string) *memberState {
+	return p.selectHealthyMemberExcluding(network, nil)
+}
+
+func (p *poolOutbound) selectHealthyMemberExcluding(network string, tried map[string]struct{}) *memberState {
 	// The event-maintained index is authoritative in steady state. The atomic
 	// check closes the tiny transition window between setting shared blacklist
 	// state and delivering its removal callback, without scanning the pool.
 	for attempt := 0; attempt < 2; attempt++ {
-		member := p.selectEligibleMember(network)
+		member := p.selectEligibleMemberExcluding(network, tried)
 		if member == nil {
 			return nil
 		}
@@ -464,6 +564,59 @@ func (p *poolOutbound) selectHealthyMember(network string) *memberState {
 		p.setMemberEligible(member, false)
 	}
 	return nil
+}
+
+func (p *poolOutbound) maxAttempts(ctx context.Context) int {
+	if !p.options.RetryEnabled || len(p.members) <= 1 {
+		return 1
+	}
+	if inbound := adapter.ContextFrom(ctx); inbound != nil && p.options.DedicatedMembers[inbound.Inbound] != "" {
+		return 1
+	}
+	attempts := p.options.RetryAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+	if attempts > len(p.members) {
+		attempts = len(p.members)
+	}
+	return attempts
+}
+
+func (p *poolOutbound) stickyKeyFromContext(ctx context.Context) string {
+	if p.sticky == nil {
+		return ""
+	}
+	metadata := adapter.ContextFrom(ctx)
+	if metadata == nil {
+		return ""
+	}
+	user := strings.TrimSpace(metadata.User)
+	source := ""
+	if metadata.Source.IsValid() {
+		source = metadata.Source.AddrString()
+	}
+	if user == "" && source == "" {
+		return ""
+	}
+	return metadata.Inbound + "|" + user + "|" + source
+}
+
+func (p *poolOutbound) memberEligible(member *memberState, network string) bool {
+	if member == nil || !supportsMemberNetwork(member, network) {
+		return false
+	}
+	if member.shared != nil && member.shared.blacklistedFast.Load() {
+		return false
+	}
+	p.eligibleMu.RLock()
+	set := &p.eligibleTCP
+	if network == N.NetworkUDP {
+		set = &p.eligibleUDP
+	}
+	_, ok := set.index[member]
+	p.eligibleMu.RUnlock()
+	return ok
 }
 
 func supportsMemberNetwork(member *memberState, network string) bool {
@@ -514,6 +667,10 @@ func (p *poolOutbound) releaseIfAllBlacklisted() bool {
 }
 
 func (p *poolOutbound) selectEligibleMember(network string) *memberState {
+	return p.selectEligibleMemberExcluding(network, nil)
+}
+
+func (p *poolOutbound) selectEligibleMemberExcluding(network string, tried map[string]struct{}) *memberState {
 	p.eligibleMu.RLock()
 	candidates := p.eligibleTCP.items
 	if network == N.NetworkUDP {
@@ -523,38 +680,136 @@ func (p *poolOutbound) selectEligibleMember(network string) *memberState {
 		p.eligibleMu.RUnlock()
 		return nil
 	}
+	eligible := func(member *memberState) bool {
+		if member == nil {
+			return false
+		}
+		_, excluded := tried[member.tag]
+		return !excluded
+	}
 	var selected *memberState
 	switch p.mode {
 	case modeRandom:
 		p.rngMu.Lock()
-		idx := p.rng.Intn(len(candidates))
+		start := p.rng.Intn(len(candidates))
 		p.rngMu.Unlock()
-		selected = candidates[idx]
+		for offset := 0; offset < len(candidates); offset++ {
+			candidate := candidates[(start+offset)%len(candidates)]
+			if eligible(candidate) {
+				selected = candidate
+				break
+			}
+		}
 	case modeBalance:
-		if len(candidates) == 1 {
-			selected = candidates[0]
-			break
-		}
-		p.rngMu.Lock()
-		firstIndex := p.rng.Intn(len(candidates))
-		secondIndex := p.rng.Intn(len(candidates) - 1)
-		p.rngMu.Unlock()
-		if secondIndex >= firstIndex {
-			secondIndex++
-		}
-		first := candidates[firstIndex]
-		second := candidates[secondIndex]
-		if activeConnections(second) < activeConnections(first) {
-			selected = second
-		} else {
-			selected = first
-		}
+		selected = p.selectBalancedCandidate(candidates, eligible)
+	case modeLatency:
+		selected = p.selectLatencyCandidate(candidates, eligible)
 	default:
-		idx := int(p.rrCounter.Add(1)-1) % len(candidates)
-		selected = candidates[idx]
+		for offset := 0; offset < len(candidates); offset++ {
+			idx := int(p.rrCounter.Add(1)-1) % len(candidates)
+			if eligible(candidates[idx]) {
+				selected = candidates[idx]
+				break
+			}
+		}
 	}
 	p.eligibleMu.RUnlock()
 	return selected
+}
+
+func (p *poolOutbound) selectBalancedCandidate(candidates []*memberState, eligible func(*memberState) bool) *memberState {
+	if len(candidates) == 0 {
+		return nil
+	}
+	var first, second *memberState
+	p.rngMu.Lock()
+	start := p.rng.Intn(len(candidates))
+	p.rngMu.Unlock()
+	for offset := 0; offset < len(candidates); offset++ {
+		candidate := candidates[(start+offset)%len(candidates)]
+		if !eligible(candidate) {
+			continue
+		}
+		if first == nil {
+			first = candidate
+			continue
+		}
+		second = candidate
+		break
+	}
+	if second == nil || activeConnections(first) <= activeConnections(second) {
+		return first
+	}
+	return second
+}
+
+// selectLatencyCandidate applies bounded power-of-k sampling instead of
+// scanning the whole inventory or sending all traffic to the single globally
+// fastest node. Candidates within the configured latency tolerance are
+// balanced by active connection count.
+func (p *poolOutbound) selectLatencyCandidate(candidates []*memberState, eligible func(*memberState) bool) *memberState {
+	if len(candidates) == 0 {
+		return nil
+	}
+	sampleSize := p.options.LatencySampleSize
+	if sampleSize < 1 {
+		sampleSize = 1
+	}
+	if sampleSize > len(candidates) {
+		sampleSize = len(candidates)
+	}
+	p.rngMu.Lock()
+	start := p.rng.Intn(len(candidates))
+	p.rngMu.Unlock()
+
+	var best *memberState
+	for visited, index := 0, start; visited < len(candidates) && sampleSize > 0; visited, index = visited+1, (index+1)%len(candidates) {
+		candidate := candidates[index]
+		if !eligible(candidate) {
+			continue
+		}
+		sampleSize--
+		if betterLatencyCandidate(candidate, best, p.options.LatencyTolerance) {
+			best = candidate
+		}
+	}
+	return best
+}
+
+func betterLatencyCandidate(candidate, current *memberState, tolerance time.Duration) bool {
+	if candidate == nil {
+		return false
+	}
+	if current == nil {
+		return true
+	}
+	candidateLatency := memberLatency(candidate)
+	currentLatency := memberLatency(current)
+	if candidateLatency <= 0 && currentLatency > 0 {
+		return false
+	}
+	if candidateLatency > 0 && currentLatency <= 0 {
+		return true
+	}
+	if candidateLatency > 0 && currentLatency > 0 {
+		if candidateLatency+tolerance < currentLatency {
+			return true
+		}
+		if currentLatency+tolerance < candidateLatency {
+			return false
+		}
+	}
+	if activeConnections(candidate) != activeConnections(current) {
+		return activeConnections(candidate) < activeConnections(current)
+	}
+	return candidateLatency > 0 && (currentLatency <= 0 || candidateLatency < currentLatency)
+}
+
+func memberLatency(member *memberState) time.Duration {
+	if member == nil || member.entry == nil {
+		return 0
+	}
+	return member.entry.LastLatency()
 }
 
 func activeConnections(member *memberState) int32 {
@@ -569,13 +824,22 @@ func (p *poolOutbound) recordFailure(member *memberState, cause error) {
 		p.logger.Warn("proxy ", member.tag, " failure (no shared state): ", cause)
 		return
 	}
-	failures, blacklisted, _ := member.shared.recordFailure(cause, p.options.FailureThreshold, p.options.BlacklistDuration)
-	if blacklisted {
-		p.logger.Warn("proxy ", member.tag, " blacklisted for ", p.options.BlacklistDuration, ": ", cause)
+	decision := member.shared.recordFailure(cause, p.options.FailureThreshold, p.options.BlacklistDuration, p.options.TransientCooldown)
+	if decision.Cooldown {
+		if p.logger != nil {
+			p.logger.Warn("proxy ", member.tag, " cooling down for ", p.options.TransientCooldown, ": ", cause)
+		}
+		log.Printf("[pool] %s cooling down for %s: %v", member.tag, p.options.TransientCooldown, cause)
+	} else if decision.Blacklisted {
+		if p.logger != nil {
+			p.logger.Warn("proxy ", member.tag, " blacklisted for ", p.options.BlacklistDuration, ": ", cause)
+		}
 		log.Printf("[pool] %s blacklisted for %s: %v", member.tag, p.options.BlacklistDuration, cause)
 	} else {
-		p.logger.Warn("proxy ", member.tag, " failure ", failures, "/", p.options.FailureThreshold, ": ", cause)
-		log.Printf("[pool] %s failure %d/%d: %v", member.tag, failures, p.options.FailureThreshold, cause)
+		if p.logger != nil {
+			p.logger.Warn("proxy ", member.tag, " failure ", decision.Failures, "/", p.options.FailureThreshold, ": ", cause)
+		}
+		log.Printf("[pool] %s failure %d/%d: %v", member.tag, decision.Failures, p.options.FailureThreshold, cause)
 	}
 }
 
@@ -583,7 +847,7 @@ func (p *poolOutbound) recordProbeFailure(member *memberState, cause error) {
 	if member.shared != nil {
 		// An explicit active probe is authoritative; exclude the node from the
 		// shared pool immediately instead of waiting for traffic failures.
-		member.shared.recordFailure(cause, 1, p.options.BlacklistDuration)
+		member.shared.recordFailure(cause, 1, p.options.BlacklistDuration, p.options.TransientCooldown)
 	} else if member.entry != nil {
 		member.entry.RecordFailure(cause)
 	}

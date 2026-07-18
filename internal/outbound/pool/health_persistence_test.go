@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -31,9 +32,9 @@ func TestHealthStatePersistsAcrossRuntimeReset(t *testing.T) {
 	entry := monitorManager.Register(monitor.NodeInfo{Tag: "stable-node", Name: "node"})
 	state := acquireSharedState("stable-node")
 	state.attachEntry(entry)
-	state.recordFailure(errors.New("first failure"), 3, time.Hour)
+	state.recordFailure(errors.New("first failure"), 3, time.Hour, time.Minute)
 	blacklistSharedMember("stable-node", time.Hour)
-	state.recordFailure(errors.New("second failure"), 3, time.Hour)
+	state.recordFailure(errors.New("second failure"), 3, time.Hour, time.Minute)
 	entry.RecordSuccessWithLatency(125 * time.Millisecond)
 	entry.MarkInitialCheckDone(false)
 	state.incActive()
@@ -126,5 +127,37 @@ func TestExpiredBlacklistIsNotRestored(t *testing.T) {
 	state.mu.Unlock()
 	if failures != 2 {
 		t.Fatalf("non-expiring failure streak was lost: %d", failures)
+	}
+}
+
+func TestTransientCooldownPersistsAcrossRestart(t *testing.T) {
+	ResetSharedStateStore()
+	resetHealthPersistenceForTest()
+	t.Cleanup(func() {
+		ResetSharedStateStore()
+		resetHealthPersistenceForTest()
+	})
+
+	path := filepath.Join(t.TempDir(), "health-state.yaml")
+	if err := ConfigureHealthPersistence(path); err != nil {
+		t.Fatal(err)
+	}
+	state := acquireSharedState("cooling")
+	decision := state.recordFailure(context.DeadlineExceeded, 3, time.Hour, 10*time.Minute)
+	if !decision.Cooldown {
+		t.Fatalf("expected cooldown decision: %#v", decision)
+	}
+	if err := PersistHealthStateNow(); err != nil {
+		t.Fatal(err)
+	}
+
+	ResetSharedStateStore()
+	resetHealthPersistenceForTest()
+	if err := ConfigureHealthPersistence(path); err != nil {
+		t.Fatal(err)
+	}
+	restored := acquireSharedState("cooling")
+	if !restored.isCoolingDown(time.Now()) || restored.isBlacklisted(time.Now()) {
+		t.Fatal("transient cooldown was not restored independently")
 	}
 }

@@ -16,13 +16,14 @@ import (
 )
 
 const (
-	healthStateVersion = 1
+	healthStateVersion = 2
 	healthWriteDelay   = 250 * time.Millisecond
 )
 
 type persistedMemberHealth struct {
 	Failures         int                          `yaml:"failures,omitempty"`
 	BlacklistedUntil time.Time                    `yaml:"blacklisted_until,omitempty"`
+	CooldownUntil    time.Time                    `yaml:"cooldown_until,omitempty"`
 	Monitor          monitor.PersistedHealthState `yaml:"monitor,omitempty"`
 	UpdatedAt        time.Time                    `yaml:"updated_at"`
 }
@@ -73,7 +74,7 @@ func ConfigureHealthPersistence(path string) error {
 			if err := yaml.Unmarshal(data, &state); err != nil {
 				return err
 			}
-			if state.Version != 0 && state.Version != healthStateVersion {
+			if state.Version != 0 && state.Version != 1 && state.Version != healthStateVersion {
 				return errors.New("unsupported health state version")
 			}
 			for tag, record := range state.Nodes {
@@ -83,6 +84,10 @@ func ConfigureHealthPersistence(path string) error {
 				if !record.BlacklistedUntil.After(time.Now()) {
 					record.BlacklistedUntil = time.Time{}
 					record.Monitor.BlacklistedUntil = time.Time{}
+				}
+				if !record.CooldownUntil.After(time.Now()) {
+					record.CooldownUntil = time.Time{}
+					record.Monitor.CooldownUntil = time.Time{}
 				}
 				records[tag] = record
 			}

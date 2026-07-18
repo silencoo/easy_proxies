@@ -15,7 +15,7 @@ func TestDedicatedDispatchAttemptsExactNodeWithoutClearingSharedBlacklist(t *tes
 	t.Cleanup(ResetSharedStateStore)
 
 	state := acquireSharedState("node-a")
-	state.recordFailure(errors.New("down"), 1, time.Hour)
+	state.recordFailure(errors.New("down"), 1, time.Hour, time.Minute)
 	member := &memberState{tag: "node-a", shared: state}
 	proxyPool := newIndexedTestPool(member, Options{
 		DedicatedMembers: map[string]string{"in-node-a": "node-a"},

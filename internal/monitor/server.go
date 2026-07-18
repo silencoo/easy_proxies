@@ -336,6 +336,9 @@ func (s *Server) handleDebug(w http.ResponseWriter, r *http.Request) {
 			"last_failure":       snap.LastFailure,
 			"last_error":         snap.LastError,
 			"blacklisted":        snap.Blacklisted,
+			"blacklisted_until":  snap.BlacklistedUntil,
+			"cooling_down":       snap.CoolingDown,
+			"cooldown_until":     snap.CooldownUntil,
 			"timeline":           snap.Timeline,
 		})
 	}

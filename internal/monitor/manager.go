@@ -58,6 +58,8 @@ type Snapshot struct {
 	SuccessCount      int64           `json:"success_count"`
 	Blacklisted       bool            `json:"blacklisted"`
 	BlacklistedUntil  time.Time       `json:"blacklisted_until"`
+	CoolingDown       bool            `json:"cooling_down"`
+	CooldownUntil     time.Time       `json:"cooldown_until"`
 	ActiveConnections int32           `json:"active_connections"`
 	LastError         string          `json:"last_error,omitempty"`
 	LastFailure       time.Time       `json:"last_failure,omitempty"`
@@ -76,6 +78,7 @@ type PersistedHealthState struct {
 	FailureCount     int           `yaml:"failure_count,omitempty"`
 	SuccessCount     int64         `yaml:"success_count,omitempty"`
 	BlacklistedUntil time.Time     `yaml:"blacklisted_until,omitempty"`
+	CooldownUntil    time.Time     `yaml:"cooldown_until,omitempty"`
 	LastError        string        `yaml:"last_error,omitempty"`
 	LastFailure      time.Time     `yaml:"last_failure,omitempty"`
 	LastSuccess      time.Time     `yaml:"last_success,omitempty"`
@@ -98,6 +101,8 @@ type entry struct {
 	timeline         []TimelineEvent
 	blacklist        bool
 	until            time.Time
+	coolingDown      bool
+	cooldownUntil    time.Time
 	lastError        string
 	lastFail         time.Time
 	lastOK           time.Time
@@ -482,6 +487,8 @@ func (e *entry) snapshot() Snapshot {
 		SuccessCount:      e.success,
 		Blacklisted:       e.blacklist,
 		BlacklistedUntil:  e.until,
+		CoolingDown:       e.coolingDown,
+		CooldownUntil:     e.cooldownUntil,
 		ActiveConnections: e.active.Load(),
 		LastError:         e.lastError,
 		LastFailure:       e.lastFail,
@@ -554,6 +561,24 @@ func (e *entry) clearBlacklist() {
 	e.mu.Unlock()
 }
 
+func (e *entry) cooldown(until time.Time) {
+	e.mu.Lock()
+	e.coolingDown = true
+	e.cooldownUntil = until
+	e.available = false
+	e.mu.Unlock()
+}
+
+func (e *entry) clearCooldown() {
+	e.mu.Lock()
+	e.coolingDown = false
+	e.cooldownUntil = time.Time{}
+	if e.initialCheckDone && !e.blacklist {
+		e.available = true
+	}
+	e.mu.Unlock()
+}
+
 func (e *entry) incActive() {
 	e.active.Add(1)
 }
@@ -604,6 +629,16 @@ func (h *EntryHandle) RecordSuccessWithLatency(latency time.Duration) {
 	h.ref.recordSuccessWithLatency(latency)
 }
 
+// LastLatency returns the most recent successful probe latency.
+func (h *EntryHandle) LastLatency() time.Duration {
+	if h == nil || h.ref == nil {
+		return 0
+	}
+	h.ref.mu.RLock()
+	defer h.ref.mu.RUnlock()
+	return h.ref.lastProbe
+}
+
 // Blacklist marks the node unavailable until the given deadline.
 func (h *EntryHandle) Blacklist(until time.Time) {
 	if h == nil || h.ref == nil {
@@ -620,6 +655,23 @@ func (h *EntryHandle) ClearBlacklist() {
 	h.ref.clearBlacklist()
 }
 
+// Cooldown marks a node temporarily unavailable without treating the fault as
+// a durable blacklist strike.
+func (h *EntryHandle) Cooldown(until time.Time) {
+	if h == nil || h.ref == nil {
+		return
+	}
+	h.ref.cooldown(until)
+}
+
+// ClearCooldown removes the transient cooldown flag.
+func (h *EntryHandle) ClearCooldown() {
+	if h == nil || h.ref == nil {
+		return
+	}
+	h.ref.clearCooldown()
+}
+
 // ExportHealthState returns the restart-safe monitor fields.
 func (h *EntryHandle) ExportHealthState() PersistedHealthState {
 	if h == nil || h.ref == nil {
@@ -632,6 +684,7 @@ func (h *EntryHandle) ExportHealthState() PersistedHealthState {
 		FailureCount:     e.failure,
 		SuccessCount:     e.success,
 		BlacklistedUntil: e.until,
+		CooldownUntil:    e.cooldownUntil,
 		LastError:        e.lastError,
 		LastFailure:      e.lastFail,
 		LastSuccess:      e.lastOK,
@@ -663,6 +716,14 @@ func (h *EntryHandle) RestoreHealthState(state PersistedHealthState) {
 	} else {
 		e.blacklist = false
 		e.until = time.Time{}
+	}
+	if state.CooldownUntil.After(time.Now()) {
+		e.coolingDown = true
+		e.cooldownUntil = state.CooldownUntil
+		e.available = false
+	} else {
+		e.coolingDown = false
+		e.cooldownUntil = time.Time{}
 	}
 	e.mu.Unlock()
 }
