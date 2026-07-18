@@ -43,6 +43,8 @@ const (
 	periodicHealthTimeout     = 10 * time.Second
 )
 
+var outboundInitializationIndexPattern = regexp.MustCompile(`initialize outbound\[(\d+)\]`)
+
 // Logger defines logging interface for the manager.
 type Logger interface {
 	Infof(format string, args ...any)
@@ -886,6 +888,31 @@ func (m *Manager) startGeoIPRouter(ctx context.Context, cfg *config.Config) {
 	m.mu.Unlock()
 }
 
+// newBoxRecover wraps box.New and converts library panics into credential-safe
+// errors. If sing-box included the outbound index before panicking, preserve
+// only that index so createBox can remove the bad node and retry. The original
+// panic payload is never returned because it may contain a subscription URI.
+func newBoxRecover(opts box.Options) (*box.Box, error) {
+	return recoverBoxInitialization(func() (*box.Box, error) {
+		return box.New(opts)
+	})
+}
+
+func recoverBoxInitialization(create func() (*box.Box, error)) (instance *box.Box, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			instance = nil
+			panicText := fmt.Sprint(recovered)
+			if match := outboundInitializationIndexPattern.FindStringSubmatch(panicText); match != nil {
+				err = fmt.Errorf("sing-box panic during initialize outbound[%s]", match[1])
+				return
+			}
+			err = errors.New("sing-box panic during initialization")
+		}
+	}()
+	return create()
+}
+
 // createBox builds a sing-box instance from config.
 // It retries automatically when individual outbounds fail sing-box validation,
 // removing the offending outbound each time.
@@ -903,8 +930,6 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*builtInst
 	}
 
 	maxRetries := len(cfg.Nodes)*3 + 50 // Dynamically scale retries to configuration size
-	outboundErrRe := regexp.MustCompile(`initialize outbound\[(\d+)\]`)
-
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		inboundRegistry := include.InboundRegistry()
 		outboundRegistry := include.OutboundRegistry()
@@ -920,7 +945,7 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*builtInst
 		// safe runtime InboundManager/OutboundManager Create calls during reload.
 		boxCtx = service.ContextWithDefaultRegistry(boxCtx)
 
-		instance, err := box.New(box.Options{Context: boxCtx, Options: opts})
+		instance, err := newBoxRecover(box.Options{Context: boxCtx, Options: opts})
 		if err == nil {
 			if attempt > 0 {
 				log.Printf("✅ sing-box instance created after removing %d invalid outbound(s)", attempt)
@@ -929,7 +954,7 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*builtInst
 		}
 
 		// Check if this is an outbound initialization error we can recover from
-		matches := outboundErrRe.FindStringSubmatch(err.Error())
+		matches := outboundInitializationIndexPattern.FindStringSubmatch(err.Error())
 		if matches == nil {
 			return nil, fmt.Errorf("create sing-box instance: %w", err)
 		}

@@ -46,9 +46,11 @@ func Build(cfg *config.Config) (option.Options, error) {
 			tag = fmt.Sprintf("%s-%d", tag, occurrence+1)
 		}
 
-		outbound, err := buildNodeOutbound(tag, node.URI, cfg.SkipCertVerify)
+		outbound, err := buildNodeOutboundSafe(tag, node.URI, cfg.SkipCertVerify)
 		if err != nil {
-			log.Printf("❌ Failed to build node '%s': %v (skipping)", node.Name, err)
+			// The stable tag is safe to expose (it is a hash), while the URI can
+			// contain passwords/tokens and must never be included in diagnostics.
+			log.Printf("❌ Failed to build node name=%q tag=%q: %v (skipping)", node.Name, tag, err)
 			failedNodes = append(failedNodes, node.Name)
 			continue
 		}
@@ -309,6 +311,26 @@ func buildNodeOutbound(tag, rawURI string, skipCertVerify bool) (option.Outbound
 	}
 }
 
+// buildNodeOutboundSafe prevents a malformed or newly introduced parser edge
+// case from taking down the complete node pool. Panic payloads are deliberately
+// not returned because third-party parsers may include the original URI (and
+// therefore credentials) in them.
+func buildNodeOutboundSafe(tag, rawURI string, skipCertVerify bool) (outbound option.Outbound, err error) {
+	return recoverNodeBuild(tag, func() (option.Outbound, error) {
+		return buildNodeOutbound(tag, rawURI, skipCertVerify)
+	})
+}
+
+func recoverNodeBuild(tag string, build func() (option.Outbound, error)) (outbound option.Outbound, err error) {
+	defer func() {
+		if recover() != nil {
+			outbound = option.Outbound{}
+			err = fmt.Errorf("node parser panicked for outbound %q", tag)
+		}
+	}()
+	return build()
+}
+
 func buildVLESSOptions(u *url.URL, skipCertVerify bool) (option.VLESSOutboundOptions, error) {
 	uuid := u.User.Username()
 	if uuid == "" {
@@ -340,7 +362,16 @@ func buildVLESSOptions(u *url.URL, skipCertVerify bool) (option.VLESSOutboundOpt
 		opts.Flow = flow
 	}
 	if packetEncoding := query.Get("packetEncoding"); packetEncoding != "" {
-		opts.PacketEncoding = &packetEncoding
+		// sing-box accepts only these two values. Older sing-box releases can
+		// panic while formatting the validation error for an unknown value, so
+		// reject it before the options reach library initialization.
+		packetEncoding = strings.ToLower(strings.TrimSpace(packetEncoding))
+		switch packetEncoding {
+		case "packetaddr", "xudp":
+			opts.PacketEncoding = &packetEncoding
+		default:
+			return option.VLESSOutboundOptions{}, errors.New("unsupported VLESS packetEncoding value")
+		}
 	}
 	if transport, err := buildV2RayTransport(query); err != nil {
 		return option.VLESSOutboundOptions{}, err
