@@ -14,6 +14,8 @@ import (
 
 	"easy_proxies/internal/config"
 	poolout "easy_proxies/internal/outbound/pool"
+	"easy_proxies/internal/ssruri"
+	"easy_proxies/internal/ssuri"
 
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
@@ -50,7 +52,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 		if err != nil {
 			// The stable tag is safe to expose (it is a hash), while the URI can
 			// contain passwords/tokens and must never be included in diagnostics.
-			log.Printf("❌ Failed to build node name=%q tag=%q: %v (skipping)", node.Name, tag, err)
+			log.Printf("❌ Failed to build node name=%q: %v (skipping)", node.Name, err)
 			failedNodes = append(failedNodes, node.Name)
 			continue
 		}
@@ -240,6 +242,14 @@ func buildPoolInbound(cfg *config.Config) (option.Inbound, error) {
 }
 
 func buildNodeOutbound(tag, rawURI string, skipCertVerify bool) (option.Outbound, error) {
+	if isShadowsocksURI(rawURI) {
+		opts, err := buildShadowsocksOptions(rawURI)
+		if err != nil {
+			return option.Outbound{}, err
+		}
+		return option.Outbound{Type: C.TypeShadowsocks, Tag: tag, Options: &opts}, nil
+	}
+
 	parsed, err := url.Parse(rawURI)
 	if err != nil {
 		normalizedURI, normalized := normalizeHysteria2PortHoppingURI(rawURI)
@@ -264,12 +274,6 @@ func buildNodeOutbound(tag, rawURI string, skipCertVerify bool) (option.Outbound
 			return option.Outbound{}, err
 		}
 		return option.Outbound{Type: C.TypeHysteria2, Tag: tag, Options: &opts}, nil
-	case "ss", "shadowsocks":
-		opts, err := buildShadowsocksOptions(parsed)
-		if err != nil {
-			return option.Outbound{}, err
-		}
-		return option.Outbound{Type: C.TypeShadowsocks, Tag: tag, Options: &opts}, nil
 	case "trojan":
 		opts, err := buildTrojanOptions(parsed, skipCertVerify)
 		if err != nil {
@@ -294,7 +298,7 @@ func buildNodeOutbound(tag, rawURI string, skipCertVerify bool) (option.Outbound
 			return option.Outbound{}, err
 		}
 		return option.Outbound{Type: C.TypeVMess, Tag: tag, Options: &opts}, nil
-	case "socks5", "socks":
+	case "socks5", "socks5h", "socks":
 		opts, err := buildSOCKSOptions(parsed)
 		if err != nil {
 			return option.Outbound{}, err
@@ -306,6 +310,18 @@ func buildNodeOutbound(tag, rawURI string, skipCertVerify bool) (option.Outbound
 			return option.Outbound{}, err
 		}
 		return option.Outbound{Type: C.TypeHTTP, Tag: tag, Options: &opts}, nil
+	case "ssr", "shadowsocksr":
+		opts, err := buildShadowsocksROptions(rawURI)
+		if err != nil {
+			return option.Outbound{}, err
+		}
+		return option.Outbound{Type: C.TypeShadowsocksR, Tag: tag, Options: &opts}, nil
+	case "hysteria":
+		opts, err := buildHysteriaOptions(parsed, skipCertVerify)
+		if err != nil {
+			return option.Outbound{}, err
+		}
+		return option.Outbound{Type: C.TypeHysteria, Tag: tag, Options: &opts}, nil
 	default:
 		return option.Outbound{}, fmt.Errorf("unsupported scheme %q", parsed.Scheme)
 	}
@@ -316,19 +332,53 @@ func buildNodeOutbound(tag, rawURI string, skipCertVerify bool) (option.Outbound
 // not returned because third-party parsers may include the original URI (and
 // therefore credentials) in them.
 func buildNodeOutboundSafe(tag, rawURI string, skipCertVerify bool) (outbound option.Outbound, err error) {
-	return recoverNodeBuild(tag, func() (option.Outbound, error) {
+	outbound, err = recoverNodeBuild(func() (option.Outbound, error) {
 		return buildNodeOutbound(tag, rawURI, skipCertVerify)
 	})
+	if err != nil {
+		return option.Outbound{}, fmt.Errorf("outbound %q: %s", tag, credentialSafeBuildError(rawURI, err))
+	}
+	return outbound, nil
 }
 
-func recoverNodeBuild(tag string, build func() (option.Outbound, error)) (outbound option.Outbound, err error) {
+func recoverNodeBuild(build func() (option.Outbound, error)) (outbound option.Outbound, err error) {
 	defer func() {
 		if recover() != nil {
 			outbound = option.Outbound{}
-			err = fmt.Errorf("node parser panicked for outbound %q", tag)
+			err = errors.New("node parser panicked")
 		}
 	}()
 	return build()
+}
+
+func credentialSafeBuildError(rawURI string, err error) string {
+	message := err.Error()
+	redactions := []string{rawURI}
+	if parsed, parseErr := url.Parse(rawURI); parseErr == nil {
+		if parsed.User != nil {
+			redactions = append(redactions, parsed.User.String(), parsed.User.Username())
+			if password, ok := parsed.User.Password(); ok {
+				redactions = append(redactions, password)
+			}
+		}
+		for _, key := range []string{"password", "passwd", "pass", "auth", "token", "uuid", "id", "psk"} {
+			redactions = append(redactions, parsed.Query()[key]...)
+		}
+	}
+	for _, secret := range redactions {
+		if secret == "" {
+			continue
+		}
+		message = strings.ReplaceAll(message, secret, "<redacted>")
+		message = strings.ReplaceAll(message, url.QueryEscape(secret), "<redacted>")
+		message = strings.ReplaceAll(message, url.PathEscape(secret), "<redacted>")
+	}
+	message = strings.ReplaceAll(message, "\r", " ")
+	message = strings.ReplaceAll(message, "\n", " ")
+	if len(message) > 512 {
+		message = message[:512] + "..."
+	}
+	return message
 }
 
 func buildVLESSOptions(u *url.URL, skipCertVerify bool) (option.VLESSOutboundOptions, error) {
@@ -564,45 +614,148 @@ func buildV2RayTransport(query url.Values) (*option.V2RayTransportOptions, error
 	return options, nil
 }
 
-func buildShadowsocksOptions(u *url.URL) (option.ShadowsocksOutboundOptions, error) {
-	server, port, err := hostPort(u, 8388)
+func buildShadowsocksOptions(rawURI string) (option.ShadowsocksOutboundOptions, error) {
+	parsed, err := ssuri.Parse(rawURI)
 	if err != nil {
 		return option.ShadowsocksOutboundOptions{}, err
 	}
 
-	// Decode userinfo (base64 encoded method:password)
-	userInfo := u.User.String()
-	decoded, err := base64.RawURLEncoding.DecodeString(userInfo)
-	if err != nil {
-		// Try standard base64
-		decoded, err = base64.StdEncoding.DecodeString(userInfo)
-		if err != nil {
-			return option.ShadowsocksOutboundOptions{}, fmt.Errorf("decode shadowsocks userinfo: %w", err)
-		}
-	}
-
-	parts := strings.SplitN(string(decoded), ":", 2)
-	if len(parts) != 2 {
-		return option.ShadowsocksOutboundOptions{}, errors.New("shadowsocks userinfo format must be method:password")
-	}
-
-	method := normalizeShadowsocksMethod(parts[0])
-	password := parts[1]
-
 	opts := option.ShadowsocksOutboundOptions{
-		ServerOptions: option.ServerOptions{Server: server, ServerPort: uint16(port)},
-		Method:        method,
-		Password:      password,
+		ServerOptions: option.ServerOptions{Server: parsed.Server, ServerPort: uint16(parsed.Port)},
+		Method:        normalizeShadowsocksMethod(parsed.Method),
+		Password:      parsed.Password,
 	}
 
-	query := u.Query()
-	if plugin := query.Get("plugin"); plugin != "" {
+	if parsed.Query.Get("plugin") != "" {
 		// sing-box library mode doesn't support external plugins like v2ray-plugin
 		// These require the plugin binary to be installed separately
-		return option.ShadowsocksOutboundOptions{}, fmt.Errorf("shadowsocks plugin not supported: %s (requires external binary)", plugin)
+		return option.ShadowsocksOutboundOptions{}, errors.New("Shadowsocks plugin is not supported in library mode")
 	}
 
 	return opts, nil
+}
+
+func isShadowsocksURI(rawURI string) bool {
+	lower := strings.ToLower(strings.TrimSpace(rawURI))
+	return strings.HasPrefix(lower, "ss://") || strings.HasPrefix(lower, "shadowsocks://")
+}
+
+func buildShadowsocksROptions(rawURI string) (option.ShadowsocksROutboundOptions, error) {
+	parsed, err := ssruri.Parse(rawURI)
+	if err != nil {
+		return option.ShadowsocksROutboundOptions{}, err
+	}
+	return option.ShadowsocksROutboundOptions{
+		ServerOptions: option.ServerOptions{Server: parsed.Server, ServerPort: uint16(parsed.Port)},
+		Method:        parsed.Method,
+		Password:      parsed.Password,
+		Protocol:      parsed.Protocol,
+		ProtocolParam: parsed.ProtocolParam,
+		Obfs:          parsed.Obfs,
+		ObfsParam:     parsed.ObfsParam,
+	}, nil
+}
+
+func buildHysteriaOptions(u *url.URL, skipCertVerify bool) (option.HysteriaOutboundOptions, error) {
+	server, port, err := hostPort(u, 443)
+	if err != nil {
+		return option.HysteriaOutboundOptions{}, err
+	}
+	query := u.Query()
+	opts := option.HysteriaOutboundOptions{
+		ServerOptions: option.ServerOptions{Server: server, ServerPort: uint16(port)},
+	}
+
+	opts.AuthString = firstQueryValue(query, "auth", "auth_str", "auth-str")
+	if opts.AuthString == "" && u.User != nil {
+		opts.AuthString = u.User.Username()
+		if password, ok := u.User.Password(); ok {
+			opts.AuthString += ":" + password
+		}
+	}
+	if opts.UpMbps, err = positiveIntQuery(query, "upmbps", "up_mbps", "up"); err != nil {
+		return option.HysteriaOutboundOptions{}, fmt.Errorf("invalid Hysteria upload bandwidth: %w", err)
+	}
+	if opts.DownMbps, err = positiveIntQuery(query, "downmbps", "down_mbps", "down"); err != nil {
+		return option.HysteriaOutboundOptions{}, fmt.Errorf("invalid Hysteria download bandwidth: %w", err)
+	}
+	if opts.ReceiveWindow, err = uintQuery(query, "recv_window", "recv-window"); err != nil {
+		return option.HysteriaOutboundOptions{}, fmt.Errorf("invalid Hysteria receive window: %w", err)
+	}
+	if opts.ReceiveWindowConn, err = uintQuery(query, "recv_window_conn", "recv-window-conn"); err != nil {
+		return option.HysteriaOutboundOptions{}, fmt.Errorf("invalid Hysteria connection receive window: %w", err)
+	}
+	opts.DisableMTUDiscovery = boolQuery(query, "disable_mtu_discovery", "disable-mtu-discovery")
+
+	if obfsParam := firstQueryValue(query, "obfsParam", "obfsparam", "obfs-password"); obfsParam != "" {
+		opts.Obfs = obfsParam
+	} else {
+		opts.Obfs = query.Get("obfs")
+	}
+
+	tlsOptions := &option.OutboundTLSOptions{Enabled: true, ServerName: server, Insecure: skipCertVerify}
+	if serverName := firstQueryValue(query, "peer", "sni"); serverName != "" {
+		tlsOptions.ServerName = serverName
+	}
+	if boolQuery(query, "insecure", "allowInsecure") {
+		tlsOptions.Insecure = true
+	}
+	if alpn := splitNonEmpty(query.Get("alpn")); len(alpn) > 0 {
+		tlsOptions.ALPN = badoption.Listable[string](alpn)
+	}
+	opts.OutboundTLSOptionsContainer = option.OutboundTLSOptionsContainer{TLS: tlsOptions}
+	return opts, nil
+}
+
+func firstQueryValue(query url.Values, keys ...string) string {
+	for _, key := range keys {
+		if value := query.Get(key); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func positiveIntQuery(query url.Values, keys ...string) (int, error) {
+	value := strings.TrimSpace(firstQueryValue(query, keys...))
+	if value == "" {
+		return 0, nil
+	}
+	lower := strings.ToLower(value)
+	lower = strings.TrimSpace(strings.TrimSuffix(lower, "mbps"))
+	parsed, err := strconv.Atoi(lower)
+	if err != nil || parsed < 0 {
+		return 0, errors.New("expected a non-negative integer")
+	}
+	return parsed, nil
+}
+
+func uintQuery(query url.Values, keys ...string) (uint64, error) {
+	value := strings.TrimSpace(firstQueryValue(query, keys...))
+	if value == "" {
+		return 0, nil
+	}
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return 0, errors.New("expected a non-negative integer")
+	}
+	return parsed, nil
+}
+
+func boolQuery(query url.Values, keys ...string) bool {
+	value := strings.TrimSpace(firstQueryValue(query, keys...))
+	return value == "1" || strings.EqualFold(value, "true") || strings.EqualFold(value, "yes")
+}
+
+func splitNonEmpty(value string) []string {
+	parts := strings.Split(value, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			result = append(result, part)
+		}
+	}
+	return result
 }
 
 func buildTrojanOptions(u *url.URL, skipCertVerify bool) (option.TrojanOutboundOptions, error) {

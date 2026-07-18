@@ -15,6 +15,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"easy_proxies/internal/ssruri"
 
 	"gopkg.in/yaml.v3"
 )
@@ -235,10 +238,11 @@ func Load(path string) (*Config, error) {
 // For vmess:// URIs, it base64-decodes the payload and extracts the "ps" field.
 func ExtractNodeName(uri string) string {
 	uri = strings.TrimSpace(uri)
+	lowerURI := strings.ToLower(uri)
 
 	// Handle vmess:// specially - it's base64-encoded JSON, not a standard URL
-	if strings.HasPrefix(uri, "vmess://") {
-		payload := strings.TrimPrefix(uri, "vmess://")
+	if strings.HasPrefix(lowerURI, "vmess://") {
+		payload := uri[len("vmess://"):]
 		// Remove any fragment that might be appended
 		if idx := strings.Index(payload, "#"); idx != -1 {
 			payload = payload[:idx]
@@ -261,6 +265,12 @@ func ExtractNodeName(uri string) string {
 			if json.Unmarshal(decoded, &vmess) == nil && vmess.PS != "" {
 				return strings.TrimSpace(vmess.PS)
 			}
+		}
+		return ""
+	}
+	if strings.HasPrefix(lowerURI, "ssr://") || strings.HasPrefix(lowerURI, "shadowsocksr://") {
+		if parsed, err := ssruri.Parse(uri); err == nil {
+			return strings.TrimSpace(parsed.Remarks)
 		}
 		return ""
 	}
@@ -1030,27 +1040,23 @@ func loadNodesFromFile(path string) ([]NodeConfig, error) {
 func parseSubscriptionContent(content string) ([]NodeConfig, error) {
 	content = strings.TrimSpace(content)
 
-	// Quick check for YAML format (check first 16384 chars for "proxies:")
-	sampleSize := 16384
-	if len(content) < sampleSize {
-		sampleSize = len(content)
-	}
-	if strings.Contains(content[:sampleSize], "proxies:") {
+	// Detect only a top-level Clash proxies key. A substring search misclassifies
+	// ordinary links whose name/query happens to contain "proxies:".
+	if isLikelyClashYAML(content) {
 		return parseClashYAML(content)
 	}
 
 	// Check if it's base64 encoded (common for v2ray subscriptions)
 	if isBase64(content) {
-		decoded, err := base64.StdEncoding.DecodeString(content)
-		if err != nil {
-			// Try URL-safe base64
-			decoded, err = base64.RawStdEncoding.DecodeString(content)
-			if err != nil {
-				// Not base64, try as plain text
-				return parseNodesFromContent(content)
+		if decoded, ok := decodeSubscriptionBase64(content); ok && utf8.Valid(decoded) {
+			decodedContent := strings.TrimSpace(string(decoded))
+			if isLikelyClashYAML(decodedContent) {
+				return parseClashYAML(decodedContent)
+			}
+			if decodedNodes, err := parseNodesFromContent(decodedContent); err == nil && len(decodedNodes) > 0 {
+				return decodedNodes, nil
 			}
 		}
-		content = string(decoded)
 	}
 
 	// Parse as plain text (one URI per line)
@@ -1089,38 +1095,55 @@ func parseNodesFromContent(content string) ([]NodeConfig, error) {
 
 // isBase64 checks if a string looks like base64 encoded content (optimized version)
 func isBase64(s string) bool {
-	// Remove whitespace
 	s = strings.TrimSpace(s)
 	if len(s) == 0 {
 		return false
 	}
-
-	// Remove newlines for checking
-	s = strings.ReplaceAll(s, "\n", "")
-	s = strings.ReplaceAll(s, "\r", "")
-
-	// Quick check: if it contains proxy URI schemes, it's not base64
 	if strings.Contains(s, "://") {
 		return false
 	}
+	_, ok := decodeSubscriptionBase64(s)
+	return ok
+}
 
-	// Check character set - base64 only contains A-Za-z0-9+/=
-	// This is much faster than trying to decode
-	for _, c := range s {
-		if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-			(c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=') {
-			return false
+func decodeSubscriptionBase64(content string) ([]byte, bool) {
+	content = strings.Join(strings.Fields(content), "")
+	if content == "" {
+		return nil, false
+	}
+	for _, encoding := range []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	} {
+		if decoded, err := encoding.DecodeString(content); err == nil {
+			return decoded, true
 		}
 	}
+	return nil, false
+}
 
-	// Length must be multiple of 4 (with padding)
-	return len(s)%4 == 0
+func isLikelyClashYAML(content string) bool {
+	content = strings.TrimPrefix(content, "\ufeff")
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		if line == "" || line[0] == ' ' || line[0] == '\t' {
+			continue
+		}
+		if !strings.HasPrefix(line, "proxies:") {
+			continue
+		}
+		remainder := strings.TrimSpace(strings.TrimPrefix(line, "proxies:"))
+		return remainder == "" || strings.HasPrefix(remainder, "[")
+	}
+	return false
 }
 
 // IsProxyURI checks if a string is a valid proxy URI
 func IsProxyURI(s string) bool {
-	schemes := []string{"vmess://", "vless://", "trojan://", "ss://", "ssr://", "hysteria://", "hysteria2://", "hy2://", "tuic://", "socks5://", "socks://", "http://", "https://", "anytls://"}
-	lower := strings.ToLower(s)
+	schemes := []string{"vmess://", "vless://", "trojan://", "ss://", "shadowsocks://", "ssr://", "shadowsocksr://", "hysteria://", "hysteria2://", "hy2://", "tuic://", "socks5://", "socks5h://", "socks://", "http://", "https://", "anytls://"}
+	lower := strings.ToLower(strings.TrimSpace(s))
 	for _, scheme := range schemes {
 		if strings.HasPrefix(lower, scheme) {
 			return true
@@ -1152,7 +1175,7 @@ func (fi *flexInt) UnmarshalYAML(unmarshal func(interface{}) error) error {
 }
 
 type clashConfig struct {
-	Proxies []clashProxy `yaml:"proxies"`
+	Proxies []yaml.Node `yaml:"proxies"`
 }
 
 type clashProxy struct {
@@ -1184,6 +1207,19 @@ type clashProxy struct {
 	ALPN                 []string `yaml:"alpn"`
 	CongestionController string   `yaml:"congestion-controller"`
 	UDPRelayMode         string   `yaml:"udp-relay-mode"`
+	// ShadowsocksR-specific fields
+	Protocol      string `yaml:"protocol"`
+	ProtocolParam string `yaml:"protocol-param"`
+	ObfsParam     string `yaml:"obfs-param"`
+	// Hysteria v1-specific fields
+	AuthStr             string  `yaml:"auth-str"`
+	Auth                string  `yaml:"auth"`
+	UpMbps              flexInt `yaml:"up"`
+	DownMbps            flexInt `yaml:"down"`
+	PeerSNI             string  `yaml:"peer"`
+	RecvWindow          uint64  `yaml:"recv-window"`
+	RecvWindowConn      uint64  `yaml:"recv-window-conn"`
+	DisableMTUDiscovery bool    `yaml:"disable-mtu-discovery"`
 }
 
 type clashWSOptions struct {
@@ -1208,14 +1244,24 @@ func parseClashYAML(content string) ([]NodeConfig, error) {
 	}
 
 	var nodes []NodeConfig
-	for _, proxy := range clash.Proxies {
-		uri := convertClashProxyToURI(proxy)
-		if uri != "" {
-			nodes = append(nodes, NodeConfig{
-				Name: proxy.Name,
-				URI:  uri,
-			})
+	skipped := 0
+	for index, rawProxy := range clash.Proxies {
+		var proxy clashProxy
+		if err := rawProxy.Decode(&proxy); err != nil {
+			skipped++
+			log.Printf("[subscription] WARN: skip Clash proxy #%d (malformed fields)", index)
+			continue
 		}
+		uri := convertClashProxyToURI(proxy)
+		if uri == "" {
+			skipped++
+			log.Printf("[subscription] WARN: skip Clash proxy #%d name=%q type=%q", index, proxy.Name, proxy.Type)
+			continue
+		}
+		nodes = append(nodes, NodeConfig{Name: proxy.Name, URI: uri})
+	}
+	if skipped > 0 {
+		log.Printf("[subscription] parsed %d Clash nodes and skipped %d malformed/unsupported entries", len(nodes), skipped)
 	}
 
 	return nodes, nil
@@ -1238,6 +1284,10 @@ func convertClashProxyToURI(p clashProxy) string {
 		return buildHysteria2URI(p)
 	case "tuic":
 		return buildTUICURI(p)
+	case "ssr", "shadowsocksr":
+		return buildShadowsocksRURI(p)
+	case "hysteria":
+		return buildHysteriaURI(p)
 	default:
 		return ""
 	}
@@ -1472,6 +1522,100 @@ func buildTUICURI(p clashProxy) string {
 
 	// TUIC URI format: tuic://uuid:password@server:port?params#name
 	return fmt.Sprintf("tuic://%s:%s@%s:%d%s#%s", p.UUID, p.Password, p.Server, int(p.Port), query, url.QueryEscape(p.Name))
+}
+
+func buildShadowsocksRURI(p clashProxy) string {
+	port := int(p.Port)
+	if strings.TrimSpace(p.Server) == "" || port < 1 || port > 65535 || p.Password == "" {
+		return ""
+	}
+	host := strings.TrimSpace(p.Server)
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		host = "[" + host + "]"
+	}
+	password := base64.RawURLEncoding.EncodeToString([]byte(p.Password))
+	main := fmt.Sprintf("%s:%d:%s:%s:%s:%s",
+		host,
+		port,
+		defaultString(p.Protocol, "origin"),
+		defaultString(p.Cipher, "none"),
+		defaultString(p.Obfs, "plain"),
+		password,
+	)
+	params := url.Values{}
+	if p.ObfsParam != "" {
+		params.Set("obfsparam", base64.RawURLEncoding.EncodeToString([]byte(p.ObfsParam)))
+	}
+	if p.ProtocolParam != "" {
+		params.Set("protoparam", base64.RawURLEncoding.EncodeToString([]byte(p.ProtocolParam)))
+	}
+	if p.Name != "" {
+		params.Set("remarks", base64.RawURLEncoding.EncodeToString([]byte(p.Name)))
+	}
+	if len(params) > 0 {
+		main += "/?" + params.Encode()
+	}
+	return "ssr://" + base64.RawURLEncoding.EncodeToString([]byte(main))
+}
+
+func buildHysteriaURI(p clashProxy) string {
+	port := int(p.Port)
+	if strings.TrimSpace(p.Server) == "" || port < 1 || port > 65535 {
+		return ""
+	}
+	params := url.Values{}
+	params.Set("protocol", "udp")
+	auth := firstNonEmpty(p.AuthStr, p.Auth, p.Password)
+	if auth != "" {
+		params.Set("auth", auth)
+	}
+	if peer := firstNonEmpty(p.ServerName, p.SNI, p.PeerSNI); peer != "" {
+		params.Set("peer", peer)
+	}
+	if p.SkipCertVerify {
+		params.Set("insecure", "1")
+	}
+	if p.UpMbps > 0 {
+		params.Set("upmbps", strconv.Itoa(int(p.UpMbps)))
+	}
+	if p.DownMbps > 0 {
+		params.Set("downmbps", strconv.Itoa(int(p.DownMbps)))
+	}
+	if len(p.ALPN) > 0 {
+		params.Set("alpn", strings.Join(p.ALPN, ","))
+	}
+	if p.Obfs != "" {
+		params.Set("obfs", p.Obfs)
+		if p.ObfsPassword != "" {
+			params.Set("obfsParam", p.ObfsPassword)
+		}
+	}
+	if p.RecvWindow > 0 {
+		params.Set("recv_window", strconv.FormatUint(p.RecvWindow, 10))
+	}
+	if p.RecvWindowConn > 0 {
+		params.Set("recv_window_conn", strconv.FormatUint(p.RecvWindowConn, 10))
+	}
+	if p.DisableMTUDiscovery {
+		params.Set("disable_mtu_discovery", "1")
+	}
+	return "hysteria://" + net.JoinHostPort(strings.TrimSpace(p.Server), strconv.Itoa(port)) + "?" + params.Encode() + "#" + url.PathEscape(p.Name)
+}
+
+func defaultString(value, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // FilePath returns the config file path.

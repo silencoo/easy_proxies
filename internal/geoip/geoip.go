@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/ssruri"
+	"easy_proxies/internal/ssuri"
 
 	"github.com/oschwald/geoip2-golang"
 )
@@ -556,13 +558,13 @@ func extractHostFromURI(uri string) string {
 		return extractVMessHost(uri)
 	}
 
-	// Shadowsocks: ss://base64(method:password)@host:port#name
-	if strings.HasPrefix(lowerURI, "ss://") {
+	// Shadowsocks: SIP002 and legacy whole-payload base64 formats.
+	if strings.HasPrefix(lowerURI, "ss://") || strings.HasPrefix(lowerURI, "shadowsocks://") {
 		return extractSSHost(uri)
 	}
 
 	// SSR: base64 encoded
-	if strings.HasPrefix(lowerURI, "ssr://") {
+	if strings.HasPrefix(lowerURI, "ssr://") || strings.HasPrefix(lowerURI, "shadowsocksr://") {
 		return extractSSRHost(uri)
 	}
 
@@ -571,7 +573,7 @@ func extractHostFromURI(uri string) string {
 		"vless://", "trojan://",
 		"hysteria://", "hysteria2://", "hy2://",
 		"anytls://", "tuic://",
-		"socks5://", "socks://",
+		"socks5://", "socks5h://", "socks://",
 		"http://", "https://",
 	}
 	for _, scheme := range standardSchemes {
@@ -638,30 +640,19 @@ func extractVMessHost(uri string) string {
 }
 
 func extractSSHost(uri string) string {
-	// Remove ss:// prefix
-	content := strings.TrimPrefix(uri, "ss://")
-
-	// Remove fragment (#name)
-	if idx := strings.Index(content, "#"); idx != -1 {
-		content = content[:idx]
+	parsed, err := ssuri.Parse(uri)
+	if err != nil {
+		return ""
 	}
-
-	// Check if it's the new format: base64@host:port
-	if atIdx := strings.LastIndex(content, "@"); atIdx != -1 {
-		hostPort := content[atIdx+1:]
-		if colonIdx := strings.LastIndex(hostPort, ":"); colonIdx != -1 {
-			return hostPort[:colonIdx]
-		}
-		return hostPort
-	}
-
-	// Old format: entire content is base64
-	return ""
+	return parsed.Server
 }
 
 func extractSSRHost(uri string) string {
-	// SSR is complex, skip for now - will be marked as "other"
-	return ""
+	parsed, err := ssruri.Parse(uri)
+	if err != nil {
+		return ""
+	}
+	return parsed.Server
 }
 
 // isoCodeToRegion maps ISO country codes to our region codes

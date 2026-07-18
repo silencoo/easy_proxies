@@ -52,16 +52,30 @@ func TestBuildNodeOutboundRejectsInvalidVLESSPacketEncodingWithoutCredentialLeak
 }
 
 func TestBuildNodeOutboundSafeConvertsPanicWithoutPayloadLeak(t *testing.T) {
-	_, err := recoverNodeBuild("outbound-safe", func() (option.Outbound, error) {
+	_, err := recoverNodeBuild(func() (option.Outbound, error) {
 		panic("socks5://user:top-secret@example.com:1080")
 	})
 	if err == nil {
 		t.Fatal("expected recovered error")
 	}
-	if !strings.Contains(err.Error(), "outbound-safe") {
-		t.Fatalf("error lacks node context: %q", err)
+	if err.Error() != "node parser panicked" {
+		t.Fatalf("unexpected error: %q", err)
 	}
 	if strings.Contains(err.Error(), "top-secret") {
 		t.Fatalf("error leaked panic payload: %q", err)
+	}
+}
+
+func TestBuildNodeOutboundSafeRedactsMalformedURI(t *testing.T) {
+	const secret = "password-must-not-leak"
+	_, err := buildNodeOutboundSafe("safe-node-tag", "socks5://user:"+secret+"@example.com%zz:1080", false)
+	if err == nil {
+		t.Fatal("expected malformed URI error")
+	}
+	if !strings.Contains(err.Error(), "safe-node-tag") {
+		t.Fatalf("error lacks node context: %q", err)
+	}
+	if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "socks5://") {
+		t.Fatalf("error leaked URI credentials: %q", err)
 	}
 }
