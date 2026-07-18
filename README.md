@@ -7,7 +7,7 @@
 ## Features
 
 - **Three runtime modes**: `pool` (single-port load balancing), `multi-port` (one port per node), and `hybrid` (both simultaneously)
-- **Wide protocol support**: VLESS, VMess, Trojan, Shadowsocks, Hysteria2, TUIC, AnyTLS, SOCKS5, HTTP/HTTPS
+- **Wide protocol support**: VLESS, VMess, Trojan, Shadowsocks, ShadowsocksR, Hysteria v1/v2, TUIC, AnyTLS, SOCKS5/SOCKS5H, HTTP/HTTPS
 - **Automatic health checking** with configurable failure thresholds and blacklist duration, plus manual blacklist/release from the dashboard
 - **GeoIP region routing**: classify nodes by country and route traffic through a specific region via a dedicated HTTP proxy endpoint
 - **Multiple node sources**: inline config, `nodes.txt` file, or subscription URLs (Base64, plain text, Clash YAML)
@@ -72,6 +72,9 @@ Pool failure streaks, active blacklist deadlines, and the latest health/latency 
 | `sequential` | Round-robin through healthy nodes |
 | `random` | Random node selection |
 | `balance` | O(1) power-of-two-choices balancing using active connection counts |
+| `latency` | Samples a bounded set, then balances connections among nodes inside the configured latency tolerance |
+
+Transient network failures use a short cooldown instead of immediately increasing the long-term blacklist streak. The unified pool can retry a different node after a failed dial and can optionally keep bounded, expiring session affinity. Dedicated per-node ports never retry through another node.
 
 ### Minimal Config Example
 
@@ -85,7 +88,7 @@ listener:
   password: pass
 
 pool:
-  mode: sequential    # sequential / random / balance
+  mode: sequential    # sequential / random / balance / latency
   failure_threshold: 3
   blacklist_duration: 24h
 
@@ -252,11 +255,13 @@ resp, err := client.Get("http://example.com")
 | VLESS | `vless://` | TCP, WS, HTTP/2, gRPC, HTTPUpgrade; TLS/Reality/uTLS |
 | VMess | `vmess://` | WS, HTTP/2, gRPC, HTTPUpgrade; TLS/uTLS |
 | Trojan | `trojan://` | WS, HTTP/2, gRPC, HTTPUpgrade; TLS/Reality/uTLS |
-| Shadowsocks | `ss://` | Direct; SIP002 format |
+| Shadowsocks | `ss://`, `shadowsocks://` | SIP002, legacy whole-payload Base64, plaintext-compatible forms; external plugins are rejected |
+| ShadowsocksR | `ssr://`, `shadowsocksr://` | Protocol/obfuscation parameters and Unicode metadata |
+| Hysteria | `hysteria://` | QUIC; auth, bandwidth, obfuscation, TLS/SNI, ALPN, windows and MTU |
 | Hysteria2 | `hysteria2://`, `hy2://` | QUIC-based |
 | TUIC | `tuic://` | QUIC-based |
 | AnyTLS | `anytls://` | TLS |
-| SOCKS5 | `socks5://`, `socks://` | Direct |
+| SOCKS5 | `socks5://`, `socks5h://`, `socks://` | Direct; `socks5h` is accepted for subscription compatibility |
 | HTTP | `http://`, `https://` | Direct |
 
 ## Node Sources

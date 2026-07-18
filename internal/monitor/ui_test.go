@@ -106,3 +106,21 @@ func TestEmbeddedWebUIExposesAdaptivePoolSettings(t *testing.T) {
 		}
 	}
 }
+
+func TestEmbeddedWebUIExposesInputConcurrencySettings(t *testing.T) {
+	data, err := embeddedFS.ReadFile("assets/index.html")
+	if err != nil {
+		t.Fatalf("read embedded WebUI: %v", err)
+	}
+	html := string(data)
+	for _, value := range []string{
+		`id="settingProbeConcurrency"`,
+		`id="settingSubFetchConcurrency"`,
+		`fetch_concurrency: subFetchConcurrency`,
+		`'订阅抓取并发数': 'Subscription fetch concurrency'`,
+	} {
+		if !strings.Contains(html, value) {
+			t.Errorf("embedded WebUI is missing %q", value)
+		}
+	}
+}

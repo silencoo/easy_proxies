@@ -175,10 +175,14 @@ nodes:
 # - VLESS:    vless://uuid@server:port?params#name
 # - Trojan:   trojan://password@server:port?params#name
 # - SS:       ss://method:password@server:port#name
-#             ss://base64(method:password)@server:port#name
+#             ss://base64(method:password)@server:port#name（也兼容旧式整段 Base64）
+# - SSR:      ssr://base64(server:port:protocol:method:obfs:password/...)
+# - Hysteria: hysteria://server:port?auth=...&upmbps=...&downmbps=...#name
 # - Hysteria2: hy2://password@server:port?params#name
-# - SOCKS5:  socks5://[user:pass@]server:port#name
+# - TUIC:     tuic://uuid:password@server:port?params#name
+# - AnyTLS:   anytls://password@server:port?params#name
+# - SOCKS5:   socks5://[user:pass@]server:port#name
+#             socks5h://[user:pass@]server:port#name
 # - HTTP:    http://[user:pass@]server:port#name
 #            https://[user:pass@]server:port#name
-# 注意：解析器可识别部分额外协议前缀（如 ssr://、hysteria://），
-# 但当前内核实际构建仅支持以上 7 类，其他会被跳过并输出日志。
+# 注意：Shadowsocks 外部 plugin 暂不支持；单个错误节点会被隔离跳过。

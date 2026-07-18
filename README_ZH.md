@@ -9,7 +9,7 @@ Easy Proxies 是一个基于 sing-box 的代理池管理工具。
 ## 当前能力
 
 - 运行模式：`pool`、`multi-port`、`hybrid`。
-- 实际构建的上游协议：`vmess`、`vless`、`trojan`、`ss/shadowsocks`、`hysteria2/hy2`、`socks5/socks`、`http/https`、`anytls`、`tuic`。
+- 实际构建的上游协议：`vmess`、`vless`、`trojan`、`ss/shadowsocks`、`ssr/shadowsocksr`、`hysteria`、`hysteria2/hy2`、`socks5/socks5h/socks`、`http/https`、`anytls`、`tuic`。
 - 节点来源：
   - `config.yaml` 的 `nodes`
   - `nodes_file`（每行一个 URI）
@@ -67,7 +67,7 @@ listener:
   password: pass
 
 pool:
-  mode: sequential    # sequential / random / balance
+  mode: sequential    # sequential / random / balance / latency
   failure_threshold: 3
   blacklist_duration: 24h
 
@@ -118,6 +118,8 @@ dns:
 
 多端口模式会把节点规范化 URI 的哈希与端口持久化到配置目录下的 `port-map.yaml`。订阅改名、重排或进程重启不会改变已有节点端口；节点删除后，端口默认保留 24 小时再允许其他节点复用。可通过 `multi_port.port_map_file` 和 `multi_port.port_reuse_delay` 调整。
 
+Pool 支持 `sequential`、`random`、`balance` 和有界采样的 `latency` 调度。短暂网络故障会进入独立冷却，不会立即累加长期拉黑计数；统一入口可以在拨号失败时切换其他节点重试，并可选启用有容量和 TTL 的会话保持。每节点独立端口始终只使用对应节点。
+
 ## 节点来源行为
 
 - 配置了 `subscriptions` 时：
@@ -136,13 +138,15 @@ dns:
 - `vless`
 - `trojan`
 - `ss` / `shadowsocks`
+- `ssr` / `shadowsocksr`
+- `hysteria`
 - `hysteria2` / `hy2`
-- `socks5` / `socks`
+- `socks5` / `socks5h` / `socks`
 - `http` / `https`
 - `anytls`
 - `tuic`
 
-订阅解析阶段可能识别到更多 URI 前缀（兼容输入），但不在上述列表中的协议会在构建阶段被跳过。
+Shadowsocks 支持 SIP002、旧式整段 Base64 和明文兼容形式，但不支持外部 plugin。单个格式错误的节点只会被跳过，不会让整批订阅节点加载失败。
 
 ## 管理 API（核心）
 

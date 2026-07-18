@@ -964,6 +964,10 @@
                       <option value="24h">24 小时</option>
                     </select>
                   </div>
+                  <div class="form-group">
+                    <label for="settingSubFetchConcurrency">订阅抓取并发数</label>
+                    <input type="number" id="settingSubFetchConcurrency" class="setting-input" min="1" max="32" placeholder="16" />
+                  </div>
                 </div>
                 <div class="form-group" style="margin-top: 12px;">
                   <label for="settingSubURLs">订阅链接 (每行一个 URL)</label>
@@ -972,7 +976,7 @@
                     <button type="button" class="sensitive-toggle" aria-label="显示敏感信息" title="显示敏感信息" aria-pressed="false" onclick="toggleSensitiveField('settingSubURLs', this)"><svg class="icon"><use href="#i-eye"></use></svg></button>
                   </div>
                 </div>
-                <div style="font-size: 11px; color: var(--success); margin-top: 8px;">订阅配置变更保存后立即生效</div>
+                <div style="font-size: 11px; color: var(--success); margin-top: 8px;">订阅配置变更保存后立即生效；并发数作用于订阅链接抓取，最大 32</div>
               </div>
             </div>
 
@@ -1220,6 +1224,7 @@
       '订阅配置': 'Subscriptions',
       '启用订阅自动刷新': 'Enable automatic subscription refresh',
       '刷新间隔': 'Refresh interval',
+      '订阅抓取并发数': 'Subscription fetch concurrency',
       '10 分钟': '10 minutes',
       '30 分钟': '30 minutes',
       '1 小时': '1 hour',
@@ -1228,7 +1233,7 @@
       '12 小时': '12 hours',
       '24 小时': '24 hours',
       '订阅链接 (每行一个 URL)': 'Subscription URLs (one per line)',
-      '订阅配置变更保存后立即生效': 'Subscription changes take effect immediately after saving.',
+      '订阅配置变更保存后立即生效；并发数作用于订阅链接抓取，最大 32': 'Subscription changes take effect immediately after saving. Concurrency controls parallel subscription fetches and is capped at 32.',
       '保存配置': 'Save configuration',
       '身份验证': 'Authentication',
       '身份验证失败': 'Authentication failed',
@@ -2228,8 +2233,10 @@
           let matched = false;
           for (let opt of sel.options) { if (iv === opt.value || iv === opt.value.replace('m','m0s') || iv.startsWith(opt.value)) { sel.value = opt.value; matched = true; break; } }
           if (!matched) sel.value = '1h';
+          const fetchConcurrency = Number(sd.fetch_concurrency) || 16;
+          document.getElementById('settingSubFetchConcurrency').value = fetchConcurrency;
           document.getElementById('settingSubURLs').value = (sd.subscriptions || []).join('\n');
-          _savedSubSnapshot = JSON.stringify({urls: (sd.subscriptions || []).join('\n'), enabled: sd.enabled || false, interval: sel.value});
+          _savedSubSnapshot = JSON.stringify({urls: (sd.subscriptions || []).join('\n'), enabled: sd.enabled || false, interval: sel.value, fetch_concurrency: fetchConcurrency});
         } catch(e){}
         // Take core snapshot after all fields are populated
         _savedCoreSnapshot = _buildCoreSnapshot();
@@ -2304,7 +2311,8 @@
       const subURLs = document.getElementById('settingSubURLs').value.split('\n').map(s => s.trim()).filter(s => s);
       const subEnabled = document.getElementById('settingSubEnabled').checked;
       const subInterval = document.getElementById('settingSubInterval').value;
-      const currentSubSnapshot = JSON.stringify({urls: subURLs.join('\n'), enabled: subEnabled, interval: subInterval});
+      const subFetchConcurrency = parseInt(document.getElementById('settingSubFetchConcurrency').value) || 16;
+      const currentSubSnapshot = JSON.stringify({urls: subURLs.join('\n'), enabled: subEnabled, interval: subInterval, fetch_concurrency: subFetchConcurrency});
 
       const coreChanged = currentCoreSnapshot !== _savedCoreSnapshot;
       const subChanged = currentSubSnapshot !== _savedSubSnapshot;
@@ -2381,7 +2389,7 @@
       // Save subscription config if changed
       if (subChanged) {
         showFullscreenLoading(tr('更新订阅中...'), tr('正在拉取订阅并重载节点，请稍候'));
-        const subPayload = { subscriptions: subURLs, enabled: subEnabled, interval: subInterval };
+        const subPayload = { subscriptions: subURLs, enabled: subEnabled, interval: subInterval, fetch_concurrency: subFetchConcurrency };
         try {
           const sr = await fetch('/api/subscription/config', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(subPayload)});
           hideFullscreenLoading();

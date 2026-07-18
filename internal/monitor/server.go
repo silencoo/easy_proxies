@@ -52,7 +52,7 @@ type SubscriptionRefresher interface {
 	RefreshNow() error
 	Status() SubscriptionStatus
 	UpdateConfig(urls []string, enabled bool, interval time.Duration)
-	UpdateConfigAndRefresh(urls []string, enabled bool, interval time.Duration) error
+	UpdateConfigAndRefresh(urls []string, enabled bool, interval time.Duration, fetchConcurrency int) error
 }
 
 // SubscriptionStatus represents subscription refresh status.
@@ -1165,23 +1165,27 @@ func (s *Server) handleSubscriptionConfig(w http.ResponseWriter, r *http.Request
 		var urls []string
 		var enabled bool
 		var interval string
+		fetchConcurrency := config.NormalizeSubscriptionFetchConcurrency(0)
 		if s.cfgSrc != nil {
 			urls = s.cfgSrc.Subscriptions
 			enabled = s.cfgSrc.SubscriptionRefresh.Enabled
 			interval = s.cfgSrc.SubscriptionRefresh.Interval.String()
+			fetchConcurrency = config.NormalizeSubscriptionFetchConcurrency(s.cfgSrc.SubscriptionRefresh.FetchConcurrency)
 		}
 		s.cfgMu.RUnlock()
 		writeJSON(w, map[string]any{
-			"subscriptions": urls,
-			"enabled":       enabled,
-			"interval":      interval,
+			"subscriptions":     urls,
+			"enabled":           enabled,
+			"interval":          interval,
+			"fetch_concurrency": fetchConcurrency,
 		})
 
 	case http.MethodPut:
 		var req struct {
-			Subscriptions []string `json:"subscriptions"`
-			Enabled       bool     `json:"enabled"`
-			Interval      string   `json:"interval"` // e.g. "1h", "30m"
+			Subscriptions    []string `json:"subscriptions"`
+			Enabled          bool     `json:"enabled"`
+			Interval         string   `json:"interval"` // e.g. "1h", "30m"
+			FetchConcurrency *int     `json:"fetch_concurrency,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
@@ -1204,12 +1208,27 @@ func (s *Server) handleSubscriptionConfig(w http.ResponseWriter, r *http.Request
 			}
 		}
 
+		s.cfgMu.RLock()
+		fetchConcurrency := config.NormalizeSubscriptionFetchConcurrency(0)
+		if s.cfgSrc != nil {
+			fetchConcurrency = config.NormalizeSubscriptionFetchConcurrency(s.cfgSrc.SubscriptionRefresh.FetchConcurrency)
+		}
+		s.cfgMu.RUnlock()
+		if req.FetchConcurrency != nil {
+			if *req.FetchConcurrency < 1 || *req.FetchConcurrency > 32 {
+				writeSettingsBadRequest(w, "订阅抓取并发数必须在 1 到 32 之间")
+				return
+			}
+			fetchConcurrency = *req.FetchConcurrency
+		}
+
 		// Update in-memory config and persist to disk
 		s.cfgMu.Lock()
 		if s.cfgSrc != nil {
 			s.cfgSrc.Subscriptions = cleanURLs
 			s.cfgSrc.SubscriptionRefresh.Enabled = req.Enabled
 			s.cfgSrc.SubscriptionRefresh.Interval = interval
+			s.cfgSrc.SubscriptionRefresh.FetchConcurrency = fetchConcurrency
 			// Always persist to disk regardless of subscription manager state
 			if err := s.cfgSrc.SaveSettings(); err != nil {
 				s.cfgMu.Unlock()
@@ -1222,26 +1241,31 @@ func (s *Server) handleSubscriptionConfig(w http.ResponseWriter, r *http.Request
 
 		// Hot-reload subscription manager and wait for refresh to complete
 		if s.subRefresher != nil {
-			if err := s.subRefresher.UpdateConfigAndRefresh(cleanURLs, req.Enabled, interval); err != nil {
+			if err := s.subRefresher.UpdateConfigAndRefresh(cleanURLs, req.Enabled, interval, fetchConcurrency); err != nil {
 				// Config was saved but refresh failed — report partial success
 				writeJSON(w, map[string]any{
-					"message":       fmt.Sprintf("订阅配置已保存，但刷新失败: %v", err),
-					"subscriptions": cleanURLs,
-					"enabled":       req.Enabled,
-					"interval":      interval.String(),
-					"refresh_error": err.Error(),
+					"message":           fmt.Sprintf("订阅配置已保存，但刷新失败: %v", err),
+					"subscriptions":     cleanURLs,
+					"enabled":           req.Enabled,
+					"interval":          interval.String(),
+					"fetch_concurrency": fetchConcurrency,
+					"refresh_error":     err.Error(),
 				})
 				return
 			}
 		}
 
-		status := s.subRefresher.Status()
+		status := SubscriptionStatus{}
+		if s.subRefresher != nil {
+			status = s.subRefresher.Status()
+		}
 		writeJSON(w, map[string]any{
-			"message":       "订阅配置已更新并生效",
-			"subscriptions": cleanURLs,
-			"enabled":       req.Enabled,
-			"interval":      interval.String(),
-			"node_count":    status.NodeCount,
+			"message":           "订阅配置已更新并生效",
+			"subscriptions":     cleanURLs,
+			"enabled":           req.Enabled,
+			"interval":          interval.String(),
+			"fetch_concurrency": fetchConcurrency,
+			"node_count":        status.NodeCount,
 		})
 
 	default:

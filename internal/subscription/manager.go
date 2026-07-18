@@ -149,14 +149,14 @@ func (m *Manager) Stop() {
 
 // UpdateConfig hot-reloads subscription URLs and refresh settings without restart.
 func (m *Manager) UpdateConfig(urls []string, enabled bool, interval time.Duration) {
-	m.updateConfig(urls, enabled, interval, false)
+	m.updateConfig(urls, enabled, interval, 0, false)
 }
 
 // UpdateConfigAndRefresh updates subscription config and synchronously waits for
 // the first refresh to complete before returning. This ensures the caller (WebUI API)
 // can confirm the update took effect.
-func (m *Manager) UpdateConfigAndRefresh(urls []string, enabled bool, interval time.Duration) error {
-	waiter := m.updateConfig(urls, enabled, interval, true)
+func (m *Manager) UpdateConfigAndRefresh(urls []string, enabled bool, interval time.Duration, fetchConcurrency int) error {
+	waiter := m.updateConfig(urls, enabled, interval, fetchConcurrency, true)
 	if waiter == nil {
 		return nil
 	}
@@ -217,7 +217,7 @@ func (m *Manager) startLoop() {
 	})
 }
 
-func (m *Manager) updateConfig(urls []string, enabled bool, interval time.Duration, wait bool) <-chan error {
+func (m *Manager) updateConfig(urls []string, enabled bool, interval time.Duration, fetchConcurrency int, wait bool) <-chan error {
 	m.startLoop()
 
 	// Do not allow an in-flight refresh based on the old URLs to publish after
@@ -228,6 +228,9 @@ func (m *Manager) updateConfig(urls []string, enabled bool, interval time.Durati
 	m.baseCfg.SubscriptionRefresh.Enabled = enabled
 	if interval > 0 {
 		m.baseCfg.SubscriptionRefresh.Interval = interval
+	}
+	if fetchConcurrency > 0 {
+		m.baseCfg.SubscriptionRefresh.FetchConcurrency = config.NormalizeSubscriptionFetchConcurrency(fetchConcurrency)
 	}
 	effectiveInterval := m.baseCfg.SubscriptionRefresh.Interval
 	saveErr := m.baseCfg.SaveSettings()
