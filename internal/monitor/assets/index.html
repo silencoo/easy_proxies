@@ -1075,6 +1075,16 @@
     let subscriptionSettingsLoaded = false;
     let _lastLogsPayload = null;
     const CHART_FONT_FAMILY = '"Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", sans-serif';
+    const REGION_CHART_COLORS = Object.freeze({
+      HK: '#e11d48',
+      JP: '#f97316',
+      KR: '#eab308',
+      US: '#2563eb',
+      TW: '#8b5cf6',
+      SG: '#10b981',
+      RESIDENT: '#ec4899',
+      OTHER: '#64748b'
+    });
     const nodeTableState = { search: '', page: 1, pageSize: 50, sortKey: 'latency', sortDir: 'asc' };
     const configNodeTableState = { search: '', page: 1, pageSize: 50 };
     const debugTableState = { search: '', page: 1, pageSize: 50, sortKey: 'name', sortDir: 'asc' };
@@ -1681,6 +1691,16 @@
 
     function getCssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
 
+    function getRegionChartStyle(region, stat) {
+      const total = Number(stat && stat.total) || 0;
+      const healthy = Math.max(0, Number(stat && stat.healthy) || 0);
+      const healthyRatio = total > 0 ? Math.min(1, healthy / total) : 0;
+      return {
+        color: REGION_CHART_COLORS[region] || '#0891b2',
+        opacity: 0.55 + (healthyRatio * 0.45)
+      };
+    }
+
     function setChartOption(chart, option, chartId) {
       if (!chart) return;
       try {
@@ -1710,7 +1730,7 @@
       const regionData = Object.keys(regionStats).map(k => ({
         name: k,
         value: regionStats[k].total,
-        itemStyle: { color: regionStats[k].healthy === 0 ? getCssVar('--error') : (regionStats[k].healthy < regionStats[k].total ? getCssVar('--chart-secondary') : getCssVar('--chart-primary')) }
+        itemStyle: getRegionChartStyle(k, regionStats[k])
       }));
 
       setChartOption(regionChartInst, {
