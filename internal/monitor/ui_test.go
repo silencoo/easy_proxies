@@ -18,6 +18,9 @@ func TestIndexForbidsEmbedding(t *testing.T) {
 	if got := recorder.Header().Get("X-Frame-Options"); got != "DENY" {
 		t.Fatalf("X-Frame-Options = %q", got)
 	}
+	if got := recorder.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q", got)
+	}
 }
 
 func TestEmbeddedWebUIUsesBundledECharts(t *testing.T) {
@@ -102,6 +105,9 @@ func TestEmbeddedWebUIHasScalableNodeOperations(t *testing.T) {
 		`const REGION_NAME_PATTERNS`,
 		`['resident',`,
 		`function getNodeRegion(node)`,
+		`function getChartNodeDisplayName(node)`,
+		`.replace(/[\u{1F1E6}-\u{1F1FF}]{2}/gu, '')`,
+		`sorted.map(getChartNodeDisplayName)`,
 		`CHART_FONT_FAMILY`,
 		`function renderConsoleLogs(payload)`,
 		`.log-warn`,

@@ -1074,7 +1074,7 @@
     let subscriptionETag = '';
     let subscriptionSettingsLoaded = false;
     let _lastLogsPayload = null;
-    const CHART_FONT_FAMILY = '"Segoe UI", "Microsoft YaHei UI", "Segoe UI Emoji", "Noto Color Emoji", sans-serif';
+    const CHART_FONT_FAMILY = '"Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", sans-serif';
     const nodeTableState = { search: '', page: 1, pageSize: 50, sortKey: 'latency', sortDir: 'asc' };
     const configNodeTableState = { search: '', page: 1, pageSize: 50 };
     const debugTableState = { search: '', page: 1, pageSize: 50, sortKey: 'name', sortDir: 'asc' };
@@ -1347,7 +1347,7 @@
 
     function normalizeNodeName(value) {
       let text = String(value || '');
-      if (/%[0-9a-f]{2}/i.test(text)) {
+      for (let attempt = 0; attempt < 3 && /%[0-9a-f]{2}/i.test(text); attempt += 1) {
         try { text = decodeURIComponent(text); } catch (_) {}
       }
       return typeof text.normalize === 'function' ? text.normalize('NFC') : text;
@@ -1355,6 +1355,16 @@
 
     function getNodeDisplayName(node) {
       return normalizeNodeName((node && (node.name || node.tag)) || '');
+    }
+
+    function getChartNodeDisplayName(node) {
+      const fullName = getNodeDisplayName(node);
+      const chartName = fullName
+        .replace(/[\u{1F1E6}-\u{1F1FF}]{2}/gu, '')
+        .replace(/\uFE0F/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      return chartName || fullName;
     }
 
     function getNodeRegion(node) {
@@ -1725,7 +1735,7 @@
 
       // 2. Latency Chart Data
       const sorted = allNodesCache.filter(n => n.last_latency_ms > 0 && !n.blacklisted).sort((a,b) => a.last_latency_ms - b.last_latency_ms).slice(0, 10);
-      const latencyX = sorted.map(getNodeDisplayName);
+      const latencyX = sorted.map(getChartNodeDisplayName);
       const latencyY = sorted.map(n => n.last_latency_ms);
 
       setChartOption(latencyChartInst, {

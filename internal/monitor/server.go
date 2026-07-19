@@ -635,6 +635,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	setManagementSecurityHeaders(w)
 	w.Header().Set("X-Frame-Options", "DENY")
 	if r.Method == http.MethodHead {
@@ -681,15 +682,15 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 	filtered := s.mgr.SnapshotFiltered(true)
 	allNodes := s.mgr.Snapshot()
 	totalNodes := len(allNodes)
+	for index := range filtered {
+		filtered[index].Region = displayRegion(filtered[index])
+	}
 
 	// Calculate region statistics
 	regionStats := make(map[string]int)
 	regionHealthy := make(map[string]int)
 	for _, snap := range allNodes {
-		region := snap.Region
-		if region == "" {
-			region = "other"
-		}
+		region := displayRegion(snap)
 		regionStats[region]++
 		// Count healthy nodes per region
 		if snap.InitialCheckDone && snap.Available && !snap.Blacklisted && !snap.CoolingDown {
