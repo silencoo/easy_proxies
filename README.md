@@ -8,11 +8,12 @@
 
 - **Three runtime modes**: `pool` (single-port load balancing), `multi-port` (one port per node), and `hybrid` (both simultaneously)
 - **Wide protocol support**: VLESS, VMess, Trojan, Shadowsocks, ShadowsocksR, Hysteria v1/v2, TUIC, AnyTLS, SOCKS5/SOCKS5H, HTTP/HTTPS
-- **Automatic health checking** with configurable failure thresholds and blacklist duration, plus manual blacklist/release from the dashboard
+- **Bounded health checking** with serialized sweeps, probe deadlines, persistent health state, configurable failure thresholds, and manual blacklist/release
 - **GeoIP region routing**: classify nodes by country and route traffic through a specific region via a dedicated HTTP proxy endpoint
 - **Multiple node sources**: inline config, `nodes.txt` file, or subscription URLs (Base64, plain text, Clash YAML)
-- **Subscription auto-refresh with hot-reload**: periodically fetches subscription updates and reloads without restart
-- **WebUI dashboard**: real-time node status, traffic charts, diagnostics, log console, and full settings management
+- **Transactional subscription refresh**: per-source fallback, stable-identity deduplication, candidate health checks, atomic persistence, and automatic rollback
+- **Drain-safe node-level reloads**: unchanged listeners and connections stay alive while added/removed nodes are diffed and replaced
+- **Bilingual WebUI dashboard**: Chinese/English, monochrome theme, sortable/searchable/paginated node tables, traffic charts, diagnostics, colored logs, and masked secrets
 - **Management API**: RESTful endpoints for node CRUD, probing, blacklisting, subscription management, and config reload
 - **Configurable DNS resolver** with fallback servers and IPv4/IPv6 strategy control
 - **Log rotation**: size-based rotation with configurable backup count, age, and compression
@@ -39,13 +40,16 @@ Edit `config.yaml` and add your proxy nodes (inline nodes, `nodes.txt` file, or 
 docker compose up -d
 ```
 
-### 3. Run from Source
+### 3. Run Natively from Source
 
 ```bash
-go run ./cmd/easy_proxies --config config.yaml
+go build -trimpath -tags "with_utls with_quic with_grpc with_wireguard with_gvisor with_clash_api" -o easy_proxies ./cmd/easy_proxies
+./easy_proxies -config config.yaml
 ```
 
-The default source build runs the proxy, subscriptions, and WebUI without optional Clash traffic streaming. Add `-tags with_clash_api` for that stream; the Docker build already enables it.
+On Windows, use `-o easy_proxies.exe` and start it with `.\easy_proxies.exe -config config.yaml`.
+
+The tag set above matches the Docker build and enables the optional protocol implementations used by real-world Clash subscriptions. In particular, Hysteria, Hysteria2, and TUIC require `with_quic`; a plain untagged `go build` can parse those nodes but cannot start them. If you only need the non-optional protocols, the reduced build remains available with `go run ./cmd/easy_proxies -config config.yaml`.
 
 ### 4. Access WebUI
 
@@ -294,9 +298,9 @@ subscription_refresh:
 
 Supports Base64, plain text, and Clash YAML formats. Subscription URLs are fetched with bounded concurrency, responses are strictly limited to 10 MB, and URL credentials/query data are redacted from errors and logs. Loopback, private, link-local, and metadata destinations (including redirects) are blocked by default; set `allow_private_networks: true` only when a trusted subscription service is intentionally hosted on such a network. Duplicate URLs and nodes are removed by stable identity. Runtime refreshes cache each URL independently so one failed provider can reuse only its own last known-good nodes; after a restart, `nodes_file` is the conservative aggregate fallback until every provider has refreshed successfully. Inline and WebUI-added nodes remain explicit configuration and are never overwritten by a subscription refresh.
 
-When subscriptions are configured, fetched nodes are written to `nodes_file`. Subscription changes are validated before the active sing-box instance is stopped, failed replacements roll back automatically, and dedicated node ports are restored from `port-map.yaml`. Rebinding the same listen ports still interrupts existing TCP connections briefly.
+When subscriptions are configured, fetched nodes are written to `nodes_file`. A refresh is committed as one transaction across configuration, cache files, and runtime state. Candidate nodes are built and health-checked before cutover; a failed fetch, unsupported node, persistence error, or stale configuration revision rolls back without replacing the active pool. Unchanged nodes and listeners retain their connections, removed outbounds drain for the configured timeout, and dedicated ports are restored from `port-map.yaml`.
 
-When the management password is empty, `management.listen` must use a loopback address. External management access requires a non-empty password and should be placed behind a TLS reverse proxy.
+When the management password is empty, `management.listen` must use a loopback address. A non-loopback management listener requires both a strong non-empty password and native TLS certificate/key files; the service refuses an insecure remote-management configuration.
 
 ## WebUI Dashboard
 
@@ -304,11 +308,12 @@ Access at `http://your-server:9091` (configurable via the `management` section).
 
 Features:
 
-- **Dashboard**: Real-time node status, traffic charts, region availability, latency monitoring
-- **Node Config**: Add/edit/delete inline nodes and subscription URLs
-- **Diagnostics**: Connectivity testing and node state export
-- **Console**: Real-time application logs (last 1000 lines, WebSocket streaming)
-- **Settings**: All configuration options editable from the browser, changes persist to `config.yaml`
+- **Dashboard**: Real-time node status, traffic charts, region/resident availability, and latency monitoring
+- **Large node sets**: Click-to-sort columns, search, region filters, and configurable 25/50/100/200-row pagination
+- **Node Config**: Add/edit/delete inline nodes and manage subscription URLs without exposing credentials in list responses
+- **Diagnostics**: Sortable/searchable connectivity results, stability rankings, and node state export
+- **Console**: Real-time application logs (last 1000 lines, WebSocket streaming) with separate info/warn/error styling
+- **Settings**: Chinese/English switcher, system theme, masked passwords/subscriptions with reveal controls, and persistent configuration editing
 
 When `management.password` is empty, authentication is bypassed.
 
@@ -352,7 +357,7 @@ services:
 ### Important Notes
 
 - **Create config files first**: `config.yaml` and `nodes.txt` must exist as files before running `docker compose up`. Use `./start.sh` which handles this automatically.
-- **Permissions**: Files need write permission for WebUI settings to persist (`chmod 666 config.yaml nodes.txt`).
+- **Permissions**: Files must be writable by the container user for WebUI settings to persist. Prefer correct ownership with `0600`/`0640` permissions; avoid world-writable configuration files.
 - **Multi-platform**: Supports amd64 and arm64 architectures.
 - **Reload**: node/subscription changes use a node-level diff. Unchanged listeners and active connections stay up; new candidates are health-checked before cutover when `min_available_nodes` is configured, and removed outbounds drain for `drain_timeout`. Immutable global listener/log changes still require a short validated full-instance handoff.
 
@@ -373,11 +378,11 @@ See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 ```bash
 go test ./...
+go vet ./...
+
+# Verify the production/full-protocol build
+go build -trimpath -tags "with_utls with_quic with_grpc with_wireguard with_gvisor with_clash_api" -o easy_proxies ./cmd/easy_proxies
 ```
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=jasonwong1991/easy_proxies&type=Date)](https://star-history.com/#jasonwong1991/easy_proxies&Date)
 
 ## License
 
