@@ -852,6 +852,12 @@ func (m *Manager) commitClearedSubscriptions(ctx context.Context, desired *confi
 		}
 		applySubscriptionSettings(latest, desired)
 		candidate := m.createNewConfig(latest, nil)
+		// Zero nodes are valid only for the first-run management-only state.
+		// Once a pool has active nodes, clearing subscriptions must not
+		// accidentally tear the runtime down to an unusable empty pool.
+		if len(latest.Nodes) > 0 && len(candidate.Nodes) == 0 {
+			return nil, errors.New("cannot clear subscriptions because no inline nodes would remain")
+		}
 		err := m.boxMgr.CommitConfig(guardedCtx, revision, candidate, func(committed *config.Config) (func() error, error) {
 			if err := m.validatePendingGeneration(ctx, pendingGeneration); err != nil {
 				return nil, err

@@ -433,7 +433,17 @@ func (c *Config) normalize() error {
 	}
 
 	if len(c.Nodes) == 0 {
-		return errors.New("config.nodes cannot be empty (configure nodes in config or use nodes_file)")
+		if !c.ManagementEnabled() {
+			return errors.New("config.nodes cannot be empty when management is disabled")
+		}
+		if err := c.validateInboundCredentials(); err != nil {
+			return err
+		}
+		if c.LogLevel == "" {
+			c.LogLevel = "info"
+		}
+		c.normalizeLogConfig()
+		return nil
 	}
 	for idx := range c.Nodes {
 		c.Nodes[idx].Name = sanitizeNodeName(c.Nodes[idx].Name)
@@ -1062,7 +1072,17 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	c.Subscriptions = validatedSubscriptions
 
 	if len(c.Nodes) == 0 {
-		return errors.New("config.nodes cannot be empty")
+		if !c.ManagementEnabled() {
+			return errors.New("config.nodes cannot be empty when management is disabled")
+		}
+		if err := c.validateInboundCredentials(); err != nil {
+			return err
+		}
+		if c.LogLevel == "" {
+			c.LogLevel = "info"
+		}
+		c.normalizeLogConfig()
+		return nil
 	}
 
 	for idx := range c.Nodes {

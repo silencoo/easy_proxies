@@ -76,6 +76,7 @@ type Manager struct {
 	startMu  sync.Mutex
 
 	currentBox      *box.Box
+	managementOnly  bool
 	runtimeCtx      context.Context
 	runtimeOptions  option.Options
 	monitorMgr      *monitor.Manager
@@ -218,7 +219,7 @@ func (m *Manager) Start(ctx context.Context) error {
 		}
 	}()
 	m.mu.RLock()
-	alreadyRunning := m.currentBox != nil
+	alreadyRunning := m.currentBox != nil || m.managementOnly
 	closed := m.closed
 	m.mu.RUnlock()
 	if closed {
@@ -256,6 +257,20 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.mu.Unlock()
 	if err := pool.ConfigureHealthPersistence(cfg.HealthStatePath()); err != nil {
 		return fmt.Errorf("load pool health state: %w", err)
+	}
+	if len(cfg.Nodes) == 0 {
+		if !cfg.ManagementEnabled() {
+			return errors.New("cannot start without proxy nodes when management is disabled")
+		}
+		m.mu.Lock()
+		m.managementOnly = true
+		m.mu.Unlock()
+		if err := m.startMonitorServer(ctx); err != nil {
+			return err
+		}
+		m.logger.Infof("management-only mode started with no proxy nodes; add a subscription or node in the WebUI at %s", cfg.Management.Listen)
+		started = true
+		return nil
 	}
 
 	// Try to start, with automatic port conflict resolution
@@ -305,17 +320,8 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.mu.Unlock()
 	m.updateHealthPersistence(cfg)
 
-	// Start periodic health check after nodes are registered
-	m.mu.Lock()
-	var monitorToStart *monitor.Manager
-	if m.monitorMgr != nil && !m.healthCheckStarted {
-		monitorToStart = m.monitorMgr
-		m.healthCheckStarted = true
-	}
-	m.mu.Unlock()
-	if monitorToStart != nil {
-		monitorToStart.StartPeriodicHealthCheck(periodicHealthInterval, periodicHealthTimeout)
-	}
+	// Start periodic health check after nodes are registered.
+	m.startPeriodicHealthChecks()
 
 	// Wait for initial health check if min nodes configured. A startup-fetched
 	// subscription is not allowed to replace the restart cache unless this
@@ -406,16 +412,19 @@ func (m *Manager) reloadLocked(ctx context.Context, newCfg *config.Config) error
 
 func (m *Manager) reloadRuntimeLocked(operationCtx context.Context, newCfg *config.Config) error {
 	m.mu.RLock()
-	if m.currentBox == nil {
-		m.mu.RUnlock()
-		return errors.New("manager not started")
-	}
+	managementOnly := m.managementOnly
 	runtimeBaseCtx := m.baseCtx
 	oldBox := m.currentBox
 	oldCfg := m.cfg
 	runtimeCtx := m.runtimeCtx
 	oldOptions := m.runtimeOptions
 	m.mu.RUnlock()
+	if oldBox == nil {
+		if !managementOnly {
+			return errors.New("manager not started")
+		}
+		return m.reloadManagementOnlyRuntimeLocked(operationCtx, runtimeBaseCtx, oldCfg, newCfg)
+	}
 
 	if operationCtx == nil {
 		operationCtx = context.Background()
@@ -565,6 +574,164 @@ func (m *Manager) reloadRuntimeLocked(operationCtx context.Context, newCfg *conf
 		m.stopGeoLookup()
 	}
 
+	return nil
+}
+
+// reloadManagementOnlyRuntimeLocked updates first-run configuration or starts
+// the first proxy runtime after the WebUI has obtained usable nodes.
+// reloadMu is held by the caller throughout this transition.
+func (m *Manager) reloadManagementOnlyRuntimeLocked(
+	operationCtx context.Context,
+	runtimeBaseCtx context.Context,
+	oldCfg *config.Config,
+	newCfg *config.Config,
+) error {
+	if operationCtx == nil {
+		operationCtx = context.Background()
+	}
+	if runtimeBaseCtx == nil {
+		runtimeBaseCtx = context.Background()
+	}
+	if len(newCfg.Nodes) == 0 {
+		m.applyLiveProbeSettings(newCfg)
+		if err := m.commitManagementOnlyConfig(operationCtx, newCfg); err != nil {
+			return err
+		}
+		m.logger.Infof("management-only configuration updated; waiting for proxy nodes")
+		return nil
+	}
+	restoreManagementOnlyState := func() {
+		m.applyLiveProbeSettings(oldCfg)
+		m.updateHealthPersistence(oldCfg)
+		if m.monitorMgr != nil {
+			var oldNodes []config.NodeConfig
+			if oldCfg != nil {
+				oldNodes = oldCfg.Nodes
+			}
+			m.monitorMgr.RetainNodeURIs(nodeURISet(oldNodes))
+		}
+	}
+
+	m.logger.Infof("starting first proxy runtime with %d nodes", len(newCfg.Nodes))
+	built, err := m.createBox(runtimeBaseCtx, newCfg)
+	if err != nil {
+		restoreManagementOnlyState()
+		return fmt.Errorf("create first proxy runtime: %w", err)
+	}
+	if err := operationCtx.Err(); err != nil {
+		_ = built.box.Close()
+		restoreManagementOnlyState()
+		return err
+	}
+	if err := built.box.Start(); err != nil {
+		_ = built.box.Close()
+		restoreManagementOnlyState()
+		return fmt.Errorf("start first proxy runtime: %w", err)
+	}
+
+	m.applyLiveProbeSettings(newCfg)
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		_ = built.box.Close()
+		restoreManagementOnlyState()
+		return errManagerClosed
+	}
+	m.currentBox = built.box
+	m.runtimeCtx = built.ctx
+	m.runtimeOptions = built.options
+	m.managementOnly = false
+	m.mu.Unlock()
+	m.updateHealthPersistence(newCfg)
+
+	rollbackCandidate := func(cause error) error {
+		_ = built.box.Close()
+		m.mu.Lock()
+		if m.currentBox == built.box {
+			m.currentBox = nil
+			m.runtimeCtx = nil
+			m.runtimeOptions = option.Options{}
+			m.managementOnly = true
+		}
+		oldGeoRouter := m.geoRouter
+		m.geoRouter = nil
+		m.mu.Unlock()
+		if oldGeoRouter != nil {
+			_ = oldGeoRouter.Stop()
+		}
+		m.stopGeoLookup()
+		restoreManagementOnlyState()
+		return cause
+	}
+
+	if m.monitorMgr != nil {
+		healthTimeout := newCfg.SubscriptionRefresh.HealthCheckTimeout
+		if healthTimeout <= 0 {
+			healthTimeout = defaultHealthCheckTimeout
+		}
+		minAvailableNodes := newCfg.SubscriptionRefresh.MinAvailableNodes
+		if _, probeConfigured := m.monitorMgr.DestinationForProbe(); probeConfigured && minAvailableNodes > 0 {
+			if err := m.monitorMgr.ProbeAllNowContext(operationCtx, healthTimeout); err != nil {
+				return rollbackCandidate(fmt.Errorf("first runtime health check: %w", err))
+			}
+			available, total := m.availableNodeCount()
+			if available < minAvailableNodes {
+				return rollbackCandidate(fmt.Errorf("health check rejected first runtime: %d/%d nodes available (need >= %d)", available, total, minAvailableNodes))
+			}
+		} else {
+			go m.monitorMgr.ProbeAllNow(periodicHealthTimeout)
+		}
+	}
+	if newCfg.GeoIP.Enabled {
+		if err := m.refreshExitGeoIP(operationCtx, newCfg); err != nil {
+			return rollbackCandidate(fmt.Errorf("prepare first runtime GeoIP pools: %w", err))
+		}
+		if err := m.ensureGeoIPRouter(runtimeBaseCtx, newCfg); err != nil {
+			return rollbackCandidate(fmt.Errorf("prepare first runtime GeoIP router: %w", err))
+		}
+	}
+	if err := operationCtx.Err(); err != nil {
+		return rollbackCandidate(err)
+	}
+	if m.beforeRuntimeCommit != nil {
+		m.beforeRuntimeCommit()
+	}
+	if err := operationCtx.Err(); err != nil {
+		return rollbackCandidate(err)
+	}
+
+	markCommitted, releaseCommitBarrier, err := commitguard.Acquire(operationCtx)
+	if err != nil {
+		return rollbackCandidate(err)
+	}
+	committedCfg, monitorServer := m.adoptConfig(newCfg, true)
+	markCommitted()
+	releaseCommitBarrier()
+	if monitorServer != nil {
+		monitorServer.SetConfig(committedCfg)
+	}
+	m.startPeriodicHealthChecks()
+	m.logger.Infof("first proxy runtime started successfully with %d nodes", len(newCfg.Nodes))
+	return nil
+}
+
+func (m *Manager) commitManagementOnlyConfig(ctx context.Context, cfg *config.Config) error {
+	if m.beforeRuntimeCommit != nil {
+		m.beforeRuntimeCommit()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	markCommitted, releaseCommitBarrier, err := commitguard.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	committedCfg, monitorServer := m.adoptConfig(cfg, true)
+	markCommitted()
+	releaseCommitBarrier()
+	if monitorServer != nil {
+		monitorServer.SetConfig(committedCfg)
+	}
 	return nil
 }
 
@@ -1634,6 +1801,7 @@ func (m *Manager) detachForClose() managerCloseState {
 		ownsRuntime:   m.ownsRuntime,
 	}
 	m.currentBox = nil
+	m.managementOnly = false
 	m.runtimeCtx = nil
 	m.runtimeOptions = option.Options{}
 	m.monitorServer = nil
@@ -2132,6 +2300,19 @@ func (m *Manager) applyConfigSettings(cfg *config.Config) {
 		m.drainTimeout = defaultDrainTimeout
 	}
 	m.minAvailableNodes = cfg.SubscriptionRefresh.MinAvailableNodes
+}
+
+func (m *Manager) startPeriodicHealthChecks() {
+	m.mu.Lock()
+	var monitorToStart *monitor.Manager
+	if m.monitorMgr != nil && !m.healthCheckStarted {
+		monitorToStart = m.monitorMgr
+		m.healthCheckStarted = true
+	}
+	m.mu.Unlock()
+	if monitorToStart != nil {
+		monitorToStart.StartPeriodicHealthCheck(periodicHealthInterval, periodicHealthTimeout)
+	}
 }
 
 // adoptConfigLocked installs an owned clone. The caller must hold m.mu.

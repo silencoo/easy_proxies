@@ -15,12 +15,23 @@ import (
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/monitor"
 
-	"gopkg.in/natefinch/lumberjack.v2")
+	"gopkg.in/natefinch/lumberjack.v2"
+)
 
 func main() {
 	var configPath string
 	flag.StringVar(&configPath, "config", "config.yaml", "path to config file")
 	flag.Parse()
+
+	resolvedConfigPath, created, err := prepareConfigFile(configPath)
+	if err != nil {
+		log.Fatalf("prepare config: %v", err)
+	}
+	if created {
+		log.Printf("Created default config file: %s", resolvedConfigPath)
+	}
+	log.Printf("Using config file: %s", resolvedConfigPath)
+	configPath = resolvedConfigPath
 
 	var cfg *config.Config
 	for attempt := 1; attempt <= 3; attempt++ {
@@ -49,6 +60,18 @@ func main() {
 	}
 }
 
+func prepareConfigFile(path string) (string, bool, error) {
+	resolvedPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", false, fmt.Errorf("resolve config path: %w", err)
+	}
+	created, err := config.EnsureDefaultFile(resolvedPath)
+	if err != nil {
+		return "", false, err
+	}
+	return resolvedPath, created, nil
+}
+
 func setupLogging(cfg *config.Config) {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 
@@ -63,9 +86,9 @@ func setupLogging(cfg *config.Config) {
 		} else {
 			lj := &lumberjack.Logger{
 				Filename:   cfg.Log.File,
-				MaxSize:    cfg.Log.MaxSize,    // MB
+				MaxSize:    cfg.Log.MaxSize, // MB
 				MaxBackups: cfg.Log.MaxBackups,
-				MaxAge:     cfg.Log.MaxAge,     // days
+				MaxAge:     cfg.Log.MaxAge, // days
 				Compress:   cfg.Log.Compress,
 			}
 			writers = append(writers, lj)
